@@ -192,10 +192,22 @@ const PERMISSIONS = Object.freeze({
     description: 'Update HUB details, status, and location.',
     group: 'Hubs',
   },
+  ACTIVATE_HUB: {
+    code: 'ACTIVATE_HUB',
+    label: 'Activate / Deactivate Hub',
+    description: 'Toggle a HUB active or inactive without full edit access.',
+    group: 'Hubs',
+  },
+  DELETE_HUB: {
+    code: 'DELETE_HUB',
+    label: 'Delete Hub',
+    description: 'Permanently delete a HUB record.',
+    group: 'Hubs',
+  },
   MANAGE_HUBS: {
     code: 'MANAGE_HUBS',
-    label: 'Manage Hubs',
-    description: 'Full access to create, edit, activate/deactivate, and delete HUBs.',
+    label: 'Manage Hubs (Full)',
+    description: 'Legacy full access — create, edit, activate/deactivate, and delete HUBs. Prefer granular permissions above.',
     group: 'Hubs',
   },
   VERIFY_HUB: {
@@ -234,8 +246,26 @@ const PERMISSIONS = Object.freeze({
   },
   EDIT_CUSTOMER: {
     code: 'EDIT_CUSTOMER',
-    label: 'Edit Customers',
-    description: 'Update customer details and manage customer vehicles (add, edit, delete).',
+    label: 'Edit Customer Details',
+    description: 'Update customer contact details and profile information.',
+    group: 'Customers',
+  },
+  ADD_CUSTOMER_VEHICLE: {
+    code: 'ADD_CUSTOMER_VEHICLE',
+    label: 'Add Customer Vehicle',
+    description: 'Add a new vehicle to a customer profile.',
+    group: 'Customers',
+  },
+  EDIT_CUSTOMER_VEHICLE: {
+    code: 'EDIT_CUSTOMER_VEHICLE',
+    label: 'Edit Customer Vehicle',
+    description: 'Update an existing vehicle on a customer profile.',
+    group: 'Customers',
+  },
+  DELETE_CUSTOMER_VEHICLE: {
+    code: 'DELETE_CUSTOMER_VEHICLE',
+    label: 'Delete Customer Vehicle',
+    description: 'Remove a vehicle from a customer profile.',
     group: 'Customers',
   },
 
@@ -255,7 +285,25 @@ const PERMISSIONS = Object.freeze({
   EDIT_ESTIMATE: {
     code: 'EDIT_ESTIMATE',
     label: 'Edit Estimate',
-    description: 'Update, submit, approve, revise, and manage estimate workflow.',
+    description: 'Update estimate items, notes, and manage work status.',
+    group: 'Estimates',
+  },
+  SUBMIT_ESTIMATE: {
+    code: 'SUBMIT_ESTIMATE',
+    label: 'Submit Estimate',
+    description: 'Submit an estimate for customer or company review.',
+    group: 'Estimates',
+  },
+  APPROVE_ESTIMATE: {
+    code: 'APPROVE_ESTIMATE',
+    label: 'Approve Estimate',
+    description: 'Company-approve an estimate on behalf of Spinoto.',
+    group: 'Estimates',
+  },
+  REVISE_ESTIMATE: {
+    code: 'REVISE_ESTIMATE',
+    label: 'Revise Estimate',
+    description: 'Send an estimate back for revision after review.',
     group: 'Estimates',
   },
 
@@ -300,8 +348,14 @@ const PERMISSIONS = Object.freeze({
   },
   APPROVE_PURCHASE_INVOICE: {
     code: 'APPROVE_PURCHASE_INVOICE',
-    label: 'Approve / Recalculate Purchase Invoice',
-    description: 'Approve a pending purchase invoice and trigger recalculation.',
+    label: 'Approve Purchase Invoice',
+    description: 'Approve a pending purchase invoice.',
+    group: 'Purchase Invoices',
+  },
+  RECALCULATE_PURCHASE_INVOICE: {
+    code: 'RECALCULATE_PURCHASE_INVOICE',
+    label: 'Recalculate Purchase Invoice',
+    description: 'Trigger recalculation on a purchase invoice.',
     group: 'Purchase Invoices',
   },
   ADD_PURCHASE_INVOICE_PAYMENT: {
@@ -318,26 +372,80 @@ const PERMISSIONS = Object.freeze({
     description: 'View and use call-centre categories in the lead capture flow.',
     group: 'CC Categories',
   },
+  CREATE_CC_CATEGORY: {
+    code: 'CREATE_CC_CATEGORY',
+    label: 'Create CC Category',
+    description: 'Add new call-centre categories.',
+    group: 'CC Categories',
+  },
+  EDIT_CC_CATEGORY: {
+    code: 'EDIT_CC_CATEGORY',
+    label: 'Edit CC Category',
+    description: 'Update existing call-centre categories.',
+    group: 'CC Categories',
+  },
+  DELETE_CC_CATEGORY: {
+    code: 'DELETE_CC_CATEGORY',
+    label: 'Delete CC Category',
+    description: 'Remove call-centre categories permanently.',
+    group: 'CC Categories',
+  },
   MANAGE_CC_CATEGORY: {
     code: 'MANAGE_CC_CATEGORY',
-    label: 'Manage CC Categories',
-    description: 'Create, edit, and delete call-centre categories.',
+    label: 'Manage CC Categories (Full)',
+    description: 'Legacy full access — create, edit, and delete call-centre categories. Prefer granular permissions above.',
     group: 'CC Categories',
   },
 
   // ---- Parts ----
+  CREATE_PART: {
+    code: 'CREATE_PART',
+    label: 'Create Part',
+    description: 'Add new parts to the parts catalogue.',
+    group: 'Parts',
+  },
+  EDIT_PART: {
+    code: 'EDIT_PART',
+    label: 'Edit Part',
+    description: 'Update existing parts in the parts catalogue.',
+    group: 'Parts',
+  },
+  DELETE_PART: {
+    code: 'DELETE_PART',
+    label: 'Delete Part',
+    description: 'Remove parts from the parts catalogue permanently.',
+    group: 'Parts',
+  },
   MANAGE_PARTS: {
     code: 'MANAGE_PARTS',
-    label: 'Manage Parts',
-    description: 'Create, edit, and delete parts in the parts catalogue.',
+    label: 'Manage Parts (Full)',
+    description: 'Legacy full access — create, edit, and delete parts. Prefer granular permissions above.',
     group: 'Parts',
   },
 
   // ---- Discounts ----
+  CREATE_DISCOUNT: {
+    code: 'CREATE_DISCOUNT',
+    label: 'Create Discount',
+    description: 'Add new discount rules to the discount master.',
+    group: 'Discounts',
+  },
+  EDIT_DISCOUNT: {
+    code: 'EDIT_DISCOUNT',
+    label: 'Edit Discount',
+    description: 'Update existing discount rules.',
+    group: 'Discounts',
+  },
+  DELETE_DISCOUNT: {
+    code: 'DELETE_DISCOUNT',
+    label: 'Delete Discount',
+    description: 'Remove discount rules permanently.',
+    group: 'Discounts',
+  },
   MANAGE_DISCOUNTS: {
     code: 'MANAGE_DISCOUNTS',
-    label: 'Manage Discounts',
-    description: 'Create, edit, and delete discount rules in the discount master.',
+    label: 'Manage Discounts (Full)',
+    description: 'Legacy full access — create, edit, and delete discount rules. Prefer granular permissions above.',
     group: 'Discounts',
   },
 

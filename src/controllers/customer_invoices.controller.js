@@ -35,7 +35,8 @@ const CI_SELECT = `
     cc.name   AS cc_category_name,
     cc.min_cc,
     cc.max_cc,
-    vmod.engine_cc
+    vmod.engine_cc,
+    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names
 
   FROM customer_invoices ci
   LEFT JOIN hubs           h    ON h.id    = ci.hub_id

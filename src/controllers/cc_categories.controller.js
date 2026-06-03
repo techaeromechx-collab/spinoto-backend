@@ -4,13 +4,16 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 
 // ── Validators ────────────────────────────────────────────────────────────────
-const ccSchema = z.object({
+const ccSchemaBase = z.object({
   name:        z.string().trim().min(1).max(20),
   min_cc:      z.coerce.number().int().min(0),
   max_cc:      z.coerce.number().int().min(1),
   description: z.string().trim().optional().nullable(),
   is_active:   z.boolean().optional(),
-}).refine(d => d.min_cc < d.max_cc, {
+});
+
+// Full schema with refine (for CREATE — all fields present)
+const ccSchema = ccSchemaBase.refine(d => d.min_cc < d.max_cc, {
   message: 'min_cc must be less than max_cc',
   path:    ['min_cc'],
 });
@@ -70,7 +73,7 @@ function createCategory(req, res, next) {
 function updateCategory(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
-    const data = ccSchema.partial().parse(req.body);
+    const data = ccSchemaBase.partial().parse(req.body);
 
     // Custom refine for partial update: if both are present, min must be < max
     if (data.min_cc !== undefined && data.max_cc !== undefined && data.min_cc >= data.max_cc) {

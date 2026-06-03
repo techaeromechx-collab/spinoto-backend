@@ -372,7 +372,7 @@ function updateLead(req, res, next) {
       // ── Schedule a follow-up event if the frontend provided a date ──────────
       // (The old auto-timing via follow_up_days/follow_up_hours has been replaced
       //  by the manual follow-up modal on the frontend.)
-      if (coreData.status && req.body.follow_up_date) {
+      if (req.body.follow_up_date) {
         // Close any existing open follow-ups for this lead
         await client.query(
           `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
@@ -391,15 +391,18 @@ function updateLead(req, res, next) {
           [id, coreData.status, dateStr, dueAt.toISOString(), req.body.follow_up_note || 'Follow-up scheduled']
         );
 
-        // Notify the lead's creator and assigned agent
-        const leadRow = await pool.query(
+        // Notify the lead's creator, assigned agent, and the person who scheduled it.
+        // Use client (inside transaction) so we read the already-updated assigned_to.
+        const leadRow = await client.query(
           `SELECT created_by, assigned_to, name, mobile FROM leads WHERE id = $1`, [id]
         );
         const leadMeta   = leadRow.rows[0];
         const leadLabel  = leadMeta?.name || leadMeta?.mobile || `Lead #${id}`;
-        const notifyUsers = [...new Set([leadMeta?.created_by, leadMeta?.assigned_to].filter(Boolean))];
+        const notifyUsers = [...new Set(
+          [leadMeta?.created_by, leadMeta?.assigned_to, req.user.id].filter(Boolean)
+        )];
         for (const uid of notifyUsers) {
-          await pool.query(
+          await client.query(
             `INSERT INTO notifications (user_id, type, title, body, lead_id)
              VALUES ($1, 'follow_up_scheduled', $2, $3, $4)`,
             [uid, `Follow-up scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, id]

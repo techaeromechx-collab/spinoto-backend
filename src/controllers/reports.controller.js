@@ -449,8 +449,8 @@ async function getTopPerformers(req, res, next) {
       pool.query(`
         SELECT s.name AS service_name,
                COUNT(ii.id)                   AS usage_count,
-               COALESCE(SUM(ii.total), 0)     AS revenue
-          FROM invoice_items ii
+               COALESCE(SUM(ii.total_price), 0) AS revenue
+          FROM invoice_services ii
           JOIN services s ON s.id = ii.service_id
          WHERE ii.created_at >= NOW() - INTERVAL '90 days'
          GROUP BY s.id, s.name

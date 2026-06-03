@@ -36,7 +36,8 @@ const PI_SELECT = `
     vmod.name AS model_name,
     bt.name   AS body_type_name,
     cc.name   AS cc_category_name,
-    vmod.engine_cc
+    vmod.engine_cc,
+    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names
 
   FROM purchase_invoices pi
   JOIN hubs h ON h.id = pi.hub_id
@@ -272,13 +273,17 @@ function approvePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
 
-    // Allow optional payout_schedule override at approval time
-    const { payout_schedule } = z.object({
+    // Allow optional payout_schedule + per-item rate overrides at approval time
+    const { payout_schedule, item_rates } = z.object({
       payout_schedule: z.enum(['lump_sum', 'split']).default('lump_sum'),
+      item_rates: z.array(z.object({
+        item_id:   z.number().int(),
+        take_rate: z.number().min(0).max(100),
+      })).optional().default([]),
     }).parse(req.body || {});
 
     const r = await pool.query(
-      `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id,
+      `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id, pi.rate_mode,
               h.payout_terms, h.payout_cycle_days
        FROM purchase_invoices pi
        JOIN hubs h ON h.id = pi.hub_id
@@ -301,6 +306,66 @@ function approvePurchaseInvoice(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // ── Recalculate per-item rates if provided ───────────────────────────
+      if (item_rates.length > 0) {
+        // Build a map of item_id -> take_rate for quick lookup
+        const rateMap = {};
+        item_rates.forEach(r => { rateMap[r.item_id] = r.take_rate; });
+
+        const itemsRow = await client.query(
+          `SELECT id, quantity, customer_rate, gst_percent FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [id]
+        );
+
+        let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
+        for (const item of itemsRow.rows) {
+          // Only recalculate items that have a rate override
+          if (rateMap[item.id] == null) continue;
+
+          const qty      = Number(item.quantity);
+          const custRate = Number(item.customer_rate);
+          const gstPct   = Number(item.gst_percent);
+          const takeRate = rateMap[item.id];
+
+          // Same formula as existing recalculate: hub_rate = customer_rate - (customer_rate × take_rate%)
+          const techDeduct = parseFloat((custRate * (takeRate / 100)).toFixed(4));
+          const hubRate    = parseFloat((custRate - techDeduct).toFixed(4));
+          const hubAmount  = parseFloat((hubRate * qty).toFixed(2));
+          const gstAmt     = parseFloat((hubAmount * gstPct / 100).toFixed(2));
+          const total      = parseFloat((hubAmount + gstAmt).toFixed(2));
+
+          subtotalExGst += hubAmount;
+          totalGst      += gstAmt;
+          grandTotal    += total;
+
+          await client.query(
+            `UPDATE purchase_invoice_items
+             SET hub_rate=$1, commission_percent=$2, gst_amount=$3, total_payable=$4
+             WHERE id=$5`,
+            [hubRate, takeRate, gstAmt, total, item.id]
+          );
+        }
+
+        // For items not in rateMap, add their existing totals to PI totals
+        for (const item of itemsRow.rows) {
+          if (rateMap[item.id] != null) continue;
+          const existing = await client.query(
+            `SELECT hub_rate, quantity, gst_amount, total_payable FROM purchase_invoice_items WHERE id=$1`, [item.id]
+          );
+          const ex = existing.rows[0];
+          if (ex) {
+            subtotalExGst += parseFloat(ex.hub_rate) * Number(ex.quantity);
+            totalGst      += parseFloat(ex.gst_amount);
+            grandTotal    += parseFloat(ex.total_payable);
+          }
+        }
+
+        await client.query(
+          `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3 WHERE id=$4`,
+          [subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), id]
+        );
+        pi.grand_total = grandTotal;
+      }
 
       await client.query(
         `UPDATE purchase_invoices

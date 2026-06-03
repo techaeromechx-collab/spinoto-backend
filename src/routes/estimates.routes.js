@@ -16,20 +16,23 @@ const {
 
 const router = express.Router();
 
-const canView   = requirePermissionOrHub('VIEW_ESTIMATE'); // hub users can read their own estimates
-const canCreate = requirePermissionOrHub('CREATE_ESTIMATE'); // hub users can create estimates
-const canEdit   = requirePermissionOrHub('EDIT_ESTIMATE'); // hub users can edit/submit estimates
+const canView    = requirePermissionOrHub('VIEW_ESTIMATE');
+const canCreate  = requirePermissionOrHub('CREATE_ESTIMATE');
+const canEdit    = requirePermissionOrHub('EDIT_ESTIMATE');
+const canSubmit  = requirePermissionOrHub('SUBMIT_ESTIMATE',  'EDIT_ESTIMATE');
+const canApprove = requirePermissionOrHub('APPROVE_ESTIMATE', 'EDIT_ESTIMATE');
+const canRevise  = requirePermissionOrHub('REVISE_ESTIMATE',  'EDIT_ESTIMATE');
 
 router.use(requireAuth);
 
-router.get('/',                                    canView,   listEstimates);
-router.post('/',                                   canCreate, createEstimate);
-router.get('/:id',                                 canView,   getEstimate);
-router.patch('/:id',                               canEdit,   updateEstimate);
-router.post('/:id/submit',                         canEdit,   submitEstimate);
-router.post('/:id/company-approve',                canEdit,   companyApprove);
-router.post('/:id/company-revise',                 canEdit,   companyRevise);
-router.post('/:id/customer-approval',              canEdit,   customerApproval);
-router.patch('/:id/items/:itemId/work-status',     canEdit,   updateItemWorkStatus);
+router.get('/',                                    canView,    listEstimates);
+router.post('/',                                   canCreate,  createEstimate);
+router.get('/:id',                                 canView,    getEstimate);
+router.patch('/:id',                               canEdit,    updateEstimate);
+router.post('/:id/submit',                         canSubmit,  submitEstimate);
+router.post('/:id/company-approve',                canApprove, companyApprove);
+router.post('/:id/company-revise',                 canRevise,  companyRevise);
+router.post('/:id/customer-approval',              canEdit,    customerApproval);
+router.patch('/:id/items/:itemId/work-status',     canEdit,    updateItemWorkStatus);
 
 module.exports = router;

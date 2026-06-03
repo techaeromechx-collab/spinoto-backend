@@ -63,12 +63,12 @@ router.get('/logins',       requireAuth, requirePermission('EDIT_HUB', 'MANAGE_H
 
 router.get('/:id', requireAuth, requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS'), getHub);
 
-router.post('/',            requireAuth, requirePermission('CREATE_HUB', 'MANAGE_HUBS'), createHub);
-router.patch('/:id',        requireAuth, requirePermission('EDIT_HUB',   'MANAGE_HUBS'), updateHub);
-router.patch('/:id/toggle', requireAuth, requirePermission('EDIT_HUB',   'MANAGE_HUBS'), toggleHub);
-router.patch('/:id/verify', requireAuth, requirePermission('VERIFY_HUB',  'MANAGE_HUBS'), verifyHub);
-router.patch('/:id/reject', requireAuth, requirePermission('VERIFY_HUB',  'MANAGE_HUBS'), rejectHub);
-router.delete('/:id',       requireAuth, requirePermission('MANAGE_HUBS'),                deleteHub);
+router.post('/',            requireAuth, requirePermission('CREATE_HUB',   'MANAGE_HUBS'), createHub);
+router.patch('/:id',        requireAuth, requirePermission('EDIT_HUB',     'MANAGE_HUBS'), updateHub);
+router.patch('/:id/toggle', requireAuth, requirePermission('ACTIVATE_HUB', 'EDIT_HUB', 'MANAGE_HUBS'), toggleHub);
+router.patch('/:id/verify', requireAuth, requirePermission('VERIFY_HUB',   'MANAGE_HUBS'), verifyHub);
+router.patch('/:id/reject', requireAuth, requirePermission('VERIFY_HUB',   'MANAGE_HUBS'), rejectHub);
+router.delete('/:id',       requireAuth, requirePermission('DELETE_HUB',   'MANAGE_HUBS'), deleteHub);
 
 // ── HUB CATEGORY + SERVICE MAPPINGS ──────────────────────────────────────────
 
