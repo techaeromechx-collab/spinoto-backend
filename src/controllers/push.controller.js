@@ -84,17 +84,18 @@ function adminStats(req, res, next) {
 }
 
 // ── POST /api/push/admin/test ─────────────────────────────────────────────────
-// Super admin: send a test push to a specific user (or themselves).
-// Body: { user_id? }  — defaults to self
+// Super admin: send a custom push to a specific user (or themselves).
+// Body: { user_id?, title, message }
 function adminTest(req, res, next) {
   handle(req, res, next, async () => {
     if (!req.user.is_super_admin) return res.status(403).json({ error: 'Forbidden' });
 
-    const targetId = req.body?.user_id || req.user.id;
+    const { user_id, title, message, url } = req.body || {};
 
-    // Temporarily bypass notification_settings check for test — use a type
-    // that is always enabled ('lead_assigned' is a safe default).
-    // We call sendPush directly; user_settings may block it so we do a direct send.
+    if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
+
+    const targetId = user_id || req.user.id;
+
     const { rows } = await pool.query(
       `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`,
       [targetId]
@@ -106,10 +107,10 @@ function adminTest(req, res, next) {
 
     const webpush = require('web-push');
     const payload = JSON.stringify({
-      title: '🔔 Spinoto Test Notification',
-      body:  'Push notifications are working correctly!',
-      url:   '/',
-      type:  'test',
+      title: title.trim(),
+      body:  (message || '').trim(),
+      url:   url || '/',
+      type:  'custom',
     });
 
     const results = await Promise.allSettled(

@@ -87,4 +87,61 @@ async function upsertCompany(req, res) {
   }
 }
 
-module.exports = { getCompany, upsertCompany };
+// ─── Default alert settings ───────────────────────────────────────────────────
+const DEFAULT_ALERT_SETTINGS = {
+  no_activity_hours:        2,
+  inactive_lead_days:       7,
+  daily_target_hour:        18,
+  escalation_overdue_days:  3,
+  escalation_missed_count:  2,
+  work_start_hour:          9,
+  work_end_hour:            18,
+};
+
+// ─── GET /api/settings/alert ──────────────────────────────────────────────────
+async function getAlertSettings(req, res) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT alert_settings FROM company_settings WHERE id = 1 LIMIT 1`
+    );
+    const saved = rows[0]?.alert_settings || {};
+    return res.json({ ...DEFAULT_ALERT_SETTINGS, ...saved });
+  } catch (err) {
+    console.error('[settings] getAlertSettings error:', err);
+    return res.status(500).json({ error: 'Failed to fetch alert settings.' });
+  }
+}
+
+// ─── PUT /api/settings/alert ──────────────────────────────────────────────────
+async function upsertAlertSettings(req, res) {
+  if (!req.user?.is_super_admin) {
+    return res.status(403).json({ error: 'Only super admins can update alert settings.' });
+  }
+
+  const body = req.body || {};
+  // Merge with defaults — only accept known keys, coerce to int
+  const merged = { ...DEFAULT_ALERT_SETTINGS };
+  for (const key of Object.keys(DEFAULT_ALERT_SETTINGS)) {
+    if (body[key] !== undefined) {
+      const val = parseInt(body[key], 10);
+      if (!isNaN(val) && val > 0) merged[key] = val;
+    }
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO company_settings (id, alert_settings, updated_at)
+       VALUES (1, $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         alert_settings = EXCLUDED.alert_settings,
+         updated_at     = NOW()`,
+      [JSON.stringify(merged)]
+    );
+    return res.json({ ok: true, alert_settings: merged });
+  } catch (err) {
+    console.error('[settings] upsertAlertSettings error:', err);
+    return res.status(500).json({ error: 'Failed to save alert settings.' });
+  }
+}
+
+module.exports = { getCompany, upsertCompany, getAlertSettings, upsertAlertSettings };

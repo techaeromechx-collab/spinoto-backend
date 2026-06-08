@@ -12,6 +12,28 @@
 const { pool }     = require('../config/db');
 const { sendPush } = require('../utils/sendPush');
 
+// ── Load alert thresholds from DB (falls back to defaults if not set) ─────────
+const DEFAULT_ALERT_CFG = {
+  no_activity_hours:        2,
+  inactive_lead_days:       7,
+  daily_target_hour:        18,
+  escalation_overdue_days:  3,
+  escalation_missed_count:  2,
+  work_start_hour:          9,
+  work_end_hour:            18,
+};
+
+async function getAlertConfig() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT alert_settings FROM company_settings WHERE id = 1 LIMIT 1`
+    );
+    return { ...DEFAULT_ALERT_CFG, ...(rows[0]?.alert_settings || {}) };
+  } catch {
+    return DEFAULT_ALERT_CFG;
+  }
+}
+
 // ── Helper: guard against duplicate notifications ─────────────────────────────
 // Returns true if an unread notification of `type` for `leadId`+`userId` was
 // already sent today (prevents spamming on every scheduler tick).
@@ -199,13 +221,12 @@ async function fireMissedFollowupAlerts() {
 // IF: completed activities < daily_target AND current time > 18:00 local
 // Fires once per user per day after 6 PM.
 // ─────────────────────────────────────────────────────────────────────────────
-async function fireDailyTargetAlerts() {
+async function fireDailyTargetAlerts(cfg = DEFAULT_ALERT_CFG) {
   const client = await pool.connect();
   try {
-    // Only fire after 18:00 (6 PM) server time
     const hour = new Date().getHours();
-    if (hour < 18) {
-      console.log('[SmartAlerts] #4 Daily Target: skipped (before 6 PM)');
+    if (hour < cfg.daily_target_hour) {
+      console.log(`[SmartAlerts] #4 Daily Target: skipped (before ${cfg.daily_target_hour}:00)`);
       return;
     }
 
@@ -248,9 +269,10 @@ async function fireDailyTargetAlerts() {
 // ALERT #5  Inactive Lead Alert (Gray / Medium)
 // IF: no lead_activities on lead for > 7 days
 // ─────────────────────────────────────────────────────────────────────────────
-async function fireInactiveLeadAlerts() {
+async function fireInactiveLeadAlerts(cfg = DEFAULT_ALERT_CFG) {
   const client = await pool.connect();
   try {
+    const days = cfg.inactive_lead_days;
     const { rows } = await client.query(`
       SELECT
         l.id          AS lead_id,
@@ -263,9 +285,9 @@ async function fireInactiveLeadAlerts() {
       LEFT JOIN lead_activities la ON la.lead_id = l.id
       WHERE LOWER(COALESCE(l.status,'')) NOT IN ('closed','won','converted','lost')
       GROUP BY l.id, l.name, l.mobile, l.created_by, l.assigned_to
-      HAVING MAX(la.created_at) < NOW() - INTERVAL '7 days'
+      HAVING MAX(la.created_at) < NOW() - ($1 || ' days')::interval
           OR MAX(la.created_at) IS NULL
-    `);
+    `, [days]);
 
     for (const row of rows) {
       const label = row.lead_name || row.lead_mobile || `Lead #${row.lead_id}`;
@@ -276,7 +298,7 @@ async function fireInactiveLeadAlerts() {
           userId: uid,
           type:   'inactive_lead',
           title:  `Lead Inactive: ${label}`,
-          body:   'Lead inactive for 7+ days. Reconnect with this customer.',
+          body:   `Lead inactive for ${days}+ days. Reconnect with this customer.`,
           leadId: row.lead_id,
         });
       }
@@ -293,10 +315,11 @@ async function fireInactiveLeadAlerts() {
 // ALERT #6  Lead Escalation Alert (Purple / Critical)
 // IF: overdue_days > 3 OR missed follow-ups >= 2
 // ─────────────────────────────────────────────────────────────────────────────
-async function fireEscalationAlerts() {
+async function fireEscalationAlerts(cfg = DEFAULT_ALERT_CFG) {
   const client = await pool.connect();
   try {
-    // Find leads with either: overdue > 3 days, or 2+ missed (overdue) events
+    const overdueDays    = cfg.escalation_overdue_days;
+    const missedCount    = cfg.escalation_missed_count;
     const { rows } = await client.query(`
       SELECT
         l.id          AS lead_id,
@@ -313,13 +336,13 @@ async function fireEscalationAlerts() {
         AND LOWER(COALESCE(l.status,'')) NOT IN ('closed','won','converted','lost')
       GROUP BY l.id, l.name, l.mobile, l.created_by, l.assigned_to
       HAVING
-        COUNT(le.id) >= 2
-        OR MAX(EXTRACT(DAY FROM NOW() - le.due_at)) > 3
-    `);
+        COUNT(le.id) >= $1
+        OR MAX(EXTRACT(DAY FROM NOW() - le.due_at)) > $2
+    `, [missedCount, overdueDays]);
 
     for (const row of rows) {
       const label = row.lead_name || row.lead_mobile || `Lead #${row.lead_id}`;
-      const reason = row.missed_count >= 2
+      const reason = row.missed_count >= missedCount
         ? `Repeated missed follow-ups detected (${row.missed_count}x)`
         : `Lead overdue by ${row.max_overdue_days} days`;
 
@@ -418,13 +441,16 @@ async function fireLeadConversionAlert(leadId, convertedByUserId) {
 // ALERT #10  No Activity Alert (Orange / Medium)
 // IF: user has no lead_activities in the last 2 hours during working hours (9–18)
 // ─────────────────────────────────────────────────────────────────────────────
-async function fireNoActivityAlerts() {
+async function fireNoActivityAlerts(cfg = DEFAULT_ALERT_CFG) {
   const client = await pool.connect();
   try {
     const hour = new Date().getHours();
-    // Only fire during working hours: 9 AM – 6 PM
-    if (hour < 9 || hour >= 18) {
-      console.log('[SmartAlerts] #10 No Activity: outside working hours');
+    const workStart = cfg.work_start_hour;
+    const workEnd   = cfg.work_end_hour;
+    const inactiveHours = cfg.no_activity_hours;
+
+    if (hour < workStart || hour >= workEnd) {
+      console.log(`[SmartAlerts] #10 No Activity: outside working hours (${workStart}–${workEnd})`);
       return;
     }
 
@@ -440,18 +466,18 @@ async function fireNoActivityAlerts() {
       WHERE u.is_active = TRUE
       GROUP BY u.id, u.name
       HAVING
-        MAX(la.created_at) < NOW() - INTERVAL '2 hours'
+        MAX(la.created_at) < NOW() - ($1 || ' hours')::interval
         OR MAX(la.created_at) IS NULL
-    `);
+    `, [inactiveHours]);
 
     for (const row of rows) {
-      // Only notify once per 2-hour window
+      // Only notify once per configured window
       const already = await client.query(
         `SELECT 1 FROM notifications
          WHERE user_id = $1 AND type = 'no_activity'
-           AND created_at >= NOW() - INTERVAL '2 hours'
+           AND created_at >= NOW() - ($2 || ' hours')::interval
          LIMIT 1`,
-        [row.user_id]
+        [row.user_id, inactiveHours]
       );
       if (already.rowCount > 0) continue;
 
@@ -540,13 +566,15 @@ async function sendSummaryPushes() {
 // ─────────────────────────────────────────────────────────────────────────────
 async function runScheduledAlerts() {
   console.log('[SmartAlerts] Running scheduled alert checks…');
+  // Load thresholds from DB once per run — super admin can change these live
+  const cfg = await getAlertConfig();
   await Promise.allSettled([
     fireOverdueLeadAlerts(),
     fireMissedFollowupAlerts(),
-    fireInactiveLeadAlerts(),
-    fireDailyTargetAlerts(),
-    fireEscalationAlerts(),
-    fireNoActivityAlerts(),
+    fireInactiveLeadAlerts(cfg),
+    fireDailyTargetAlerts(cfg),
+    fireEscalationAlerts(cfg),
+    fireNoActivityAlerts(cfg),
   ]);
   // After all alerts are written to DB, send one summary push per user
   await sendSummaryPushes();
