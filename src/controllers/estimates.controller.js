@@ -222,6 +222,14 @@ function listEstimates(req, res, next) {
     const conditions = [];
     const params     = [];
 
+    // ── User scoping ──────────────────────────────────────────────────────────
+    // Super admins and VIEW_ESTIMATE users see all. Others see only their own.
+    const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_ESTIMATE');
+    if (!isAll) {
+      params.push(req.user.id);
+      conditions.push(`e.created_by = $${params.length}`);
+    }
+
     if (appointmentId) { params.push(Number(appointmentId)); conditions.push(`e.appointment_id = $${params.length}`); }
     if (hubId)         { params.push(Number(hubId));         conditions.push(`e.hub_id = $${params.length}`); }
     if (status)        { params.push(status);                conditions.push(`e.status = $${params.length}`); }

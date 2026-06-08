@@ -456,8 +456,8 @@ async function fireNoActivityAlerts() {
       await notify(client, {
         userId: row.user_id,
         type:   'no_activity',
-        title:  'No Activity Detected',
-        body:   'No CRM activity for 2+ hours. Please update lead activities.',
+        title:  'No Lead Activity',
+        body:   'No lead activity logged in 2+ hours. Please update your leads.',
         leadId: null,
       });
     }

@@ -10,7 +10,7 @@ const {
 } = require('../controllers/customer_invoices.controller');
 const router = express.Router();
 
-const canView    = requirePermissionOrHub('VIEW_INVOICE'); // hub users can view their own customer invoices
+const canView    = requirePermissionOrHub('VIEW_INVOICE', 'CREATE_INVOICE', 'EDIT_INVOICE', 'ADD_INVOICE_PAYMENT');
 const canCreate  = requirePermission('CREATE_INVOICE');
 const canEdit    = requirePermission('EDIT_INVOICE');
 const canPayment = requirePermission('ADD_INVOICE_PAYMENT');

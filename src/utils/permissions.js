@@ -221,7 +221,7 @@ const PERMISSIONS = Object.freeze({
   VIEW_APPOINTMENT: {
     code: 'VIEW_APPOINTMENT',
     label: 'View Appointments',
-    description: 'View the appointment list and individual appointment details.',
+    description: 'View all appointments across all users and hubs.',
     group: 'Appointments',
   },
   CREATE_APPOINTMENT: {
@@ -306,6 +306,12 @@ const PERMISSIONS = Object.freeze({
     description: 'Send an estimate back for revision after review.',
     group: 'Estimates',
   },
+  EXECUTE_ESTIMATE: {
+    code: 'EXECUTE_ESTIMATE',
+    label: 'Execute Estimate',
+    description: 'Mark customer approval/rejection on line items and update work status (Pending → In Progress → Completed).',
+    group: 'Estimates',
+  },
 
   // ---- Invoices ----
   VIEW_INVOICE: {
@@ -365,36 +371,60 @@ const PERMISSIONS = Object.freeze({
     group: 'Purchase Invoices',
   },
 
-  // ---- CC Categories ----
+  // ---- Reference Data (Vehicles page → Reference Data tab) ----
+  VIEW_REFERENCE_DATA: {
+    code: 'VIEW_REFERENCE_DATA',
+    label: 'View Reference Data',
+    description: 'View the Reference Data tab on the Vehicles page (Vehicle Types, Body Types, Segments, CC Categories).',
+    group: 'Reference Data',
+  },
+  MANAGE_VEHICLE_TYPES: {
+    code: 'MANAGE_VEHICLE_TYPES',
+    label: 'Manage Vehicle Types',
+    description: 'Add, edit, and delete Vehicle Types (e.g. 2W, 4W) on the Reference Data tab.',
+    group: 'Reference Data',
+  },
+  MANAGE_BODY_TYPES: {
+    code: 'MANAGE_BODY_TYPES',
+    label: 'Manage Body Types',
+    description: 'Add, edit, and delete Body Types (e.g. Hatchback, SUV, Sedan) on the Reference Data tab.',
+    group: 'Reference Data',
+  },
+  MANAGE_SEGMENTS: {
+    code: 'MANAGE_SEGMENTS',
+    label: 'Manage Segments / Fuel Types',
+    description: 'Add, edit, and delete Segments and Fuel Types (e.g. CNG, Diesel, Petrol) on the Reference Data tab.',
+    group: 'Reference Data',
+  },
   VIEW_CC_CATEGORY: {
     code: 'VIEW_CC_CATEGORY',
     label: 'View CC Categories',
-    description: 'View and use call-centre categories in the lead capture flow.',
-    group: 'CC Categories',
+    description: 'View and use CC Categories (Two-Wheeler engine capacity ranges C1–C6) on the Reference Data tab.',
+    group: 'Reference Data',
   },
   CREATE_CC_CATEGORY: {
     code: 'CREATE_CC_CATEGORY',
     label: 'Create CC Category',
-    description: 'Add new call-centre categories.',
-    group: 'CC Categories',
+    description: 'Add new CC Category ranges on the Reference Data tab.',
+    group: 'Reference Data',
   },
   EDIT_CC_CATEGORY: {
     code: 'EDIT_CC_CATEGORY',
     label: 'Edit CC Category',
-    description: 'Update existing call-centre categories.',
-    group: 'CC Categories',
+    description: 'Update existing CC Category ranges on the Reference Data tab.',
+    group: 'Reference Data',
   },
   DELETE_CC_CATEGORY: {
     code: 'DELETE_CC_CATEGORY',
     label: 'Delete CC Category',
-    description: 'Remove call-centre categories permanently.',
-    group: 'CC Categories',
+    description: 'Remove CC Category ranges permanently.',
+    group: 'Reference Data',
   },
   MANAGE_CC_CATEGORY: {
     code: 'MANAGE_CC_CATEGORY',
     label: 'Manage CC Categories (Full)',
-    description: 'Legacy full access — create, edit, and delete call-centre categories. Prefer granular permissions above.',
-    group: 'CC Categories',
+    description: 'Full access to CC Category ranges — create, edit, and delete. Prefer granular permissions above.',
+    group: 'Reference Data',
   },
 
   // ---- Parts ----
@@ -487,6 +517,116 @@ const PERMISSIONS = Object.freeze({
     label: 'View All Notifications',
     description: 'See notifications for the entire team, not just own notifications.',
     group: 'Operations',
+  },
+
+  // ---- Dashboard widgets ----
+  VIEW_DASHBOARD_REVENUE: {
+    code: 'VIEW_DASHBOARD_REVENUE',
+    label: 'Dashboard: Revenue',
+    description: 'See Monthly Revenue KPI, Pipeline Value, and Recent Invoices card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_INVOICES: {
+    code: 'VIEW_DASHBOARD_INVOICES',
+    label: 'Dashboard: Invoices',
+    description: 'See Pending Invoices KPI and Purchase Invoices widget on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_APPOINTMENTS: {
+    code: 'VIEW_DASHBOARD_APPOINTMENTS',
+    label: 'Dashboard: Appointments',
+    description: 'See Today\'s Appointments KPI and Appointments list card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_HUB_PERFORMANCE: {
+    code: 'VIEW_DASHBOARD_HUB_PERFORMANCE',
+    label: 'Dashboard: Hub Performance',
+    description: 'See the Hub Performance card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_LEADS: {
+    code: 'VIEW_DASHBOARD_LEADS',
+    label: 'Dashboard: Leads',
+    description: 'See Recent Leads card, Lead Pipeline, and lead stats strip on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_FOLLOWUPS: {
+    code: 'VIEW_DASHBOARD_FOLLOWUPS',
+    label: 'Dashboard: Follow-ups',
+    description: 'See the Follow-ups widget on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_NOTIFICATIONS: {
+    code: 'VIEW_DASHBOARD_NOTIFICATIONS',
+    label: 'Dashboard: Smart Alerts',
+    description: 'See the Smart Alerts / Notifications widget on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_PARTS: {
+    code: 'VIEW_DASHBOARD_PARTS',
+    label: 'Dashboard: Parts',
+    description: 'See the Parts Catalogue summary widget on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_TEAM_PERFORMANCE: {
+    code: 'VIEW_DASHBOARD_TEAM_PERFORMANCE',
+    label: 'Dashboard: Team Performance',
+    description: 'See the Team Performance table on the dashboard — shows per-user leads, conversions, and follow-up stats.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_OWN: {
+    code: 'VIEW_DASHBOARD_OWN',
+    label: 'Dashboard: Personal View',
+    description: 'See a personal dashboard showing own leads, follow-ups, pipeline and conversion stats.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_STATS_STRIP: {
+    code: 'VIEW_DASHBOARD_STATS_STRIP',
+    label: 'Dashboard: Stats Strip',
+    description: 'See the stats strip (Total Leads, Pipeline Value, Unassigned, etc.) on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_REVENUE_TREND: {
+    code: 'VIEW_DASHBOARD_REVENUE_TREND',
+    label: 'Dashboard: Revenue Trend',
+    description: 'See the Revenue Trend area chart on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_QUICK_ACTIONS: {
+    code: 'VIEW_DASHBOARD_QUICK_ACTIONS',
+    label: 'Dashboard: Quick Actions',
+    description: 'See the Quick Actions card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_ESTIMATES: {
+    code: 'VIEW_DASHBOARD_ESTIMATES',
+    label: 'Dashboard: Recent Estimates',
+    description: 'See the Recent Estimates card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_ACTIVITIES: {
+    code: 'VIEW_DASHBOARD_ACTIVITIES',
+    label: 'Dashboard: Recent Activities',
+    description: 'See the Recent Activities feed on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_CUSTOMERS: {
+    code: 'VIEW_DASHBOARD_CUSTOMERS',
+    label: 'Dashboard: Recent Customers',
+    description: 'See the Recent Customers card on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_FUNNEL: {
+    code: 'VIEW_DASHBOARD_FUNNEL',
+    label: 'Dashboard: Conversion Funnel',
+    description: 'See the Conversion Funnel chart on the dashboard.',
+    group: 'Dashboard',
+  },
+  VIEW_DASHBOARD_TOP_SERVICES: {
+    code: 'VIEW_DASHBOARD_TOP_SERVICES',
+    label: 'Dashboard: Top Services',
+    description: 'See the Top Services by revenue card on the dashboard.',
+    group: 'Dashboard',
   },
 });
 

@@ -24,20 +24,21 @@ function handleUploadError(err, req, res, next) {
 }
 
 // Permission sets
-const canUpload        = [requireAuth, requirePermission('BULK_UPLOAD', 'MANAGE_MASTER_DATA')];
-const canUploadPricing = [requireAuth, requirePermission('BULK_UPLOAD_PRICING', 'BULK_UPLOAD', 'MANAGE_PRICING', 'MANAGE_MASTER_DATA')];
+const canUpload         = [requireAuth, requirePermission('BULK_UPLOAD', 'MANAGE_MASTER_DATA')];
+const canUploadVehicles = [requireAuth, requirePermission('BULK_UPLOAD_VEHICLE', 'BULK_UPLOAD', 'MANAGE_MASTER_DATA')];
+const canUploadPricing  = [requireAuth, requirePermission('BULK_UPLOAD_PRICING', 'BULK_UPLOAD', 'MANAGE_PRICING', 'MANAGE_MASTER_DATA')];
 
 // ── Upload endpoints ──────────────────────────────────────────────────────────
-router.post('/leads',     canUpload,        upload.single('file'), handleUploadError, c.importLeads);
-router.post('/locations', canUpload,        upload.single('file'), handleUploadError, c.importLocations);
-router.post('/vehicles',  canUpload,        upload.single('file'), handleUploadError, c.importVehicles);
-router.post('/services',  canUpload,        upload.single('file'), handleUploadError, c.importServices);
-router.post('/parts',     canUpload,        upload.single('file'), handleUploadError, c.importParts);
-router.post('/pricing',   canUploadPricing, upload.single('file'), handleUploadError, c.importPricing);
+router.post('/leads',     canUpload,         upload.single('file'), handleUploadError, c.importLeads);
+router.post('/locations', canUpload,         upload.single('file'), handleUploadError, c.importLocations);
+router.post('/vehicles',  canUploadVehicles, upload.single('file'), handleUploadError, c.importVehicles);
+router.post('/services',  canUpload,         upload.single('file'), handleUploadError, c.importServices);
+router.post('/parts',     canUpload,         upload.single('file'), handleUploadError, c.importParts);
+router.post('/pricing',   canUploadPricing,  upload.single('file'), handleUploadError, c.importPricing);
 
 // ── Template download endpoints ────────────────────────────────────────────────
 // GET /api/import/template/:type?format=csv   → download CSV template
 // GET /api/import/template/:type?format=xlsx  → download Excel template
-router.get('/template/:type', requireAuth, requirePermission('BULK_UPLOAD','BULK_UPLOAD_PRICING','MANAGE_MASTER_DATA','MANAGE_PRICING'), c.downloadTemplate);
+router.get('/template/:type', requireAuth, requirePermission('BULK_UPLOAD','BULK_UPLOAD_VEHICLE','BULK_UPLOAD_PRICING','MANAGE_MASTER_DATA','MANAGE_PRICING'), c.downloadTemplate);
 
 module.exports = router;

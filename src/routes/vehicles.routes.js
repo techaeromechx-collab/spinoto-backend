@@ -33,39 +33,53 @@ router.delete(
   c.deleteVehicleRecord
 );
 
-// ── Reference list reads — any authenticated user ─────────────────────────────
-router.get('/types',      requireAuth, c.listTypes);
-router.get('/makes',      requireAuth, c.listMakes);
-router.get('/models',     requireAuth, c.listModels);
-router.get('/segments',   requireAuth, c.listSegments);
-router.get('/body-types', requireAuth, c.listBodyTypes);
+// ── Reference list reads — VIEW_REFERENCE_DATA or any managing permission ─────
+const canViewRef = [requireAuth, requirePermission(
+  'VIEW_REFERENCE_DATA', 'MANAGE_VEHICLE_TYPES', 'MANAGE_BODY_TYPES', 'MANAGE_SEGMENTS',
+  'VIEW_CC_CATEGORY', 'CREATE_CC_CATEGORY', 'EDIT_CC_CATEGORY', 'DELETE_CC_CATEGORY', 'MANAGE_CC_CATEGORY',
+  'MANAGE_MASTER_DATA', 'CREATE_VEHICLE', 'UPDATE_VEHICLE', 'DELETE_VEHICLE',
+  'VIEW_VEHICLE', 'VIEW_ESTIMATE', 'CREATE_ESTIMATE', 'EDIT_ESTIMATE', 'CREATE_LEAD',
+)];
+router.get('/types',      canViewRef, c.listTypes);
+router.get('/makes',      canViewRef, c.listMakes);
+router.get('/models',     canViewRef, c.listModels);
+router.get('/segments',   canViewRef, c.listSegments);
+router.get('/body-types', canViewRef, c.listBodyTypes);
 
-// ── Reference list writes — MANAGE_MASTER_DATA or granular vehicle perms ──────
-const canManage  = [requireAuth, requirePermission('MANAGE_MASTER_DATA', 'CREATE_VEHICLE', 'UPDATE_VEHICLE')];
-const canDestroy = [requireAuth, requirePermission('MANAGE_MASTER_DATA', 'DELETE_VEHICLE')];
+// ── Reference list writes — granular permissions per data type ────────────────
+const canManageTypes    = [requireAuth, requirePermission('MANAGE_VEHICLE_TYPES', 'MANAGE_MASTER_DATA')];
+const canManageBodyTypes= [requireAuth, requirePermission('MANAGE_BODY_TYPES',    'MANAGE_MASTER_DATA')];
+const canManageSegments = [requireAuth, requirePermission('MANAGE_SEGMENTS',      'MANAGE_MASTER_DATA')];
+const canDestroyTypes   = [requireAuth, requirePermission('MANAGE_VEHICLE_TYPES', 'MANAGE_MASTER_DATA')];
+const canDestroyBody    = [requireAuth, requirePermission('MANAGE_BODY_TYPES',    'MANAGE_MASTER_DATA')];
+const canDestroySegs    = [requireAuth, requirePermission('MANAGE_SEGMENTS',      'MANAGE_MASTER_DATA')];
 
-// Vehicle Types — full CRUD (FK will block if in use)
-router.post  ('/types',        canManage,  c.createType);
-router.patch ('/types/:id',    canManage,  c.updateType);
-router.delete('/types/:id',    canDestroy, c.deleteType);
+// Makes & Models still use MANAGE_MASTER_DATA (no granular perm for makes/models)
+const canManageMakes = [requireAuth, requirePermission('MANAGE_MASTER_DATA', 'CREATE_VEHICLE', 'UPDATE_VEHICLE')];
+const canDestroyMakes= [requireAuth, requirePermission('MANAGE_MASTER_DATA', 'DELETE_VEHICLE')];
 
-// Makes & Models — full CRUD (hard delete allowed, FK will block if in use)
-router.post  ('/makes',        canManage,  c.createMake);
-router.patch ('/makes/:id',    canManage,  c.updateMake);
-router.delete('/makes/:id',    canDestroy, c.deleteMake);
+// Vehicle Types — full CRUD
+router.post  ('/types',        canManageTypes,  c.createType);
+router.patch ('/types/:id',    canManageTypes,  c.updateType);
+router.delete('/types/:id',    canDestroyTypes, c.deleteType);
 
-router.post  ('/models',       canManage,  c.createModel);
-router.patch ('/models/:id',   canManage,  c.updateModel);
-router.delete('/models/:id',   canDestroy, c.deleteModel);
+// Makes & Models — full CRUD
+router.post  ('/makes',        canManageMakes,  c.createMake);
+router.patch ('/makes/:id',    canManageMakes,  c.updateMake);
+router.delete('/makes/:id',    canDestroyMakes, c.deleteMake);
 
-// Segments — full CRUD (FK will block if in use)
-router.post  ('/segments',     canManage,  c.createSegment);
-router.patch ('/segments/:id', canManage,  c.updateSegment);
-router.delete('/segments/:id', canDestroy, c.deleteSegment);
+router.post  ('/models',       canManageMakes,  c.createModel);
+router.patch ('/models/:id',   canManageMakes,  c.updateModel);
+router.delete('/models/:id',   canDestroyMakes, c.deleteModel);
 
-// Body Types — full CRUD (FK will block if in use)
-router.post  ('/body-types',     canManage,  c.createBodyType);
-router.patch ('/body-types/:id', canManage,  c.updateBodyType);
-router.delete('/body-types/:id', canDestroy, c.deleteBodyType);
+// Segments — full CRUD
+router.post  ('/segments',     canManageSegments, c.createSegment);
+router.patch ('/segments/:id', canManageSegments, c.updateSegment);
+router.delete('/segments/:id', canDestroySegs,    c.deleteSegment);
+
+// Body Types — full CRUD
+router.post  ('/body-types',     canManageBodyTypes, c.createBodyType);
+router.patch ('/body-types/:id', canManageBodyTypes, c.updateBodyType);
+router.delete('/body-types/:id', canDestroyBody,     c.deleteBodyType);
 
 module.exports = router;

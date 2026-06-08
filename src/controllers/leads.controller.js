@@ -79,7 +79,19 @@ const LEAD_SELECT = `
     au.id   AS assigned_to_id,
     au.name AS assigned_to_name,
     l.assigned_to,
-    EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) AS is_converted
+    EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) AS is_converted,
+    (SELECT le.due_date FROM lead_events le
+      WHERE le.lead_id = l.id AND le.is_done = FALSE
+        AND le.due_date >= CURRENT_DATE
+      ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
+      LIMIT 1
+    ) AS next_follow_up_date,
+    (SELECT le.due_at FROM lead_events le
+      WHERE le.lead_id = l.id AND le.is_done = FALSE
+        AND le.due_date >= CURRENT_DATE
+      ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
+      LIMIT 1
+    ) AS next_follow_up_time
   FROM leads l
   LEFT JOIN states        s  ON s.id  = l.state_id
   LEFT JOIN cities        c  ON c.id  = l.city_id
@@ -166,7 +178,19 @@ function listLeads(req, res, next) {
           JOIN service_categories sc ON sc.id = lc.category_id
           WHERE lc.lead_id = l.id ORDER BY lc.id LIMIT 1
         ) AS first_cat_interest_name,
-        EXISTS (SELECT 1 FROM appointments ap WHERE ap.lead_id = l.id) AS is_converted
+        EXISTS (SELECT 1 FROM appointments ap WHERE ap.lead_id = l.id) AS is_converted,
+        (SELECT le.due_date FROM lead_events le
+          WHERE le.lead_id = l.id AND le.is_done = FALSE
+            AND le.due_date >= CURRENT_DATE
+          ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
+          LIMIT 1
+        ) AS next_follow_up_date,
+        (SELECT le.due_at FROM lead_events le
+          WHERE le.lead_id = l.id AND le.is_done = FALSE
+            AND le.due_date >= CURRENT_DATE
+          ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
+          LIMIT 1
+        ) AS next_follow_up_time
       FROM leads l
       LEFT JOIN states        s  ON s.id  = l.state_id
       LEFT JOIN cities        c  ON c.id  = l.city_id
@@ -195,7 +219,29 @@ function listLeads(req, res, next) {
 function getLead(req, res, next) {
   handle(req, res, next, async () => {
     const id = parseInt(req.params.id, 10);
-    const leadRow = await pool.query(`${LEAD_SELECT} WHERE l.id = $1`, [id]);
+    const user = req.user;
+
+    // Build the same ownership scope used by listLeads
+    let whereClause = 'WHERE l.id = $1';
+    const params = [id];
+
+    if (!user.is_super_admin && !user.permissions.has('VIEW_LEAD')) {
+      if (user.permissions.has('VIEW_TEAM_LEADS')) {
+        // All callers whose manager_id = this user + own leads
+        const teamRows = await pool.query(
+          `SELECT id FROM users WHERE manager_id = $1`, [user.id]
+        );
+        const teamIds = [user.id, ...teamRows.rows.map(r => r.id)];
+        params.push(teamIds);
+        whereClause += ` AND l.created_by = ANY($${params.length})`;
+      } else {
+        // VIEW_OWN_LEADS — leads created by or assigned to this user
+        params.push(user.id);
+        whereClause += ` AND (l.created_by = $${params.length} OR l.assigned_to = $${params.length})`;
+      }
+    }
+
+    const leadRow = await pool.query(`${LEAD_SELECT} ${whereClause}`, params);
     if (!leadRow.rows[0]) return res.status(404).json({ error: 'Lead not found' });
 
     // Fetch services for this lead

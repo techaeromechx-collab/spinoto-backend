@@ -109,6 +109,16 @@ function listCustomerInvoices(req, res, next) {
     const offset = (page - 1) * limit;
     const conditions = [], params = [];
 
+    // ── User scoping ──────────────────────────────────────────────────────────
+    // Super admins and VIEW_INVOICE users see all. Others see only their own.
+    const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_INVOICE');
+    if (!isAll) {
+      params.push(req.user.id);
+      conditions.push(
+        `EXISTS (SELECT 1 FROM estimates e WHERE e.id = ci.estimate_id AND e.created_by = $${params.length})`
+      );
+    }
+
     if (req.query.search) {
       params.push(`%${req.query.search}%`);
       const n = params.length;

@@ -95,6 +95,26 @@ function listEvents(req, res, next) {
     const { id: userId, is_super_admin, permissions } = req.user;
     const isManager = !is_super_admin && permissions.has('VIEW_TEAM_LEADS');
 
+    // ── lead_id mode: return ALL events for a specific lead (used by lead detail modal) ──
+    const leadIdFilter = req.query.lead_id ? parseInt(req.query.lead_id, 10) : null;
+    if (leadIdFilter) {
+      const SELECT = `
+        e.id, e.lead_id, e.status_name, e.due_date, e.due_at, e.note, e.is_done, e.done_at, e.created_at,
+        l.name AS lead_name, l.mobile AS lead_mobile,
+        au.name AS assigned_to_name
+      `;
+      const r = await pool.query(
+        `SELECT ${SELECT}
+         FROM lead_events e
+         JOIN leads l ON l.id = e.lead_id
+         LEFT JOIN users au ON au.id = l.assigned_to
+         WHERE e.lead_id = $1
+         ORDER BY e.due_date ASC, e.created_at ASC`,
+        [leadIdFilter]
+      );
+      return res.json({ items: r.rows });
+    }
+
     const { dateFrom, dateTo, endAt, includeOverdue, isWeek } = getDateRange(req.query);
     const now = new Date().toISOString();
 

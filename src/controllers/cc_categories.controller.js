@@ -101,6 +101,22 @@ function updateCategory(req, res, next) {
       values
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
+
+    // ── Re-classify all vehicle_models whose engine_cc falls within any active range ──
+    // This keeps the stored cc_category_id in sync whenever a range is changed.
+    await pool.query(`
+      UPDATE vehicle_models vm
+      SET    cc_category_id = (
+               SELECT cc.id
+                 FROM cc_categories cc
+                WHERE cc.is_active = TRUE
+                  AND cc.min_cc <= vm.engine_cc
+                  AND cc.max_cc >= vm.engine_cc
+                LIMIT 1
+             )
+      WHERE  vm.engine_cc IS NOT NULL
+    `);
+
     res.json({ item: r.rows[0] });
   });
 }

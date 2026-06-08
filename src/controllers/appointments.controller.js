@@ -188,7 +188,7 @@ const APPT_SELECT = `
     a.whatsapp,
     a.vehicle_number,
     a.segment_ids,
-    a.scheduled_date,
+    TO_CHAR(a.scheduled_date, 'YYYY-MM-DD') AS scheduled_date,
     a.scheduled_time,
     a.total_price,
     a.notes,
@@ -430,6 +430,21 @@ function listAppointments(req, res, next) {
 
     const conditions = [];
     const params     = [];
+
+    // ── User scoping ──────────────────────────────────────────────────────────
+    // Super admins and users with VIEW_APPOINTMENT see all.
+    // Others (e.g. CREATE_APPOINTMENT only) see appointments linked to their leads.
+    const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_APPOINTMENT');
+    if (!isAll) {
+      params.push([req.user.id]);
+      conditions.push(
+        `EXISTS (
+          SELECT 1 FROM leads l
+          WHERE l.id = a.lead_id
+          AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+        )`
+      );
+    }
 
     if (search) {
       params.push(`%${search.toLowerCase()}%`);

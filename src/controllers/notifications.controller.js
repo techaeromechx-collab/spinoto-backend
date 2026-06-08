@@ -4,22 +4,41 @@ function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
 }
 
-// GET /api/notifications  — last 30 notifications for the logged-in user
+// GET /api/notifications
+// — VIEW_ALL_NOTIFICATIONS: returns last 100 notifications for the whole team
+// — Otherwise: returns last 30 notifications for the logged-in user only
 function listNotifications(req, res, next) {
   handle(req, res, next, async () => {
-    const userId = req.user.id;
+    const canViewAll = req.user.is_super_admin || req.user.permissions.has('VIEW_ALL_NOTIFICATIONS');
+
+    if (canViewAll) {
+      const r = await pool.query(
+        `SELECT n.id, n.type, n.title, n.body, n.lead_id, n.is_read, n.created_at,
+                n.user_id,
+                u.name   AS user_name,
+                l.name   AS lead_name,
+                l.mobile AS lead_mobile
+         FROM notifications n
+         LEFT JOIN leads l ON l.id = n.lead_id
+         LEFT JOIN users u ON u.id = n.user_id
+         ORDER BY n.created_at DESC
+         LIMIT 100`
+      );
+      return res.json({ items: r.rows, scope: 'all' });
+    }
+
     const r = await pool.query(
       `SELECT n.id, n.type, n.title, n.body, n.lead_id, n.is_read, n.created_at,
-              l.name  AS lead_name,
+              l.name   AS lead_name,
               l.mobile AS lead_mobile
        FROM notifications n
        LEFT JOIN leads l ON l.id = n.lead_id
        WHERE n.user_id = $1
        ORDER BY n.created_at DESC
        LIMIT 30`,
-      [userId]
+      [req.user.id]
     );
-    res.json({ items: r.rows });
+    res.json({ items: r.rows, scope: 'own' });
   });
 }
 

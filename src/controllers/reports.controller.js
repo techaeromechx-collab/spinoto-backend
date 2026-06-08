@@ -254,15 +254,6 @@ async function getUserDetail(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = {
-  getDashboardStats,
-  getSummary,
-  getStatusDistribution,
-  getCategoryRevenue,
-  getByUser,
-  getUserDetail,
-};
-
 // ── Dashboard stats ───────────────────────────────────────────────────────────
 // GET /api/reports/dashboard
 // Returns: today_appointments, month_revenue, pending_invoices, lead_conversion,
@@ -271,6 +262,33 @@ async function getDashboardStats(req, res, next) {
   try {
     const today      = new Date().toISOString().split('T')[0];
     const monthStart = today.slice(0, 7) + '-01';
+
+    // ── Resolve scope ─────────────────────────────────────────────────────
+    const { scope, userIds } = await resolveScope(req.user);
+    const isAll = scope === 'all';
+    // SQL snippet and param builder for lead-scoped queries
+    const leadScope = (alias = 'l', offset = 0) => {
+      if (isAll) return { sql: '', params: [] };
+      return {
+        sql: ` AND (${alias}.created_by = ANY($${offset + 1}) OR ${alias}.assigned_to = ANY($${offset + 1}))`,
+        params: [userIds],
+      };
+    };
+
+    // ── Hub performance period ────────────────────────────────────────────
+    const period = req.query.period || 'month';
+    let hubStart;
+    if (period === 'week') {
+      const d = new Date(); d.setDate(d.getDate() - 6);
+      hubStart = d.toISOString().split('T')[0];
+    } else if (period === 'all') {
+      hubStart = '2000-01-01';
+    } else {
+      hubStart = monthStart;
+    }
+
+    const ls1 = leadScope('l', 1);
+    const ls2 = leadScope('l', 1);
 
     const [
       todayAppts,
@@ -281,49 +299,60 @@ async function getDashboardStats(req, res, next) {
       recentInvoices,
       invoiceStatusBreak,
       pipelineValue,
+      unassignedLeads,
+      pendingEstimates,
+      overdueFollowups,
+      convertedThisMonth,
     ] = await Promise.all([
 
-      // Today's appointments
+      // Today's appointments — no user scoping (appointments page shows all)
       pool.query(
-        `SELECT COUNT(*)::int AS count FROM appointments WHERE scheduled_date = $1::date`,
+        `SELECT COUNT(*)::int AS count FROM appointments a WHERE a.scheduled_date = $1::date`,
         [today]
       ),
 
-      // This month's revenue (customer invoices — amount_paid sum)
+      // This month's revenue — scoped via appointment → lead
       pool.query(
-        `SELECT COALESCE(SUM(amount_paid), 0) AS revenue,
+        `SELECT COALESCE(SUM(ci.amount_paid), 0) AS revenue,
                 COUNT(*)::int AS invoice_count
-           FROM customer_invoices
-          WHERE created_at >= $1::date`,
-        [monthStart]
+           FROM customer_invoices ci
+           ${isAll ? '' : 'LEFT JOIN appointments a ON a.id = ci.appointment_id LEFT JOIN leads l ON l.id = a.lead_id'}
+          WHERE ci.created_at >= $1::date
+          ${isAll ? '' : `AND (l.created_by = ANY($2) OR l.assigned_to = ANY($2))`}`,
+        isAll ? [monthStart] : [monthStart, userIds]
       ),
 
-      // Pending invoices — customer_invoices with outstanding balance
+      // Pending invoices — scoped via appointment → lead
       pool.query(
         `SELECT COUNT(*)::int AS count,
-                COALESCE(SUM(grand_total - amount_paid), 0) AS outstanding_amount
-           FROM customer_invoices
-          WHERE grand_total - amount_paid > 0`
+                COALESCE(SUM(ci.grand_total - ci.amount_paid), 0) AS outstanding_amount
+           FROM customer_invoices ci
+           ${isAll ? '' : 'LEFT JOIN appointments a ON a.id = ci.appointment_id LEFT JOIN leads l ON l.id = a.lead_id'}
+          WHERE ci.grand_total - ci.amount_paid > 0
+          ${isAll ? '' : `AND (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}`,
+        isAll ? [] : [userIds]
       ),
 
-      // Lead conversion rate (leads that have an appointment / total leads)
+      // Lead conversion rate — scoped by lead owner
       pool.query(
         `SELECT
-           COUNT(DISTINCT l.id)::int                                       AS total_leads,
-           COUNT(DISTINCT a.lead_id)::int                                  AS converted_leads,
+           COUNT(DISTINCT l.id)::int AS total_leads,
+           COUNT(DISTINCT a.lead_id)::int AS converted_leads,
            CASE WHEN COUNT(DISTINCT l.id) > 0
                 THEN ROUND(COUNT(DISTINCT a.lead_id)::numeric / COUNT(DISTINCT l.id) * 100, 1)
-                ELSE 0 END                                                 AS conversion_rate
+                ELSE 0 END AS conversion_rate
          FROM leads l
-         LEFT JOIN appointments a ON a.lead_id = l.id`
+         LEFT JOIN appointments a ON a.lead_id = l.id
+         ${isAll ? '' : `WHERE (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}`,
+        isAll ? [] : [userIds]
       ),
 
-      // Hub performance — top hubs by appointment count this month
+      // Hub performance — always system-wide (hub-level metric)
       pool.query(
         `SELECT
            h.hub_name,
-           COUNT(a.id)::int                            AS appointment_count,
-           COALESCE(SUM(a.total_price), 0)             AS total_value
+           COUNT(a.id)::int                AS appointment_count,
+           COALESCE(SUM(a.total_price), 0) AS total_value
          FROM hubs h
          LEFT JOIN appointments a ON a.hub_id = h.id
            AND a.scheduled_date >= $1::date
@@ -331,40 +360,87 @@ async function getDashboardStats(req, res, next) {
          GROUP BY h.id, h.hub_name
          ORDER BY appointment_count DESC
          LIMIT 6`,
-        [monthStart]
+        [hubStart]
       ),
 
-      // Recent customer invoices (last 5)
+      // Recent invoices — scoped via appointment → lead
       pool.query(
         `SELECT ci.id,
                 COALESCE(ci.customer_name, a.customer_name) AS customer_name,
-                COALESCE(ci.mobile, a.mobile)               AS mobile,
-                ci.grand_total  AS total,
+                COALESCE(ci.mobile, a.mobile) AS mobile,
+                ci.grand_total AS total,
                 ci.amount_paid,
                 (ci.grand_total - ci.amount_paid) AS outstanding,
-                ci.status       AS status_name,
+                ci.status AS status_name,
                 ci.created_at
            FROM customer_invoices ci
            LEFT JOIN appointments a ON a.id = ci.appointment_id
-           ORDER BY ci.created_at DESC LIMIT 5`
+           ${isAll ? '' : 'LEFT JOIN leads l ON l.id = a.lead_id'}
+           ${isAll ? '' : `WHERE (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}
+           ORDER BY ci.created_at DESC LIMIT 5`,
+        isAll ? [] : [userIds]
       ),
 
-      // Invoice status breakdown from customer_invoices
+      // Invoice status breakdown — scoped via appointment → lead
       pool.query(
-        `SELECT status AS name, COUNT(*)::int AS count,
-                COALESCE(SUM(grand_total), 0) AS total_amount
-           FROM customer_invoices
-           GROUP BY status
-           ORDER BY count DESC`
+        `SELECT ci.status AS name, COUNT(*)::int AS count,
+                COALESCE(SUM(ci.grand_total), 0) AS total_amount
+           FROM customer_invoices ci
+           ${isAll ? '' : 'LEFT JOIN appointments a ON a.id = ci.appointment_id LEFT JOIN leads l ON l.id = a.lead_id'}
+           ${isAll ? '' : `WHERE (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}
+           GROUP BY ci.status ORDER BY count DESC`,
+        isAll ? [] : [userIds]
       ),
 
-      // Pipeline value — sum total_price for leads whose status has is_pipeline = true
-      // Leads with NULL status (brand-new, no status set) are also counted in pipeline
+      // Pipeline value — scoped by lead owner
       pool.query(
         `SELECT COALESCE(SUM(l.total_price), 0) AS pipeline_value
            FROM leads l
            LEFT JOIN lead_statuses ls ON ls.name = l.status
-          WHERE l.status IS NULL OR ls.is_pipeline = TRUE`
+          WHERE (l.status IS NULL OR ls.is_pipeline = TRUE)
+          ${isAll ? '' : `AND (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}`,
+        isAll ? [] : [userIds]
+      ),
+
+      // Unassigned leads — scoped by lead owner
+      pool.query(
+        `SELECT COUNT(*)::int AS count FROM leads l
+          WHERE l.assigned_to IS NULL
+          ${isAll ? '' : `AND (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}`,
+        isAll ? [] : [userIds]
+      ),
+
+      // Pending estimates — scoped via appointment → lead
+      pool.query(
+        `SELECT COUNT(*)::int AS count
+           FROM estimates e
+           ${isAll ? '' : 'LEFT JOIN appointments a ON a.id = e.appointment_id LEFT JOIN leads l ON l.id = a.lead_id'}
+          WHERE e.status IN ('draft', 'pending_review')
+          ${isAll ? '' : `AND (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}`,
+        isAll ? [] : [userIds]
+      ),
+
+      // Overdue follow-ups — scoped via lead
+      pool.query(
+        `SELECT COUNT(*)::int AS count
+           FROM lead_events le
+           ${isAll ? '' : 'JOIN leads l ON l.id = le.lead_id'}
+          WHERE le.is_done = FALSE
+            AND ((le.due_at IS NOT NULL AND le.due_at < NOW())
+              OR (le.due_at IS NULL AND le.due_date < $1::date))
+          ${isAll ? '' : `AND (l.created_by = ANY($2) OR l.assigned_to = ANY($2))`}`,
+        isAll ? [today] : [today, userIds]
+      ),
+
+      // Converted this month — scoped via lead
+      pool.query(
+        `SELECT COUNT(DISTINCT a.lead_id)::int AS count
+           FROM appointments a
+           ${isAll ? '' : 'JOIN leads l ON l.id = a.lead_id'}
+          WHERE a.created_at >= $1::date
+            AND a.lead_id IS NOT NULL
+          ${isAll ? '' : `AND (l.created_by = ANY($2) OR l.assigned_to = ANY($2))`}`,
+        isAll ? [monthStart] : [monthStart, userIds]
       ),
     ]);
 
@@ -379,34 +455,45 @@ async function getDashboardStats(req, res, next) {
       recent_invoices:     recentInvoices.rows,
       invoice_status_break: invoiceStatusBreak.rows,
       pipeline_value:      Number(pipelineValue.rows[0]?.pipeline_value || 0),
+      unassigned_leads:      unassignedLeads.rows[0]?.count || 0,
+      pending_estimates:     pendingEstimates.rows[0]?.count || 0,
+      overdue_followups:     overdueFollowups.rows[0]?.count || 0,
+      converted_this_month:  convertedThisMonth.rows[0]?.count || 0,
     });
   } catch (err) { next(err); }
 }
 
-module.exports = {
-  getDashboardStats,
-  getSummary,
-  getStatusDistribution,
-  getCategoryRevenue,
-  getByUser,
-  getUserDetail,
-};
-
 // ── Analytics: Monthly Revenue Trend (last 12 months) ────────────────────────
 async function getRevenueTrend(req, res, next) {
   try {
+    const { scope, userIds } = await resolveScope(req.user);
+    const isAll = scope === 'all';
+
+    const params = [];
+    let scopeJoin  = '';
+    let scopeWhere = '';
+
+    if (!isAll) {
+      params.push(userIds);
+      scopeJoin  = `LEFT JOIN appointments a ON a.id = ci.appointment_id
+                    LEFT JOIN leads l ON l.id = a.lead_id`;
+      scopeWhere = `AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))`;
+    }
+
     const r = await pool.query(`
       SELECT
-        TO_CHAR(DATE_TRUNC('month', invoice_date), 'Mon YYYY') AS month,
-        DATE_TRUNC('month', invoice_date) AS month_date,
-        COALESCE(SUM(grand_total), 0)  AS revenue,
-        COUNT(*)                        AS invoice_count,
-        COALESCE(SUM(amount_paid), 0)  AS collected
-      FROM purchase_invoices
-      WHERE invoice_date >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'
-      GROUP BY DATE_TRUNC('month', invoice_date)
+        TO_CHAR(DATE_TRUNC('month', ci.created_at), 'Mon YYYY') AS month,
+        DATE_TRUNC('month', ci.created_at)                      AS month_date,
+        COALESCE(SUM(ci.amount_paid), 0)                        AS revenue,
+        COUNT(*)::int                                            AS invoice_count
+      FROM customer_invoices ci
+      ${scopeJoin}
+      WHERE ci.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'
+      ${scopeWhere}
+      GROUP BY DATE_TRUNC('month', ci.created_at)
       ORDER BY month_date ASC
-    `);
+    `, params);
+
     res.json({ items: r.rows });
   } catch (err) { next(err); }
 }
@@ -436,23 +523,26 @@ async function getTopPerformers(req, res, next) {
   try {
     const [hubs, services] = await Promise.all([
       pool.query(`
-        SELECT h.name AS hub_name,
+        SELECT h.hub_name,
                COUNT(pi.id)                      AS invoice_count,
                COALESCE(SUM(pi.grand_total), 0)  AS revenue
           FROM purchase_invoices pi
           JOIN hubs h ON h.id = pi.hub_id
-         WHERE pi.invoice_date >= NOW() - INTERVAL '90 days'
-         GROUP BY h.id, h.name
+         WHERE pi.created_at >= NOW() - INTERVAL '90 days'
+         GROUP BY h.id, h.hub_name
          ORDER BY revenue DESC NULLS LAST
          LIMIT 8
       `),
       pool.query(`
         SELECT s.name AS service_name,
-               COUNT(ii.id)                   AS usage_count,
-               COALESCE(SUM(ii.total_price), 0) AS revenue
-          FROM invoice_services ii
-          JOIN services s ON s.id = ii.service_id
-         WHERE ii.created_at >= NOW() - INTERVAL '90 days'
+               COUNT(cii.id)                                        AS usage_count,
+               COALESCE(SUM(cii.customer_rate * cii.quantity), 0)   AS revenue
+          FROM customer_invoice_items cii
+          JOIN estimates e        ON e.id  = (SELECT ci.estimate_id FROM customer_invoices ci WHERE ci.id = cii.customer_invoice_id LIMIT 1)
+          JOIN estimate_items ei  ON ei.id = cii.estimate_item_id
+          JOIN services s         ON s.id  = ei.service_id
+         WHERE cii.created_at >= NOW() - INTERVAL '90 days'
+           AND s.id IS NOT NULL
          GROUP BY s.id, s.name
          ORDER BY revenue DESC NULLS LAST
          LIMIT 8
@@ -462,8 +552,75 @@ async function getTopPerformers(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ── Team Performance ──────────────────────────────────────────────────────────
+// GET /api/reports/team-performance?period=week|month|all
+async function getTeamPerformance(req, res, next) {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+
+    // Resolve period → start date
+    const period = req.query.period || 'month';
+    let periodStart;
+    if (period === 'week') {
+      const d = new Date(); d.setDate(d.getDate() - 6);
+      periodStart = d.toISOString().split('T')[0];
+    } else if (period === 'all') {
+      periodStart = '2000-01-01';
+    } else {
+      periodStart = today.slice(0, 7) + '-01'; // this month
+    }
+
+    const rows = await pool.query(
+      `SELECT
+         u.id   AS user_id,
+         u.name AS user_name,
+
+         -- Leads generated (created by user) in period
+         (SELECT COUNT(*)::int FROM leads
+          WHERE created_by = u.id AND created_at::date >= $2)               AS leads_generated,
+
+         -- Leads assigned to user in period
+         (SELECT COUNT(*)::int FROM leads
+          WHERE assigned_to = u.id AND created_at::date >= $2)              AS leads_assigned,
+
+         -- Leads converted (has appointment) for user in period
+         (SELECT COUNT(*)::int FROM leads l2
+          WHERE (l2.created_by = u.id OR l2.assigned_to = u.id)
+            AND l2.created_at::date >= $2
+            AND EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l2.id)) AS leads_converted,
+
+         -- Total pending follow-ups on leads belonging to user
+         (SELECT COUNT(*)::int FROM lead_events le
+          JOIN leads l2 ON l2.id = le.lead_id
+          WHERE (l2.assigned_to = u.id OR l2.created_by = u.id)
+            AND le.is_done = FALSE)                                          AS followups_total,
+
+         -- Today's follow-ups due for user
+         (SELECT COUNT(*)::int FROM lead_events le
+          JOIN leads l2 ON l2.id = le.lead_id
+          WHERE (l2.assigned_to = u.id OR l2.created_by = u.id)
+            AND le.is_done = FALSE
+            AND le.due_date = $1)                                            AS followups_today,
+
+         -- Today's leads (created or assigned today)
+         (SELECT COUNT(*)::int FROM leads
+          WHERE (created_by = u.id OR assigned_to = u.id)
+            AND created_at::date = $1)                                       AS today_leads
+
+       FROM users u
+       WHERE u.hub_id IS NULL
+         AND u.is_super_admin IS NOT TRUE
+       ORDER BY leads_generated DESC`,
+      [today, periodStart]
+    );
+
+    res.json({ items: rows.rows });
+  } catch (err) { next(err); }
+}
+
 module.exports = {
   getDashboardStats, getSummary, getStatusDistribution,
   getCategoryRevenue, getByUser, getUserDetail,
   getRevenueTrend, getConversionFunnel, getTopPerformers,
+  getTeamPerformance,
 };

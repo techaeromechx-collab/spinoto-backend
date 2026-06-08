@@ -29,7 +29,7 @@ const createSchema = z.object({
   is_super_admin: z.boolean().optional(),
   is_active: z.boolean().optional(),
   manager_id: z.coerce.number().int().positive().optional().nullable(),
-  permissions: z.array(z.enum(PERMISSION_CODES)).optional(),
+  permissions: z.array(z.string()).transform(codes => codes.filter(c => PERMISSION_CODES.includes(c))).optional(),
   // Profile fields
   mobile:       z.string().trim().max(20).optional().nullable(),
   department:   z.string().trim().max(80).optional().nullable(),
@@ -50,7 +50,8 @@ const updateSchema = z.object({
 });
 
 const permissionsSchema = z.object({
-  permissions: z.array(z.enum(PERMISSION_CODES)),
+  // Accept any strings, then filter to only valid codes (ignores stale/removed permissions)
+  permissions: z.array(z.string()).transform(codes => codes.filter(c => PERMISSION_CODES.includes(c))),
 });
 
 function handle(req, res, next, fn) {
@@ -84,7 +85,10 @@ async function loadUser(id) {
      GROUP BY u.id, m.name`,
     [id]
   );
-  return r.rows[0] || null;
+  if (!r.rows[0]) return null;
+  // Filter out any stale/removed permission codes that no longer exist in the catalog
+  r.rows[0].permissions = (r.rows[0].permissions || []).filter(c => PERMISSION_CODES.includes(c));
+  return r.rows[0];
 }
 
 /** Replace the full permission set for a user. Run inside a transaction. */
@@ -144,6 +148,10 @@ function listUsers(req, res, next) {
       );
     }
 
+    // Filter out any stale/removed permission codes
+    r.rows.forEach(u => {
+      u.permissions = (u.permissions || []).filter(c => PERMISSION_CODES.includes(c));
+    });
     res.json({ items: r.rows });
   });
 }
