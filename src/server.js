@@ -41,6 +41,7 @@ const settingsRoutes             = require('./routes/settings.routes');
 const rolesRoutes                = require('./routes/roles.routes');
 const logsRoutes                 = require('./routes/logs.routes');
 const discountMasterRoutes       = require('./routes/discount_master.routes');
+const pushRoutes                 = require('./routes/push.routes');
 
 const app = express();
 
@@ -116,6 +117,7 @@ app.use('/api/purchase-invoices', purchaseInvoicesRouter);
 app.use('/api/customer-invoices', customerInvoicesRouter);
 
 app.use('/api/roles', rolesRoutes);
+app.use('/api/push',  pushRoutes);
 app.use('/api/logs',  logsRoutes);
 
 // Stubs for upcoming modules — every module will plug in here.

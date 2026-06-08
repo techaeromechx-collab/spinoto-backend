@@ -9,7 +9,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-const { pool } = require('../config/db');
+const { pool }     = require('../config/db');
+const { sendPush } = require('../utils/sendPush');
 
 // ── Helper: guard against duplicate notifications ─────────────────────────────
 // Returns true if an unread notification of `type` for `leadId`+`userId` was
@@ -41,6 +42,7 @@ async function notify(client, { userId, type, title, body, leadId = null }) {
      VALUES ($1, $2, $3, $4, $5)`,
     [userId, type, title, body, leadId]
   );
+  // Push is handled as a summary after all alerts run — see sendSummaryPushes()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,6 +472,70 @@ async function fireNoActivityAlerts() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Summary push — one push per user for all NEW notifications this tick
+// "New" = created in the last 12 minutes (slightly > scheduler interval of 10m)
+// Groups them: "5 new alerts — 3 Overdue Leads, 1 Missed Follow-up, 1 Escalation"
+// ─────────────────────────────────────────────────────────────────────────────
+const TYPE_LABELS = {
+  overdue_lead:       'Overdue Lead',
+  missed_followup:    'Missed Follow-up',
+  high_priority_lead: 'High Priority Lead',
+  daily_target:       'Daily Target',
+  inactive_lead:      'Inactive Lead',
+  lead_escalation:    'Escalation',
+  duplicate_lead:     'Duplicate Lead',
+  lead_assigned:      'Lead Assigned',
+  lead_converted:     'Lead Converted',
+  no_activity:        'No Activity',
+};
+
+async function sendSummaryPushes() {
+  try {
+    // Find all notifications created in the last 12 minutes, grouped by user + type
+    const { rows } = await pool.query(`
+      SELECT
+        user_id,
+        type,
+        COUNT(*)::int AS cnt
+      FROM notifications
+      WHERE created_at >= NOW() - INTERVAL '12 minutes'
+      GROUP BY user_id, type
+      ORDER BY user_id, cnt DESC
+    `);
+
+    if (!rows.length) return;
+
+    // Group by user
+    const byUser = {};
+    for (const row of rows) {
+      if (!byUser[row.user_id]) byUser[row.user_id] = [];
+      byUser[row.user_id].push(row);
+    }
+
+    for (const [userId, items] of Object.entries(byUser)) {
+      const total = items.reduce((s, r) => s + r.cnt, 0);
+
+      // Build summary line: "3 Overdue Leads, 1 Missed Follow-up"
+      const parts = items.map(r => {
+        const label = TYPE_LABELS[r.type] || r.type;
+        return `${r.cnt} ${label}${r.cnt > 1 ? 's' : ''}`;
+      });
+
+      const title = `🔔 ${total} new alert${total > 1 ? 's' : ''}`;
+      const body  = parts.join(', ');
+
+      // Use the type of the first (most frequent) alert for the settings check
+      const primaryType = items[0].type;
+      sendPush(parseInt(userId, 10), primaryType, title, body, '/leads');
+    }
+
+    console.log(`[SmartAlerts] Summary push sent to ${Object.keys(byUser).length} user(s)`);
+  } catch (err) {
+    console.error('[SmartAlerts] Summary push error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Run all scheduled alerts (called by scheduler on each tick)
 // ─────────────────────────────────────────────────────────────────────────────
 async function runScheduledAlerts() {
@@ -482,6 +548,8 @@ async function runScheduledAlerts() {
     fireEscalationAlerts(),
     fireNoActivityAlerts(),
   ]);
+  // After all alerts are written to DB, send one summary push per user
+  await sendSummaryPushes();
 }
 
 module.exports = {
