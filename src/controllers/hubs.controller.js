@@ -372,6 +372,13 @@ function updateHub(req, res, next) {
     // If the hub was rejected, editing it resets it to pending for re-review
     const wasRejected = exists.rows[0].verification_status === 'rejected';
 
+    // Prevent activating a hub that hasn't been verified
+    if (data.is_active === true && exists.rows[0].verification_status !== 'verified') {
+      return res.status(400).json({
+        error: `Cannot activate hub — verification status is "${exists.rows[0].verification_status}". Please verify the hub first.`,
+      });
+    }
+
     if (data.rm_user_id) {
       const rmCheck = await pool.query('SELECT id FROM users WHERE id = $1 AND is_active = TRUE', [data.rm_user_id]);
       if (rmCheck.rowCount === 0) return res.status(400).json({ error: 'Selected RM is not an active user' });

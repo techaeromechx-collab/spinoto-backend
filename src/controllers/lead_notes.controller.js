@@ -19,6 +19,7 @@ function listNotes(req, res, next) {
     const r = await pool.query(
       `SELECT
          n.id, n.lead_id, n.note, n.created_at,
+         n.created_by,
          u.name AS created_by_name
        FROM lead_notes n
        LEFT JOIN users u ON u.id = n.created_by

@@ -82,13 +82,11 @@ const LEAD_SELECT = `
     EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) AS is_converted,
     (SELECT le.due_date FROM lead_events le
       WHERE le.lead_id = l.id AND le.is_done = FALSE
-        AND le.due_date >= CURRENT_DATE
       ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
       LIMIT 1
     ) AS next_follow_up_date,
     (SELECT le.due_at FROM lead_events le
       WHERE le.lead_id = l.id AND le.is_done = FALSE
-        AND le.due_date >= CURRENT_DATE
       ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
       LIMIT 1
     ) AS next_follow_up_time
@@ -181,13 +179,11 @@ function listLeads(req, res, next) {
         EXISTS (SELECT 1 FROM appointments ap WHERE ap.lead_id = l.id) AS is_converted,
         (SELECT le.due_date FROM lead_events le
           WHERE le.lead_id = l.id AND le.is_done = FALSE
-            AND le.due_date >= CURRENT_DATE
           ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
           LIMIT 1
         ) AS next_follow_up_date,
         (SELECT le.due_at FROM lead_events le
           WHERE le.lead_id = l.id AND le.is_done = FALSE
-            AND le.due_date >= CURRENT_DATE
           ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
           LIMIT 1
         ) AS next_follow_up_time
