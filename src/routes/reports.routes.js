@@ -29,6 +29,8 @@ router.get('/user-detail/:userId', canView,        c.getUserDetail);
 router.get('/analytics/revenue-trend',   canViewRevenue,  c.getRevenueTrend);
 router.get('/analytics/funnel',          canViewLeads,    c.getConversionFunnel);
 router.get('/analytics/top-performers',  canViewRevenue,  c.getTopPerformers);
+router.get('/analytics/leads-over-time', canViewLeads,    c.getLeadsOverTime);
+router.get('/analytics/leads-by-source', canViewLeads,    c.getLeadsBySource);
 router.get('/team-performance',          canViewTeamPerf, c.getTeamPerformance);
 
 module.exports = router;

@@ -8,6 +8,17 @@ function dateParams(from, to, params, field) {
   return parts.length ? parts.join(' AND ') : '';
 }
 
+// ── Hub WHERE helper ───────────────────────────────────────────────────────────
+// Filters leads by the hub of the user who created/is assigned to the lead
+function hubClause(hubId, params, createdByAlias = 'created_by', assignedToAlias = 'assigned_to') {
+  if (!hubId) return '';
+  params.push(Number(hubId));
+  const n = params.length;
+  return `EXISTS (
+    SELECT 1 FROM users _u WHERE _u.id IN (${createdByAlias}, ${assignedToAlias}) AND _u.hub_id = $${n}
+  )`;
+}
+
 // ── Resolve scope (mirrors leads controller logic) ────────────────────────────
 // Returns { scope, userIds }
 // scope: 'all' | 'team' | 'own'
@@ -32,30 +43,50 @@ async function resolveScope(user) {
 // =====================================================================
 async function getSummary(req, res, next) {
   try {
-    const { from, to }          = req.query;
-    const { scope, userIds }    = await resolveScope(req.user);
-    const params                = [];
+    const { from, to, hub_id, prev_from, prev_to } = req.query;
+    const { scope, userIds } = await resolveScope(req.user);
 
-    // scope clause
-    let scopeWhere = '';
-    if (userIds) { params.push(userIds); scopeWhere = `created_by = ANY($${params.length})`; }
+    function buildQuery(f, t) {
+      const params = [];
+      let scopeWhere = '';
+      if (userIds) { params.push(userIds); scopeWhere = `created_by = ANY($${params.length})`; }
+      const dw  = dateParams(f, t, params, 'created_at');
+      const hub = hubClause(hub_id, params);
+      const clauses = [scopeWhere, dw, hub].filter(Boolean);
+      const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return { sql: `
+        SELECT
+          COUNT(*)::int                                                                        AS total_leads,
+          COUNT(*) FILTER (
+            WHERE status IN (
+              SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+            )
+          )::int                                                                               AS converted_leads,
+          COALESCE(SUM(total_price), 0)::numeric                                              AS total_potential_revenue,
+          COALESCE(SUM(total_price) FILTER (
+            WHERE status IN (
+              SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+            )
+          ), 0)::numeric                                                                       AS realized_revenue
+        FROM leads ${where}
+      `, params };
+    }
 
-    // date clause
-    const dw = dateParams(from, to, params, 'created_at');
+    const curr = buildQuery(from, to);
+    const queries = [pool.query(curr.sql, curr.params)];
 
-    const clauses = [scopeWhere, dw].filter(Boolean);
-    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    // Previous period comparison
+    if (prev_from && prev_to) {
+      const prev = buildQuery(prev_from, prev_to);
+      queries.push(pool.query(prev.sql, prev.params));
+    }
 
-    const r = await pool.query(`
-      SELECT
-        COUNT(*)::int                                                               AS total_leads,
-        COUNT(*) FILTER (WHERE status = 'converted')::int                          AS converted_leads,
-        COALESCE(SUM(total_price), 0)::numeric                                     AS total_potential_revenue,
-        COALESCE(SUM(total_price) FILTER (WHERE status = 'converted'), 0)::numeric AS realized_revenue
-      FROM leads ${where}
-    `, params);
-
-    res.json({ ...r.rows[0], scope });
+    const [currRes, prevRes] = await Promise.all(queries);
+    res.json({
+      ...currRes.rows[0],
+      scope,
+      prev: prevRes ? prevRes.rows[0] : null,
+    });
   } catch (err) { next(err); }
 }
 
@@ -64,15 +95,16 @@ async function getSummary(req, res, next) {
 // =====================================================================
 async function getStatusDistribution(req, res, next) {
   try {
-    const { from, to }       = req.query;
-    const { userIds }        = await resolveScope(req.user);
-    const params             = [];
+    const { from, to, hub_id } = req.query;
+    const { userIds }          = await resolveScope(req.user);
+    const params               = [];
 
     let scopeWhere = '';
     if (userIds) { params.push(userIds); scopeWhere = `created_by = ANY($${params.length})`; }
 
     const dw      = dateParams(from, to, params, 'created_at');
-    const clauses = [scopeWhere, dw].filter(Boolean);
+    const hub     = hubClause(hub_id, params);
+    const clauses = [scopeWhere, dw, hub].filter(Boolean);
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
     const r = await pool.query(`
@@ -91,15 +123,16 @@ async function getStatusDistribution(req, res, next) {
 // =====================================================================
 async function getCategoryRevenue(req, res, next) {
   try {
-    const { from, to }       = req.query;
-    const { userIds }        = await resolveScope(req.user);
-    const params             = [];
+    const { from, to, hub_id } = req.query;
+    const { userIds }          = await resolveScope(req.user);
+    const params               = [];
 
     let scopeJoin = '';
     if (userIds) { params.push(userIds); scopeJoin = `AND l.created_by = ANY($${params.length})`; }
 
-    const dw      = dateParams(from, to, params, 'l.created_at');
-    const dateCond = dw ? `AND ${dw}` : '';
+    const dw       = dateParams(from, to, params, 'l.created_at');
+    const hub      = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
+    const dateCond = [dw, hub].filter(Boolean).map(c => `AND ${c}`).join(' ');
 
     const r = await pool.query(`
       SELECT
@@ -122,7 +155,7 @@ async function getCategoryRevenue(req, res, next) {
 // =====================================================================
 async function getByUser(req, res, next) {
   try {
-    const { from, to }          = req.query;
+    const { from, to, hub_id }  = req.query;
     const { scope, userIds }    = await resolveScope(req.user);
     const params                = [];
 
@@ -131,6 +164,10 @@ async function getByUser(req, res, next) {
     if (userIds) {
       params.push(userIds);
       userWhere = `u.is_active = TRUE AND u.id = ANY($${params.length})`;
+    }
+    if (hub_id) {
+      params.push(Number(hub_id));
+      userWhere += ` AND u.hub_id = $${params.length}`;
     }
 
     // Date filter on leads join
@@ -143,9 +180,13 @@ async function getByUser(req, res, next) {
         u.name                                                                      AS user_name,
         u.email,
         COUNT(l.id)::int                                                            AS total_leads,
-        COUNT(l.id) FILTER (WHERE l.status = 'converted')::int                     AS converted_leads,
+        COUNT(l.id) FILTER (
+          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        )::int                                                                      AS converted_leads,
         COALESCE(SUM(l.total_price), 0)::numeric                                   AS total_revenue,
-        COALESCE(SUM(l.total_price) FILTER (WHERE l.status = 'converted'), 0)::numeric AS realized_revenue
+        COALESCE(SUM(l.total_price) FILTER (
+          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        ), 0)::numeric                                                              AS realized_revenue
       FROM users u
       LEFT JOIN leads l ON l.created_by = u.id ${dateCond}
       WHERE ${userWhere}
@@ -190,14 +231,20 @@ async function getUserDetail(req, res, next) {
         u.email,
         u.is_super_admin,
         COUNT(l.id)::int                                                               AS total_leads,
-        COUNT(l.id) FILTER (WHERE l.status = 'converted')::int                        AS converted_leads,
+        COUNT(l.id) FILTER (
+          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        )::int                                                                         AS converted_leads,
         COUNT(l.id) FILTER (WHERE l.created_at::date = CURRENT_DATE)::int             AS leads_today,
         COUNT(l.id) FILTER (
-          WHERE l.status IS NOT NULL AND l.status NOT IN ('converted','lost','cancelled','appointment cancelled')
+          WHERE l.status IS NOT NULL
+            AND l.status NOT IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+            AND l.status NOT IN (SELECT name FROM lead_statuses WHERE is_active = FALSE)
         )::int                                                                         AS active_leads,
         COUNT(l.id) FILTER (WHERE l.status IS NULL)::int                               AS new_leads,
         COALESCE(SUM(l.total_price), 0)::numeric                                       AS pipeline_value,
-        COALESCE(SUM(l.total_price) FILTER (WHERE l.status = 'converted'),0)::numeric  AS realized_revenue
+        COALESCE(SUM(l.total_price) FILTER (
+          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        ), 0)::numeric                                                                 AS realized_revenue
       FROM users u
       LEFT JOIN leads l ON l.created_by = u.id ${dateCond}
       WHERE u.id = $1
@@ -237,9 +284,11 @@ async function getUserDetail(req, res, next) {
     // 4. Recent leads (latest 10, always real-time)
     const rlRes = await pool.query(`
       SELECT
-        l.id, l.name, l.mobile, l.status, l.total_price, l.vehicle_type_id,
+        l.id, l.name, l.mobile, l.status, l.total_price,
+        vt.name AS vehicle_type_name,
         l.created_at
       FROM leads l
+      LEFT JOIN vehicle_types vt ON vt.id = l.vehicle_type_id
       WHERE l.created_by = $1
       ORDER BY l.created_at DESC
       LIMIT 10
@@ -463,9 +512,10 @@ async function getDashboardStats(req, res, next) {
   } catch (err) { next(err); }
 }
 
-// ── Analytics: Monthly Revenue Trend (last 12 months) ────────────────────────
+// ── Analytics: Monthly Revenue Trend ─────────────────────────────────────────
 async function getRevenueTrend(req, res, next) {
   try {
+    const { from, to } = req.query;
     const { scope, userIds } = await resolveScope(req.user);
     const isAll = scope === 'all';
 
@@ -480,6 +530,15 @@ async function getRevenueTrend(req, res, next) {
       scopeWhere = `AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))`;
     }
 
+    // Date range — default to last 12 months if not provided
+    let dateWhere;
+    if (from && to) {
+      params.push(from); params.push(to);
+      dateWhere = `ci.created_at >= $${params.length - 1}::date AND ci.created_at < ($${params.length}::date + interval '1 day')`;
+    } else {
+      dateWhere = `ci.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'`;
+    }
+
     const r = await pool.query(`
       SELECT
         TO_CHAR(DATE_TRUNC('month', ci.created_at), 'Mon YYYY') AS month,
@@ -488,7 +547,7 @@ async function getRevenueTrend(req, res, next) {
         COUNT(*)::int                                            AS invoice_count
       FROM customer_invoices ci
       ${scopeJoin}
-      WHERE ci.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'
+      WHERE ${dateWhere}
       ${scopeWhere}
       GROUP BY DATE_TRUNC('month', ci.created_at)
       ORDER BY month_date ASC
@@ -501,11 +560,21 @@ async function getRevenueTrend(req, res, next) {
 // ── Analytics: Conversion Funnel ─────────────────────────────────────────────
 async function getConversionFunnel(req, res, next) {
   try {
+    const { from, to } = req.query;
+    function buildFunnelQ(table) {
+      if (from && to) {
+        return pool.query(
+          `SELECT COUNT(*) AS total FROM ${table} WHERE created_at >= $1::date AND created_at < ($2::date + interval '1 day')`,
+          [from, to]
+        );
+      }
+      return pool.query(`SELECT COUNT(*) AS total FROM ${table}`);
+    }
     const [leads, appts, estimates, invoices] = await Promise.all([
-      pool.query(`SELECT COUNT(*) AS total FROM leads`),
-      pool.query(`SELECT COUNT(*) AS total FROM appointments`),
-      pool.query(`SELECT COUNT(*) AS total FROM estimates`),
-      pool.query(`SELECT COUNT(*) AS total FROM purchase_invoices`),
+      buildFunnelQ('leads'),
+      buildFunnelQ('appointments'),
+      buildFunnelQ('estimates'),
+      buildFunnelQ('purchase_invoices'),
     ]);
     res.json({
       funnel: [
@@ -518,9 +587,18 @@ async function getConversionFunnel(req, res, next) {
   } catch (err) { next(err); }
 }
 
-// ── Analytics: Top Hubs & Top Services (last 90 days) ────────────────────────
+// ── Analytics: Top Hubs & Top Services ───────────────────────────────────────
 async function getTopPerformers(req, res, next) {
   try {
+    const { from, to } = req.query;
+    const dateParams = from && to ? [from, to] : [];
+    const hubDateWhere = from && to
+      ? `pi.created_at >= $1::date AND pi.created_at < ($2::date + interval '1 day')`
+      : `pi.created_at >= NOW() - INTERVAL '90 days'`;
+    const svcDateWhere = from && to
+      ? `cii.created_at >= $1::date AND cii.created_at < ($2::date + interval '1 day')`
+      : `cii.created_at >= NOW() - INTERVAL '90 days'`;
+
     const [hubs, services] = await Promise.all([
       pool.query(`
         SELECT h.hub_name,
@@ -528,11 +606,11 @@ async function getTopPerformers(req, res, next) {
                COALESCE(SUM(pi.grand_total), 0)  AS revenue
           FROM purchase_invoices pi
           JOIN hubs h ON h.id = pi.hub_id
-         WHERE pi.created_at >= NOW() - INTERVAL '90 days'
+         WHERE ${hubDateWhere}
          GROUP BY h.id, h.hub_name
          ORDER BY revenue DESC NULLS LAST
          LIMIT 8
-      `),
+      `, dateParams),
       pool.query(`
         SELECT s.name AS service_name,
                COUNT(cii.id)                                        AS usage_count,
@@ -541,12 +619,12 @@ async function getTopPerformers(req, res, next) {
           JOIN estimates e        ON e.id  = (SELECT ci.estimate_id FROM customer_invoices ci WHERE ci.id = cii.customer_invoice_id LIMIT 1)
           JOIN estimate_items ei  ON ei.id = cii.estimate_item_id
           JOIN services s         ON s.id  = ei.service_id
-         WHERE cii.created_at >= NOW() - INTERVAL '90 days'
+         WHERE ${svcDateWhere}
            AND s.id IS NOT NULL
          GROUP BY s.id, s.name
          ORDER BY revenue DESC NULLS LAST
          LIMIT 8
-      `),
+      `, dateParams),
     ]);
     res.json({ top_hubs: hubs.rows, top_services: services.rows });
   } catch (err) { next(err); }
@@ -618,9 +696,80 @@ async function getTeamPerformance(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ── Leads By Source ───────────────────────────────────────────────────────────
+// GET /api/reports/leads-by-source?from=&to=&hub_id=
+async function getLeadsBySource(req, res, next) {
+  try {
+    const { from, to, hub_id } = req.query;
+    const { userIds } = await resolveScope(req.user);
+    const params = [];
+
+    let scopeWhere = '';
+    if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
+
+    const dw  = dateParams(from, to, params, 'l.created_at');
+    const hub = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
+
+    const clauses = [scopeWhere, dw, hub].filter(Boolean);
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const r = await pool.query(`
+      SELECT
+        COALESCE(NULLIF(TRIM(l.lead_source), ''), 'Unknown') AS source,
+        COUNT(*)::int                                          AS total,
+        COUNT(*) FILTER (
+          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        )::int                                                 AS converted
+      FROM leads l
+      ${where}
+      GROUP BY COALESCE(NULLIF(TRIM(l.lead_source), ''), 'Unknown')
+      ORDER BY total DESC
+    `, params);
+
+    res.json({ items: r.rows });
+  } catch (err) { next(err); }
+}
+
+// ── Leads Over Time ───────────────────────────────────────────────────────────
+// GET /api/reports/leads-over-time?from=&to=&group_by=day|week&hub_id=
+async function getLeadsOverTime(req, res, next) {
+  try {
+    const { from, to, hub_id, group_by = 'day' } = req.query;
+    const { userIds } = await resolveScope(req.user);
+    const params = [];
+
+    // scope
+    let scopeWhere = '';
+    if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
+
+    // date
+    const dw  = dateParams(from, to, params, 'l.created_at');
+
+    // hub — filter by users who belong to that hub
+    const hub = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
+
+    const clauses = [scopeWhere, dw, hub].filter(Boolean);
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const trunc = group_by === 'week' ? 'week' : group_by === 'month' ? 'month' : 'day';
+
+    const r = await pool.query(`
+      SELECT
+        DATE_TRUNC('${trunc}', l.created_at)::date AS period,
+        COUNT(*)::int                               AS count
+      FROM leads l
+      ${where}
+      GROUP BY DATE_TRUNC('${trunc}', l.created_at)
+      ORDER BY period ASC
+    `, params);
+
+    res.json({ items: r.rows, group_by: trunc });
+  } catch (err) { next(err); }
+}
+
 module.exports = {
   getDashboardStats, getSummary, getStatusDistribution,
   getCategoryRevenue, getByUser, getUserDetail,
   getRevenueTrend, getConversionFunnel, getTopPerformers,
-  getTeamPerformance,
+  getTeamPerformance, getLeadsOverTime, getLeadsBySource,
 };
