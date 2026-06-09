@@ -1,6 +1,7 @@
 'use strict';
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { sendPush } = require('../utils/sendPush');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -107,6 +108,7 @@ function addNote(req, res, next) {
                VALUES ($1, 'note_added', $2, $3, $4)`,
               [uid, title, body, leadId]
             );
+            sendPush(uid, 'note_added', title, body, '/leads');
           }
         }
       }

@@ -35,7 +35,7 @@ function listNotifications(req, res, next) {
        LEFT JOIN leads l ON l.id = n.lead_id
        WHERE n.user_id = $1
        ORDER BY n.created_at DESC
-       LIMIT 30`,
+       LIMIT 100`,
       [req.user.id]
     );
     res.json({ items: r.rows, scope: 'own' });

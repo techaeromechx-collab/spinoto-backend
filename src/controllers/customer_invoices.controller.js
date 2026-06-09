@@ -212,6 +212,9 @@ function deletePayment(req, res, next) {
       await client.query('BEGIN');
       await _recalcStatus(client, id);
       await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     } finally { client.release(); }
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);

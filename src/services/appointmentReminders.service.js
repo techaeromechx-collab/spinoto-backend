@@ -51,9 +51,13 @@ async function fireAppointmentReminders() {
           -- appointment is upcoming within this window
           AND (a.scheduled_date::timestamp + a.scheduled_time::time)
                 BETWEEN NOW() AND (NOW() + ($1 || ' hours')::interval)
-          -- not already cancelled/done
+          -- not already cancelled/done/invoiced
           AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%cancel%'
           AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%complet%'
+          AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%invoice%'
+          AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%approved%'
+          AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%paid%'
+          AND LOWER(COALESCE(ast.name,'')) NOT ILIKE '%closed%'
           -- not already notified for this window
           AND NOT EXISTS (
             SELECT 1 FROM appointment_reminder_log rl

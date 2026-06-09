@@ -526,9 +526,11 @@ async function sendSummaryPushes() {
         body,
         COUNT(*) OVER (PARTITION BY user_id, type)::int AS cnt,
         COUNT(*) OVER (PARTITION BY user_id)::int         AS total,
-        ROW_NUMBER() OVER (PARTITION BY user_id, type ORDER BY created_at DESC) AS rn
+        ROW_NUMBER() OVER (PARTITION BY user_id, type ORDER BY created_at DESC)::int AS rn
       FROM notifications
       WHERE created_at >= NOW() - INTERVAL '12 minutes'
+        -- Exclude types that already fire their own immediate push
+        AND type NOT IN ('note_added','follow_up_scheduled','appointment_reminder','lead_assigned')
     `);
 
     if (!rows.length) return;

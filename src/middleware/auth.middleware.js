@@ -25,7 +25,7 @@ async function requireAuth(req, res, next) {
 
   try {
     const r = await pool.query(
-      `SELECT u.id, u.email, u.is_super_admin, u.is_active, u.hub_id,
+      `SELECT u.id, u.name, u.email, u.is_super_admin, u.is_active, u.hub_id,
               COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions
        FROM users u
        LEFT JOIN user_permissions up ON up.user_id = u.id
@@ -39,6 +39,7 @@ async function requireAuth(req, res, next) {
 
     req.user = {
       id:             u.id,
+      name:           u.name,
       email:          u.email,
       is_super_admin: u.is_super_admin,
       hub_id:         u.hub_id || null,

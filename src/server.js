@@ -149,13 +149,14 @@ const PORT = process.env.PORT || 4000;
      WHERE type = 'no_activity' AND (body IS NULL OR body = '')`
   ).catch(() => {});
 
-  // Ensure all users have follow_up_scheduled + appointment_reminder enabled by default
+  // Ensure all users have new notification types enabled by default
   pool.query(
     `UPDATE users
      SET notification_settings = notification_settings
-       || '{"follow_up_scheduled": true, "appointment_reminder": true}'::jsonb
+       || '{"follow_up_scheduled": true, "appointment_reminder": true, "note_added": true}'::jsonb
      WHERE NOT (notification_settings ? 'follow_up_scheduled')
-        OR NOT (notification_settings ? 'appointment_reminder')`
+        OR NOT (notification_settings ? 'appointment_reminder')
+        OR NOT (notification_settings ? 'note_added')`
   ).catch(() => {});
 
   app.listen(PORT, () => {
