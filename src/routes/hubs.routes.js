@@ -28,19 +28,31 @@ const {
   deleteDocument,
 } = require('../controllers/hub_documents.controller');
 
-// ── Multer: local disk storage for hub documents ──────────────────────────────
+// ── Multer storage ────────────────────────────────────────────────────────────
+// Use memoryStorage when ImageKit is configured (files go straight to CDN).
+// Fall back to diskStorage if ImageKit env vars are not set.
 
-const hubDocsDir = path.join(__dirname, '../../uploads/hub-docs');
-if (!fs.existsSync(hubDocsDir)) fs.mkdirSync(hubDocsDir, { recursive: true });
+const imagekitConfigured = !!(
+  process.env.IMAGEKIT_PUBLIC_KEY &&
+  process.env.IMAGEKIT_PRIVATE_KEY &&
+  process.env.IMAGEKIT_URL_ENDPOINT
+);
 
-const storage = multer.diskStorage({
-  destination: hubDocsDir,
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uid = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    cb(null, `hubdoc-${uid}${ext}`);
-  },
-});
+let storage;
+if (imagekitConfigured) {
+  storage = multer.memoryStorage();
+} else {
+  const hubDocsDir = path.join(__dirname, '../../uploads/hub-docs');
+  if (!fs.existsSync(hubDocsDir)) fs.mkdirSync(hubDocsDir, { recursive: true });
+  storage = multer.diskStorage({
+    destination: hubDocsDir,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const uid = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      cb(null, `hubdoc-${uid}${ext}`);
+    },
+  });
+}
 
 const upload = multer({
   storage,

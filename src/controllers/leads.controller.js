@@ -5,7 +5,8 @@ const {
   fireDuplicateLeadAlert,
   fireLeadConversionAlert,
 } = require('../services/smartAlerts.service');
-const { logActivity } = require('../services/activityLog.service');
+const { logActivity }  = require('../services/activityLog.service');
+const { sendPush }     = require('../utils/sendPush');
 
 // ---------- validators ----------
 const leadSchema = z.object({
@@ -519,16 +520,15 @@ function updateLead(req, res, next) {
           const assignerName = assignerRow.rows[0]?.name || 'Someone';
           const parts = [prevLead?.name, prevLead?.mobile].filter(Boolean);
           const leadLabel = parts.join(' • ') || `Lead #${id}`;
+          const notifTitle = 'Lead Assigned';
+          const notifBody  = `${leadLabel} assigned to you by ${assignerName}`;
           await pool.query(
             `INSERT INTO notifications (user_id, type, title, body, lead_id)
              VALUES ($1, 'lead_assigned', $2, $3, $4)`,
-            [
-              coreData.assigned_to,
-              `Lead assigned to you by ${assignerName}`,
-              `${leadLabel}`,
-              id,
-            ]
+            [coreData.assigned_to, notifTitle, notifBody, id]
           );
+          // Push immediately (single assignment — don't wait for summary)
+          sendPush(coreData.assigned_to, 'lead_assigned', notifTitle, notifBody, '/leads');
         }
       }
 
@@ -885,7 +885,7 @@ function bulkAssign(req, res, next) {
       await pool.query(
         `INSERT INTO notifications (user_id, type, title, body, lead_id)
          VALUES ($1, 'lead_assigned', $2, $3, $4)`,
-        [assigned_to, `Lead assigned to you by ${assignerName}`, `Lead #${leadId} assigned`, leadId]
+        [assigned_to, `Lead Assigned`, `Lead #${leadId} assigned to you by ${assignerName}`, leadId]
       );
       // Log assignment change to activity timeline
       await pool.query(
@@ -894,6 +894,14 @@ function bulkAssign(req, res, next) {
         [leadId, prevAssignedMap[leadId] || null, newAssigneeName, req.user.id]
       );
     }
+
+    // One summary push for all assigned leads
+    const count = assignable_ids.length;
+    const bulkTitle = count === 1 ? 'Lead Assigned' : `${count} Leads Assigned`;
+    const bulkBody  = count === 1
+      ? `Lead #${assignable_ids[0]} assigned to you by ${assignerName}`
+      : `Assigned to you by ${assignerName}`;
+    sendPush(assigned_to, 'lead_assigned', bulkTitle, bulkBody, '/leads');
 
     res.json({ updated: assignable_ids.length, skipped_converted: convertedIds.size });
   });

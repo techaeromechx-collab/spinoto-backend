@@ -2,17 +2,21 @@
  * Hub Documents controller
  *
  * Handles upload / list / delete of documents attached to a hub.
- * Files are stored locally under backend/uploads/hub-docs/
- * (when switching to cloud later, only this file + the multer storage
- *  config in hubs.routes.js need to change).
+ * Files are uploaded to ImageKit CDN when env vars are set.
+ * Falls back to local disk storage if ImageKit is not configured.
  */
 
-const { z }  = require('zod');
+const { z }    = require('zod');
 const { pool } = require('../config/db');
-const path   = require('path');
-const fs     = require('fs');
+const path     = require('path');
+const fs       = require('fs');
+const { uploadToImageKit, deleteFromImageKit } = require('../utils/imagekit');
 
 const idParam = z.coerce.number().int().positive();
+
+function imagekitEnabled() {
+  return !!(process.env.IMAGEKIT_PUBLIC_KEY && process.env.IMAGEKIT_PRIVATE_KEY && process.env.IMAGEKIT_URL_ENDPOINT);
+}
 
 const VALID_DOC_TYPES = [
   'aadhaar',
@@ -91,30 +95,51 @@ function uploadDocument(req, res, next) {
       return res.status(404).json({ error: 'HUB not found' });
     }
 
-    // If a file of this type already exists, delete the old file from disk
-    // (the DB row will be replaced via ON CONFLICT ... DO UPDATE)
+    // If a file of this type already exists, delete the old one
     const existing = await pool.query(
-      'SELECT file_url FROM hub_documents WHERE hub_id = $1 AND doc_type = $2',
+      'SELECT file_url, imagekit_file_id FROM hub_documents WHERE hub_id = $1 AND doc_type = $2',
       [hubId, docType]
     );
     if (existing.rowCount > 0) {
-      safeUnlink(diskPath(existing.rows[0].file_url));
+      const old = existing.rows[0];
+      if (old.imagekit_file_id) {
+        // Delete from ImageKit
+        await deleteFromImageKit(old.imagekit_file_id);
+      } else {
+        // Delete from local disk (legacy)
+        safeUnlink(diskPath(old.file_url));
+      }
     }
 
-    const fileUrl     = `/uploads/hub-docs/${req.file.filename}`;
-    const uploadedBy  = req.user?.id || null;
+    let fileUrl        = null;
+    let imagekitFileId = null;
+    const uploadedBy   = req.user?.id || null;
+
+    if (imagekitEnabled()) {
+      // Upload to ImageKit
+      const folder = `hub-docs/${docType}`;
+      const result = await uploadToImageKit(req.file.buffer, req.file.originalname, folder);
+      fileUrl        = result.url;
+      imagekitFileId = result.fileId;
+      // Clean up temp file if disk storage was used
+      if (req.file.path) safeUnlink(req.file.path);
+    } else {
+      // Fallback: local disk
+      fileUrl = `/uploads/hub-docs/${req.file.filename}`;
+    }
 
     const r = await pool.query(
-      `INSERT INTO hub_documents (hub_id, doc_type, file_name, file_url, uploaded_by)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO hub_documents (hub_id, doc_type, file_name, file_url, uploaded_by, imagekit_file_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (hub_id, doc_type)
        DO UPDATE SET
-         file_name   = EXCLUDED.file_name,
-         file_url    = EXCLUDED.file_url,
-         uploaded_at = NOW(),
-         uploaded_by = EXCLUDED.uploaded_by
+         file_name          = EXCLUDED.file_name,
+         file_url           = EXCLUDED.file_url,
+         uploaded_at        = NOW(),
+         uploaded_by        = EXCLUDED.uploaded_by,
+         imagekit_file_id   = EXCLUDED.imagekit_file_id
        RETURNING *`,
-      [hubId, docType, req.file.originalname, fileUrl, uploadedBy]
+      [hubId, docType, req.file.originalname, fileUrl, uploadedBy, imagekitFileId]
     );
 
     res.status(201).json({ item: r.rows[0] });
@@ -134,7 +159,13 @@ function deleteDocument(req, res, next) {
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Document not found' });
 
-    safeUnlink(diskPath(r.rows[0].file_url));
+    const doc = r.rows[0];
+    if (doc.imagekit_file_id) {
+      await deleteFromImageKit(doc.imagekit_file_id);
+    } else {
+      safeUnlink(diskPath(doc.file_url));
+    }
+
     await pool.query('DELETE FROM hub_documents WHERE id = $1', [docId]);
     res.status(204).end();
   });
