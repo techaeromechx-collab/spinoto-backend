@@ -56,7 +56,7 @@ if (imagekitConfigured) {
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB cap
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB cap (frontend compresses before upload)
   fileFilter: (_req, file, cb) => {
     const allowed = ['.pdf', '.jpg', '.jpeg', '.png'];
     const ext = path.extname(file.originalname).toLowerCase();

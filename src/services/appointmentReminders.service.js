@@ -22,6 +22,7 @@
  */
 
 const { pool } = require('../config/db');
+const { sendPush } = require('../utils/sendPush');
 
 const WINDOWS = [
   { hours: 24,   label: '24 hours' },
@@ -90,7 +91,10 @@ async function fireAppointmentReminders() {
             ON CONFLICT DO NOTHING
             RETURNING id
           `, [userId, title, body]);
-          if (r.rows.length > 0) notified++;
+          if (r.rows.length > 0) {
+            notified++;
+            sendPush(userId, 'appointment_reminder', title, body, '/appointments');
+          }
         }
 
         // Fix #6: only log when at least one notification fired

@@ -142,6 +142,22 @@ const PORT = process.env.PORT || 4000;
   } catch (err) {
     console.warn('[seed] could not refresh seed passwords:', err.message);
   }
+  // Fix null-body no_activity notifications created before body text was added
+  pool.query(
+    `UPDATE notifications
+     SET body = 'No lead activity logged in 2+ hours. Please update your leads.'
+     WHERE type = 'no_activity' AND (body IS NULL OR body = '')`
+  ).catch(() => {});
+
+  // Ensure all users have follow_up_scheduled + appointment_reminder enabled by default
+  pool.query(
+    `UPDATE users
+     SET notification_settings = notification_settings
+       || '{"follow_up_scheduled": true, "appointment_reminder": true}'::jsonb
+     WHERE NOT (notification_settings ? 'follow_up_scheduled')
+        OR NOT (notification_settings ? 'appointment_reminder')`
+  ).catch(() => {});
+
   app.listen(PORT, () => {
     console.log(`Spinoto API listening on http://localhost:${PORT}`);
     startScheduler();

@@ -450,6 +450,7 @@ function updateLead(req, res, next) {
              VALUES ($1, 'follow_up_scheduled', $2, $3, $4)`,
             [uid, `Follow-up scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, id]
           );
+          sendPush(uid, 'follow_up_scheduled', `Follow-up Scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, '/leads');
         }
       }
 

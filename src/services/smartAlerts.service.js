@@ -517,42 +517,48 @@ const TYPE_LABELS = {
 
 async function sendSummaryPushes() {
   try {
-    // Find all notifications created in the last 12 minutes, grouped by user + type
+    // Fetch recent notifications with actual title+body (last 12 minutes)
     const { rows } = await pool.query(`
       SELECT
         user_id,
         type,
-        COUNT(*)::int AS cnt
+        title,
+        body,
+        COUNT(*) OVER (PARTITION BY user_id, type)::int AS cnt,
+        COUNT(*) OVER (PARTITION BY user_id)::int         AS total,
+        ROW_NUMBER() OVER (PARTITION BY user_id, type ORDER BY created_at DESC) AS rn
       FROM notifications
       WHERE created_at >= NOW() - INTERVAL '12 minutes'
-      GROUP BY user_id, type
-      ORDER BY user_id, cnt DESC
     `);
 
     if (!rows.length) return;
 
-    // Group by user
+    // Keep only one representative row per user+type (latest), plus total count
     const byUser = {};
     for (const row of rows) {
-      if (!byUser[row.user_id]) byUser[row.user_id] = [];
-      byUser[row.user_id].push(row);
+      if (row.rn !== 1) continue; // only first row per user+type
+      if (!byUser[row.user_id]) byUser[row.user_id] = { total: row.total, items: [] };
+      byUser[row.user_id].items.push(row);
     }
 
-    for (const [userId, items] of Object.entries(byUser)) {
-      const total = items.reduce((s, r) => s + r.cnt, 0);
+    for (const [userId, { total, items }] of Object.entries(byUser)) {
+      let pushTitle, pushBody;
 
-      // Build summary line: "3 Overdue Leads, 1 Missed Follow-up"
-      const parts = items.map(r => {
-        const label = TYPE_LABELS[r.type] || r.type;
-        return `${r.cnt} ${label}${r.cnt > 1 ? 's' : ''}`;
-      });
+      if (total === 1) {
+        // Single notification — use actual title + body directly
+        pushTitle = items[0].title;
+        pushBody  = items[0].body || '';
+      } else {
+        // Multiple notifications — show summary count
+        pushTitle = `🔔 ${total} new alert${total > 1 ? 's' : ''}`;
+        pushBody  = items.map(r => {
+          const label = TYPE_LABELS[r.type] || r.type;
+          return `${r.cnt} ${label}${r.cnt > 1 ? 's' : ''}`;
+        }).join(', ');
+      }
 
-      const title = `🔔 ${total} new alert${total > 1 ? 's' : ''}`;
-      const body  = parts.join(', ');
-
-      // Use the type of the first (most frequent) alert for the settings check
       const primaryType = items[0].type;
-      sendPush(parseInt(userId, 10), primaryType, title, body, '/leads');
+      sendPush(parseInt(userId, 10), primaryType, pushTitle, pushBody, '/leads');
     }
 
     console.log(`[SmartAlerts] Summary push sent to ${Object.keys(byUser).length} user(s)`);
