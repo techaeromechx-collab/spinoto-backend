@@ -29,6 +29,7 @@ const createSchema = z.object({
   is_super_admin: z.boolean().optional(),
   is_active: z.boolean().optional(),
   manager_id: z.coerce.number().int().positive().optional().nullable(),
+  role_id: z.coerce.number().int().positive().optional().nullable(),
   permissions: z.array(z.string()).transform(codes => codes.filter(c => PERMISSION_CODES.includes(c))).optional(),
   // Profile fields
   mobile:       z.string().trim().max(20).optional().nullable(),
@@ -43,6 +44,8 @@ const updateSchema = z.object({
   is_super_admin: z.boolean().optional(),
   is_active: z.boolean().optional(),
   manager_id: z.coerce.number().int().positive().optional().nullable(),
+  role_id: z.coerce.number().int().positive().optional().nullable(),
+  permissions: z.array(z.string()).transform(codes => codes.filter(c => PERMISSION_CODES.includes(c))).optional(),
   // Profile fields
   mobile:       z.string().trim().max(20).optional().nullable(),
   department:   z.string().trim().max(80).optional().nullable(),
@@ -77,12 +80,14 @@ async function loadUser(id) {
     `SELECT u.id, u.name, u.email, u.is_active, u.is_super_admin, u.created_at, u.updated_at,
             u.mobile, u.department, u.joining_date, u.profile_photo, u.last_login,
             u.manager_id, m.name AS manager_name,
+            u.role_id, r.name AS role_name,
             COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions
      FROM users u
      LEFT JOIN users m ON m.id = u.manager_id
+     LEFT JOIN roles r ON r.id = u.role_id
      LEFT JOIN user_permissions up ON up.user_id = u.id
      WHERE u.id = $1
-     GROUP BY u.id, m.name`,
+     GROUP BY u.id, m.name, r.name`,
     [id]
   );
   if (!r.rows[0]) return null;
@@ -124,12 +129,14 @@ function listUsers(req, res, next) {
       r = await pool.query(
         `SELECT u.id, u.name, u.email, u.is_active, u.is_super_admin, u.created_at,
                 u.manager_id, m.name AS manager_name,
+                u.role_id, ro.name AS role_name,
                 COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions
          FROM users u
          LEFT JOIN users m ON m.id = u.manager_id
+         LEFT JOIN roles ro ON ro.id = u.role_id
          LEFT JOIN user_permissions up ON up.user_id = u.id
          WHERE u.hub_id IS NULL
-         GROUP BY u.id, m.name
+         GROUP BY u.id, m.name, ro.name
          ORDER BY u.created_at ASC`
       );
     } else {
@@ -137,12 +144,14 @@ function listUsers(req, res, next) {
       r = await pool.query(
         `SELECT u.id, u.name, u.email, u.is_active, u.is_super_admin, u.created_at,
                 u.manager_id, m.name AS manager_name,
+                u.role_id, ro.name AS role_name,
                 COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions
          FROM users u
          LEFT JOIN users m ON m.id = u.manager_id
+         LEFT JOIN roles ro ON ro.id = u.role_id
          LEFT JOIN user_permissions up ON up.user_id = u.id
          WHERE u.manager_id = $1 AND u.hub_id IS NULL
-         GROUP BY u.id, m.name
+         GROUP BY u.id, m.name, ro.name
          ORDER BY u.created_at ASC`,
         [req.user.id]
       );
@@ -176,18 +185,26 @@ function getUser(req, res, next) {
 function createUser(req, res, next) {
   handle(req, res, next, async () => {
     const data = createSchema.parse(req.body);
+
+    // Only super admins may create super admins — otherwise any MANAGE_USERS
+    // user could escalate privileges by creating a super admin account.
+    if (data.is_super_admin === true && !req.user.is_super_admin) {
+      return res.status(403).json({ error: 'Only a Super Admin can create Super Admin accounts' });
+    }
+
     const passwordHash = await bcrypt.hash(data.password, 10);
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const r = await client.query(
-        `INSERT INTO users (name, email, password_hash, is_super_admin, is_active, manager_id, mobile, department, joining_date)
-         VALUES ($1, $2, $3, COALESCE($4, FALSE), COALESCE($5, TRUE), $6, $7, $8, $9)
+        `INSERT INTO users (name, email, password_hash, is_super_admin, is_active, manager_id, role_id, mobile, department, joining_date)
+         VALUES ($1, $2, $3, COALESCE($4, FALSE), COALESCE($5, TRUE), $6, $7, $8, $9, $10)
          RETURNING id`,
         [
           data.name, data.email.toLowerCase(), passwordHash,
           data.is_super_admin, data.is_active, data.manager_id ?? null,
+          data.role_id ?? null,
           data.mobile ?? null, data.department ?? null, data.joining_date ?? null,
         ]
       );
@@ -220,36 +237,73 @@ function updateUser(req, res, next) {
       return res.status(400).json({ error: "You can't deactivate your own account" });
     }
 
+    // Privilege-escalation guards (route only requires MANAGE_USERS):
+    //   - only super admins may grant or revoke the super admin flag
+    //   - non-super admins may not modify a super admin account at all
+    if (!req.user.is_super_admin) {
+      if (data.is_super_admin !== undefined) {
+        return res.status(403).json({ error: 'Only a Super Admin can change the Super Admin flag' });
+      }
+      const target = await pool.query('SELECT is_super_admin FROM users WHERE id = $1', [id]);
+      if (target.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+      if (target.rows[0].is_super_admin) {
+        return res.status(403).json({ error: 'Only a Super Admin can modify a Super Admin account' });
+      }
+    }
+
     const passwordHash = data.password ? await bcrypt.hash(data.password, 10) : null;
 
-    const r = await pool.query(
-      `UPDATE users SET
-         name           = COALESCE($1, name),
-         email          = COALESCE(LOWER($2), email),
-         password_hash  = COALESCE($3, password_hash),
-         is_super_admin = COALESCE($4, is_super_admin),
-         is_active      = COALESCE($5, is_active),
-         manager_id     = CASE WHEN $6::boolean THEN $7::int ELSE manager_id END,
-         mobile         = COALESCE($9, mobile),
-         department     = COALESCE($10, department),
-         joining_date   = COALESCE($11::date, joining_date)
-       WHERE id = $8
-       RETURNING id`,
-      [
-        data.name           ?? null,
-        data.email          ?? null,
-        passwordHash,
-        data.is_super_admin ?? null,
-        data.is_active      ?? null,
-        'manager_id' in data,
-        data.manager_id     ?? null,
-        id,
-        data.mobile         ?? null,
-        data.department     ?? null,
-        data.joining_date   ?? null,
-      ]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        `UPDATE users SET
+           name           = COALESCE($1, name),
+           email          = COALESCE(LOWER($2), email),
+           password_hash  = COALESCE($3, password_hash),
+           is_super_admin = COALESCE($4, is_super_admin),
+           is_active      = COALESCE($5, is_active),
+           manager_id     = CASE WHEN $6::boolean THEN $7::int ELSE manager_id END,
+           role_id        = CASE WHEN $12::boolean THEN $13::int ELSE role_id END,
+           mobile         = CASE WHEN $14::boolean THEN $9::text  ELSE mobile END,
+           department     = CASE WHEN $15::boolean THEN $10::text ELSE department END,
+           joining_date   = CASE WHEN $16::boolean THEN $11::date ELSE joining_date END
+         WHERE id = $8
+         RETURNING id`,
+        [
+          data.name           ?? null,
+          data.email          ?? null,
+          passwordHash,
+          data.is_super_admin ?? null,
+          data.is_active      ?? null,
+          'manager_id' in data,
+          data.manager_id     ?? null,
+          id,
+          data.mobile         ?? null,
+          data.department     ?? null,
+          data.joining_date   ?? null,
+          'role_id' in data,
+          data.role_id        ?? null,
+          'mobile' in data,        // $14 — sending null now clears the field
+          'department' in data,    // $15
+          'joining_date' in data,  // $16
+        ]
+      );
+      if (r.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'User not found' }); }
+
+      // Replace permissions if provided (e.g. when role changes)
+      if (data.permissions !== undefined) {
+        await replacePermissions(client, id, data.permissions);
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
     const user = await loadUser(id);
     res.json({ item: user });
   });
@@ -261,8 +315,25 @@ function deleteUser(req, res, next) {
     if (req.user.id === id) {
       return res.status(400).json({ error: "You can't delete your own account" });
     }
-    const r = await pool.query('DELETE FROM users WHERE id = $1', [id]);
-    if (r.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+
+    const target = await pool.query('SELECT is_super_admin FROM users WHERE id = $1', [id]);
+    if (target.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    if (target.rows[0].is_super_admin && !req.user.is_super_admin) {
+      return res.status(403).json({ error: 'Only a Super Admin can delete a Super Admin account' });
+    }
+
+    try {
+      const r = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+      if (r.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    } catch (err) {
+      // FK violation — the user has linked records (leads, estimates, …).
+      if (err.code === '23503') {
+        return res.status(400).json({
+          error: 'This user has linked records (leads, estimates, etc.) and cannot be deleted. Deactivate the account instead.',
+        });
+      }
+      throw err;
+    }
     res.status(204).end();
   });
 }

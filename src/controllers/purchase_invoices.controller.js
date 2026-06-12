@@ -151,7 +151,9 @@ function generatePurchaseInvoice(req, res, next) {
 
     // Validate estimate
     const estRow = await pool.query(
-      `SELECT e.id, e.status, e.appointment_id, e.hub_id FROM estimates e WHERE e.id = $1`, [estimate_id]
+      `SELECT e.id, e.status, e.appointment_id, e.hub_id,
+              e.discount_mode, e.transaction_discount_type, e.transaction_discount_value
+       FROM estimates e WHERE e.id = $1`, [estimate_id]
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const est = estRow.rows[0];
@@ -187,11 +189,43 @@ function generatePurchaseInvoice(req, res, next) {
     );
     if (itemsRow.rowCount === 0) return res.status(400).json({ error: 'No completed approved items found in this estimate' });
 
+    // Transaction-level discount: distribute proportionally across items by inc-GST amount
+    // Formula: x = txDiscount / (totalIncGst / 100)
+    //          item_discount = (item_total_inc_gst / 100) * x
+    //                        = (item_total_inc_gst / totalIncGst) * txDiscount
+    const txDiscountMode  = est.discount_mode || 'none';
+    const txDiscountType  = est.transaction_discount_type || 'percent';
+    const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
+
+    // Sum of total_inc_gst across all eligible items (base for proportional split)
+    const totalIncGstSum = itemsRow.rows.reduce((s, it) => s + Number(it.total_inc_gst ?? 0), 0);
+
+    // Compute the total transaction discount amount (inc-GST)
+    let txDiscountTotal = 0;
+    if (txDiscountMode === 'transaction' && txDiscountValue > 0 && totalIncGstSum > 0) {
+      if (txDiscountType === 'percent') {
+        txDiscountTotal = parseFloat((totalIncGstSum * txDiscountValue / 100).toFixed(2));
+      } else {
+        txDiscountTotal = Math.min(txDiscountValue, totalIncGstSum);
+      }
+    }
+
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const items = itemsRow.rows.map(item => {
-      const qty      = Number(item.quantity);
-      const custRate = Number(item.customer_rate);
-      const gstPct   = Number(item.gst_percent);
+      const qty    = Number(item.quantity);
+      const gstPct = Number(item.gst_percent);
+
+      // Determine post-discount inc-GST for this item:
+      // 1. Start with line-item discount (total_inc_gst already reflects it)
+      // 2. Then apply this item's proportional share of the transaction discount
+      const itemIncGst = Number(item.total_inc_gst ?? 0);
+      const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
+        ? parseFloat((itemIncGst / totalIncGstSum * txDiscountTotal).toFixed(4))
+        : 0;
+      const postDiscIncGst = parseFloat((itemIncGst - itemTxDiscount).toFixed(4));
+
+      // custRate = post-discount ex-GST per unit
+      const custRate = parseFloat((postDiscIncGst / qty / (1 + gstPct / 100)).toFixed(4));
 
       let appliedRatePct; // the % stored per-item for audit trail
       let hubRate;
@@ -219,7 +253,7 @@ function generatePurchaseInvoice(req, res, next) {
       totalGst      += gstAmount;
       grandTotal    += totalPayable;
 
-      return { ...item, hubRate, appliedRatePct, techDeductAmt, gstAmount, totalPayable };
+      return { ...item, custRate, hubRate, appliedRatePct, techDeductAmt, gstAmount, totalPayable };
     });
 
     const client = await pool.connect();
@@ -249,7 +283,7 @@ function generatePurchaseInvoice(req, res, next) {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [
             piId, item.id, item.item_type, item.description,
-            item.quantity, item.customer_rate,
+            item.quantity, item.custRate,  // post-discount ex-GST (= customer_rate when no discount)
             item.appliedRatePct ?? 0,   // stores commission% or tech_rate% — NOT NULL so fallback to 0
             item.hubRate,
             item.gst_percent, item.gstAmount, item.totalPayable,
@@ -630,6 +664,237 @@ function deleteHubPayment(req, res, next) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/purchase-invoices/:id
+// Update take rates per item after approval.
+// Blocked if payment_status = 'paid' or any payment exists.
+// ─────────────────────────────────────────────────────────────────────────────
+function updatePurchaseInvoice(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+
+    const { item_rates } = z.object({
+      item_rates: z.array(z.object({
+        item_id:   z.number().int(),
+        take_rate: z.number().min(0).max(100),
+      })).min(1),
+    }).parse(req.body || {});
+
+    const r = await pool.query(
+      `SELECT status, payment_status, amount_paid FROM purchase_invoices WHERE id = $1`, [id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    const pi = r.rows[0];
+    if (pi.payment_status === 'paid' || parseFloat(pi.amount_paid) > 0) {
+      return res.status(400).json({ error: 'Cannot edit — payment has already been recorded.' });
+    }
+
+    const rateMap = {};
+    item_rates.forEach(r => { rateMap[r.item_id] = r.take_rate; });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const itemsRow = await client.query(
+        `SELECT id, quantity, customer_rate, gst_percent FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [id]
+      );
+
+      let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
+      for (const item of itemsRow.rows) {
+        const qty      = Number(item.quantity);
+        const custRate = Number(item.customer_rate);
+        const gstPct   = Number(item.gst_percent);
+        const takeRate = rateMap[item.id] != null ? rateMap[item.id] : 0;
+
+        const techDeduct = parseFloat((custRate * (takeRate / 100)).toFixed(4));
+        const hubRate    = parseFloat((custRate - techDeduct).toFixed(4));
+        const hubAmount  = parseFloat((hubRate * qty).toFixed(2));
+        const gstAmt     = parseFloat((hubAmount * gstPct / 100).toFixed(2));
+        const total      = parseFloat((hubAmount + gstAmt).toFixed(2));
+
+        subtotalExGst += hubAmount;
+        totalGst      += gstAmt;
+        grandTotal    += total;
+
+        await client.query(
+          `UPDATE purchase_invoice_items SET hub_rate=$1, commission_percent=$2, gst_amount=$3, total_payable=$4 WHERE id=$5`,
+          [hubRate, takeRate, gstAmt, total, item.id]
+        );
+      }
+
+      await client.query(
+        `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, updated_at=NOW() WHERE id=$4`,
+        [subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), id]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    full.rows[0].items        = await _getItems(id);
+    full.rows[0].hub_payments = await _getHubPayments(id);
+    full.rows[0].schedule     = await _getPaymentSchedule(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/purchase-invoices/:id/sync-from-estimate
+// Re-derives all line items + totals from the linked estimate.
+// Blocked if PI payment_status = 'paid'.
+// ─────────────────────────────────────────────────────────────────────────────
+function syncPurchaseInvoiceFromEstimate(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+
+    const piRow = await pool.query(
+      `SELECT pi.id, pi.estimate_id, pi.hub_id, pi.rate_mode, pi.commission_percent,
+              pi.payment_status
+       FROM purchase_invoices pi WHERE pi.id = $1`,
+      [id]
+    );
+    if (!piRow.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    const pi = piRow.rows[0];
+
+    if (pi.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Cannot sync — Purchase Invoice is already paid.' });
+    }
+
+    // Re-fetch estimate discount fields
+    const estRow = await pool.query(
+      `SELECT e.discount_mode, e.transaction_discount_type, e.transaction_discount_value
+       FROM estimates e WHERE e.id = $1`,
+      [pi.estimate_id]
+    );
+    const est = estRow.rows[0] || {};
+
+    // Hub rates
+    const hubRow = await pool.query(
+      `SELECT commission_percent, tech_rate_service, tech_rate_parts FROM hubs WHERE id = $1`,
+      [pi.hub_id]
+    );
+    const hub             = hubRow.rows[0] || {};
+    const commissionPct   = hub.commission_percent != null ? Number(hub.commission_percent) : null;
+    const techRateService = hub.tech_rate_service  != null ? Number(hub.tech_rate_service)  : null;
+    const techRateParts   = hub.tech_rate_parts    != null ? Number(hub.tech_rate_parts)    : null;
+    const useCommission   = commissionPct != null && commissionPct > 0;
+    const rateMode        = useCommission ? 'commission' : 'tech_rate';
+
+    // Eligible items
+    const itemsRow = await pool.query(
+      `SELECT * FROM estimate_items
+       WHERE estimate_id = $1 AND customer_approved = true AND work_status = 'completed'`,
+      [pi.estimate_id]
+    );
+    if (itemsRow.rowCount === 0) {
+      return res.status(400).json({ error: 'No completed approved items found in estimate.' });
+    }
+
+    // Transaction discount
+    const txDiscountMode  = est.discount_mode || 'none';
+    const txDiscountType  = est.transaction_discount_type || 'percent';
+    const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
+    const totalIncGstSum  = itemsRow.rows.reduce((s, it) => s + Number(it.total_inc_gst ?? 0), 0);
+    let txDiscountTotal = 0;
+    if (txDiscountMode === 'transaction' && txDiscountValue > 0 && totalIncGstSum > 0) {
+      txDiscountTotal = txDiscountType === 'percent'
+        ? parseFloat((totalIncGstSum * txDiscountValue / 100).toFixed(2))
+        : Math.min(txDiscountValue, totalIncGstSum);
+    }
+
+    let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
+    const items = itemsRow.rows.map(item => {
+      const qty    = Number(item.quantity);
+      const gstPct = Number(item.gst_percent);
+
+      const itemIncGst     = Number(item.total_inc_gst ?? 0);
+      const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
+        ? parseFloat((itemIncGst / totalIncGstSum * txDiscountTotal).toFixed(4))
+        : 0;
+      const postDiscIncGst = parseFloat((itemIncGst - itemTxDiscount).toFixed(4));
+      const custRate       = parseFloat((postDiscIncGst / qty / (1 + gstPct / 100)).toFixed(4));
+
+      let appliedRatePct, hubRate;
+      if (useCommission) {
+        appliedRatePct = commissionPct;
+        hubRate        = parseFloat((custRate * (1 - commissionPct / 100)).toFixed(4));
+      } else {
+        const isService  = item.item_type === 'service';
+        const techRate   = isService ? (techRateService ?? 0) : (techRateParts ?? 0);
+        appliedRatePct   = techRate;
+        const techDeduct = parseFloat((custRate * (techRate / 100)).toFixed(4));
+        hubRate          = parseFloat((custRate - techDeduct).toFixed(4));
+      }
+
+      const hubAmount    = parseFloat((hubRate * qty).toFixed(2));
+      const gstAmount    = parseFloat((hubAmount * gstPct / 100).toFixed(2));
+      const totalPayable = parseFloat((hubAmount + gstAmount).toFixed(2));
+
+      subtotalExGst += hubAmount;
+      totalGst      += gstAmount;
+      grandTotal    += totalPayable;
+
+      return { ...item, custRate, hubRate, appliedRatePct, gstAmount, totalPayable };
+    });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Replace items
+      await client.query(`DELETE FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [id]);
+      for (const item of items) {
+        await client.query(
+          `INSERT INTO purchase_invoice_items
+             (purchase_invoice_id, estimate_item_id, item_type, description,
+              quantity, customer_rate, commission_percent, hub_rate,
+              gst_percent, gst_amount, total_payable)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [
+            id, item.id, item.item_type, item.description,
+            item.quantity, item.custRate,
+            item.appliedRatePct ?? 0,
+            item.hubRate,
+            item.gst_percent, item.gstAmount, item.totalPayable,
+          ]
+        );
+      }
+
+      // Update PI totals
+      await client.query(
+        `UPDATE purchase_invoices
+         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3,
+             rate_mode=$4, commission_percent=$5, updated_at=NOW()
+         WHERE id=$6`,
+        [
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          rateMode, useCommission ? commissionPct : 0,
+          id,
+        ]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    full.rows[0].items        = await _getItems(id);
+    full.rows[0].hub_payments = await _getHubPayments(id);
+    full.rows[0].schedule     = await _getPaymentSchedule(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
 // ── GET /api/purchase-invoices/payouts — dashboard of pending hub payouts, bucketed
 function listPayouts(req, res, next) {
   handle(req, res, next, async () => {
@@ -813,4 +1078,4 @@ function bulkPayment(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, listHubPayments, getTechRateSummary, bulkPayment };
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment };

@@ -14,6 +14,12 @@ const SEED_USERS = [
 ];
 
 async function ensureSeedPasswords() {
+  // SAFETY: never run in production — this would silently reset the super
+  // admin password back to the documented dev password on every boot,
+  // undoing any password change the admin made.
+  if (process.env.NODE_ENV === 'production' && process.env.FORCE_SEED_PASSWORDS !== 'true') {
+    return;
+  }
   for (const { email, password } of SEED_USERS) {
     const r = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
     if (r.rowCount === 0) continue;

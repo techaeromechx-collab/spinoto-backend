@@ -39,15 +39,21 @@ const itemSchema = z.object({
 });
 
 const createSchema = z.object({
-  appointment_id: z.coerce.number().int().positive(),
-  hub_id:         z.coerce.number().int().positive().optional().nullable(),
-  notes:          z.string().trim().max(3000).optional().nullable(),
-  items:          z.array(itemSchema).optional().default([]),
+  appointment_id:            z.coerce.number().int().positive(),
+  hub_id:                    z.coerce.number().int().positive().optional().nullable(),
+  notes:                     z.string().trim().max(3000).optional().nullable(),
+  items:                     z.array(itemSchema).optional().default([]),
+  discount_mode:             z.enum(['none', 'line_item', 'transaction']).default('none'),
+  transaction_discount_type: z.enum(['percent', 'flat']).optional().nullable(),
+  transaction_discount_value: z.coerce.number().nonnegative().optional().default(0),
 });
 
 const updateSchema = z.object({
-  notes: z.string().trim().max(3000).optional().nullable(),
-  items: z.array(itemSchema).optional(),
+  notes:                     z.string().trim().max(3000).optional().nullable(),
+  items:                     z.array(itemSchema).optional(),
+  discount_mode:             z.enum(['none', 'line_item', 'transaction']).optional(),
+  transaction_discount_type: z.enum(['percent', 'flat']).optional().nullable(),
+  transaction_discount_value: z.coerce.number().nonnegative().optional(),
 });
 
 const customerApprovalSchema = z.object({
@@ -77,13 +83,22 @@ function handle(req, res, next, fn) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function computeItem(data) {
-  const qty         = Number(data.quantity)        || 1;
-  const rate        = Number(data.customer_rate)   || 0; // ex-GST (stored at 4dp precision)
-  const gstPct      = Number(data.gst_percent)     || 0;
-  const discountAmt = Number(data.discount_amount) || 0;
+  const qty    = Number(data.quantity)      || 1;
+  const rate   = Number(data.customer_rate) || 0; // ex-GST (stored at 4dp precision)
+  const gstPct = Number(data.gst_percent)   || 0;
 
   // Step 1: total inc-GST before discount
   const totalBeforeDisc = parseFloat((rate * qty * (1 + gstPct / 100)).toFixed(2));
+
+  // Step 1b: derive the discount amount SERVER-SIDE from type + value.
+  // Never trust a client-supplied discount_amount — it could zero out a line.
+  let discountAmt = 0;
+  const dValue = Number(data.discount_value) || 0;
+  if (data.discount_type === 'percent' && dValue > 0) {
+    discountAmt = parseFloat((totalBeforeDisc * dValue / 100).toFixed(2));
+  } else if (data.discount_type === 'flat' && dValue > 0) {
+    discountAmt = Math.min(dValue, totalBeforeDisc);
+  }
   // Step 2: apply line-item discount
   const totalIncGst = parseFloat((Math.max(0, totalBeforeDisc - discountAmt)).toFixed(2));
   // Step 3: back-calculate ex-GST from the discounted total (correct for Indian GST)
@@ -96,15 +111,54 @@ function computeItem(data) {
 }
 
 async function recalcTotals(client, estimateId) {
-  // subtotal_ex_gst = sum of post-discount ex-GST amounts = total_inc_gst − gst_amount
+  // Step 1: sum items (per-item discounts already baked into total_inc_gst)
+  const sumRes = await client.query(`
+    SELECT
+      COALESCE(SUM(total_inc_gst - gst_amount), 0) AS subtotal_ex_gst,
+      COALESCE(SUM(gst_amount), 0)                 AS total_gst,
+      COALESCE(SUM(total_inc_gst), 0)              AS grand_total_before
+    FROM estimate_items WHERE estimate_id = $1
+  `, [estimateId]);
+
+  const { subtotal_ex_gst, total_gst, grand_total_before } = sumRes.rows[0];
+
+  // Step 2: fetch discount mode for this estimate
+  const modeRes = await client.query(
+    `SELECT discount_mode, transaction_discount_type, transaction_discount_value
+     FROM estimates WHERE id = $1`,
+    [estimateId]
+  );
+  const { discount_mode, transaction_discount_type, transaction_discount_value } = modeRes.rows[0] || {};
+
+  // Step 3: apply transaction-level discount if applicable
+  let transactionDiscountAmount = 0;
+  let grandTotal = parseFloat(grand_total_before);
+
+  if (discount_mode === 'transaction' && parseFloat(transaction_discount_value) > 0) {
+    const val = parseFloat(transaction_discount_value);
+    if (transaction_discount_type === 'percent') {
+      transactionDiscountAmount = parseFloat((grandTotal * val / 100).toFixed(2));
+    } else if (transaction_discount_type === 'flat') {
+      transactionDiscountAmount = Math.min(val, grandTotal);
+    }
+    grandTotal = parseFloat((grandTotal - transactionDiscountAmount).toFixed(2));
+  }
+
   await client.query(`
     UPDATE estimates SET
-      subtotal_ex_gst = (SELECT COALESCE(SUM(total_inc_gst - gst_amount), 0) FROM estimate_items WHERE estimate_id = $1),
-      total_gst       = (SELECT COALESCE(SUM(gst_amount), 0)                 FROM estimate_items WHERE estimate_id = $1),
-      grand_total     = (SELECT COALESCE(SUM(total_inc_gst), 0)              FROM estimate_items WHERE estimate_id = $1),
-      updated_at      = NOW()
-    WHERE id = $1
-  `, [estimateId]);
+      subtotal_ex_gst          = $1,
+      total_gst                = $2,
+      grand_total              = $3,
+      transaction_discount_amount = $4,
+      updated_at               = NOW()
+    WHERE id = $5
+  `, [
+    subtotal_ex_gst,
+    total_gst,
+    grandTotal.toFixed(2),
+    transactionDiscountAmount.toFixed(2),
+    estimateId,
+  ]);
 }
 
 async function _getItems(estimateId) {
@@ -158,6 +212,10 @@ const EST_SELECT = `
     e.created_by,
     e.created_at,
     e.updated_at,
+    e.discount_mode,
+    e.transaction_discount_type,
+    e.transaction_discount_value,
+    e.transaction_discount_amount,
 
     -- Appointment info
     a.customer_name,
@@ -189,7 +247,8 @@ const EST_SELECT = `
     (SELECT COUNT(*)::int FROM estimate_items ei WHERE ei.estimate_id = e.id) AS item_count,
 
     -- Linked customer invoice (null if not yet generated)
-    (SELECT ci.id FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_id,
+    (SELECT ci.id     FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_id,
+    (SELECT ci.status FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_status,
 
     -- Linked purchase invoice (id + status, so UI can gate CI generation)
     (SELECT pi.id     FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_id,
@@ -234,6 +293,16 @@ function listEstimates(req, res, next) {
     if (hubId)         { params.push(Number(hubId));         conditions.push(`e.hub_id = $${params.length}`); }
     if (status)        { params.push(status);                conditions.push(`e.status = $${params.length}`); }
 
+    // Free-text search across customer name, vehicle number, mobile and
+    // estimate id (matches the search box placeholder on the Estimates page).
+    if (req.query.search && req.query.search.trim()) {
+      params.push(`%${req.query.search.trim()}%`);
+      const n = params.length;
+      conditions.push(
+        `(a.customer_name ILIKE $${n} OR a.vehicle_number ILIKE $${n} OR a.mobile ILIKE $${n} OR CAST(e.id AS TEXT) ILIKE $${n})`
+      );
+    }
+
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const [dataRes, countRes] = await Promise.all([
@@ -241,7 +310,15 @@ function listEstimates(req, res, next) {
         `${EST_SELECT} ${where} ORDER BY e.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
-      pool.query(`SELECT COUNT(*)::int AS total FROM estimates e ${where}`, params),
+      // Count needs the appointments join too — the search condition
+      // references a.* columns.
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM estimates e
+         LEFT JOIN appointments a ON a.id = e.appointment_id
+         ${where}`,
+        params
+      ),
     ]);
 
     return res.json({
@@ -299,17 +376,44 @@ function createEstimate(req, res, next) {
     try {
       await client.query('BEGIN');
 
+      // Serialize concurrent creates for the same appointment, then re-check
+      // the one-estimate-per-appointment guard INSIDE the transaction —
+      // the pre-check above is not atomic on its own.
+      await client.query(`SELECT pg_advisory_xact_lock(1, $1)`, [data.appointment_id]);
+      const dupInTx = await client.query(
+        `SELECT id FROM estimates WHERE appointment_id = $1 LIMIT 1`,
+        [data.appointment_id]
+      );
+      if (dupInTx.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: `An estimate already exists for appointment #${data.appointment_id}.`,
+          existing_estimate_id: dupInTx.rows[0].id,
+        });
+      }
+
       const ins = await client.query(
-        `INSERT INTO estimates (appointment_id, hub_id, status, notes, created_by)
-         VALUES ($1, $2, 'draft', $3, $4)
+        `INSERT INTO estimates
+           (appointment_id, hub_id, status, notes, created_by,
+            discount_mode, transaction_discount_type, transaction_discount_value)
+         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7)
          RETURNING id`,
-        [data.appointment_id, data.hub_id, data.notes || null, req.user.id]
+        [
+          data.appointment_id, data.hub_id, data.notes || null, req.user.id,
+          data.discount_mode, // schema defaults to 'none'
+          data.transaction_discount_type || null,
+          data.transaction_discount_value || 0,
+        ]
       );
 
       const estimateId = ins.rows[0].id;
 
+      const forceZeroDiscount = ['transaction', 'none'].includes(data.discount_mode);
       for (const item of data.items) {
-        const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(item);
+        const itemForCalc = forceZeroDiscount
+          ? { ...item, discount_type: null, discount_value: 0, discount_amount: 0 }
+          : item;
+        const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc);
         const svcId  = item.item_type === 'service' ? (item.service_id || item.item_id || null) : null;
         const partId = item.item_type === 'part'    ? (item.part_id    || item.item_id || null) : null;
         await client.query(
@@ -336,16 +440,19 @@ function createEstimate(req, res, next) {
             gstAmount,
             totalIncGst,
             item.is_from_appointment ?? false,
-            item.discount_type   || null,
-            item.discount_value  || 0,
-            discountAmt,
-            item.discount_source || null,
+            forceZeroDiscount ? null        : (item.discount_type   || null),
+            forceZeroDiscount ? 0           : (item.discount_value  || 0),
+            forceZeroDiscount ? 0           : discountAmt,
+            forceZeroDiscount ? null        : (item.discount_source || null),
           ]
         );
       }
 
       await recalcTotals(client, estimateId);
       await client.query('COMMIT');
+
+      // Auto-advance appointment status to "Estimate Created"
+      await advanceAppointmentStatus(data.appointment_id, 'estimate-created');
 
       const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [estimateId]);
       const estimate = row.rows[0];
@@ -362,7 +469,7 @@ function createEstimate(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/estimates/:id — Update (draft / revision_requested only)
+// PATCH /api/estimates/:id — Update (any status; invoice sync handled by caller)
 // ─────────────────────────────────────────────────────────────────────────────
 function updateEstimate(req, res, next) {
   handle(req, res, next, async () => {
@@ -373,13 +480,16 @@ function updateEstimate(req, res, next) {
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
     const { status } = cur.rows[0];
-    if (!['draft', 'revision_requested'].includes(status)) {
-      return res.status(409).json({
-        error: `Estimate cannot be edited in status '${status}'. Only draft or revision_requested estimates are editable.`,
-      });
-    }
+    // Status restriction removed — estimates can be edited at any status.
+    // Invoice sync is handled separately after save.
 
-    if (data.notes === undefined && data.items === undefined) {
+    if (
+      data.notes === undefined &&
+      data.items === undefined &&
+      data.discount_mode === undefined &&
+      data.transaction_discount_type === undefined &&
+      data.transaction_discount_value === undefined
+    ) {
       return res.status(400).json({ error: 'Nothing to update' });
     }
 
@@ -387,21 +497,85 @@ function updateEstimate(req, res, next) {
     try {
       await client.query('BEGIN');
 
+      // Build dynamic SET for top-level estimate fields
+      const setFields = [];
+      const setVals   = [];
+      let   n         = 1;
+
       if (data.notes !== undefined) {
+        setFields.push(`notes = $${n++}`); setVals.push(data.notes);
+      }
+      if (data.discount_mode !== undefined) {
+        setFields.push(`discount_mode = $${n++}`); setVals.push(data.discount_mode);
+      }
+      if (data.transaction_discount_type !== undefined) {
+        setFields.push(`transaction_discount_type = $${n++}`); setVals.push(data.transaction_discount_type);
+      }
+      if (data.transaction_discount_value !== undefined) {
+        setFields.push(`transaction_discount_value = $${n++}`); setVals.push(data.transaction_discount_value);
+      }
+      if (setFields.length > 0) {
+        setFields.push(`updated_at = NOW()`);
+        setVals.push(id);
         await client.query(
-          `UPDATE estimates SET notes = $1, updated_at = NOW() WHERE id = $2`,
-          [data.notes, id]
+          `UPDATE estimates SET ${setFields.join(', ')} WHERE id = $${n}`,
+          setVals
         );
       }
 
       if (data.items !== undefined) {
-        // Full replace
+        // Resolve the effective discount mode (may have just been updated above)
+        const modeRow = await client.query(
+          `SELECT discount_mode FROM estimates WHERE id = $1`, [id]
+        );
+        const effectiveMode = modeRow.rows[0]?.discount_mode || 'line_item';
+        const forceZeroDiscount = ['transaction', 'none'].includes(effectiveMode);
+
+        // Full replace — preserve approval/work status from original items so
+        // PI/CI sync can still find completed items after the edit.
+        // Build a lookup: "service_id:part_id" → { customer_approved, work_status }
+        const origRows = await client.query(
+          `SELECT service_id, part_id, description, customer_approved, work_status
+           FROM estimate_items WHERE estimate_id = $1`,
+          [id]
+        );
+        // Manual items have neither service_id nor part_id — key those by
+        // description so distinct manual items don't share one map entry.
+        const itemKey = (svcId, partId, description) =>
+          (svcId || partId) ? `${svcId ?? ''}:${partId ?? ''}` : `manual:${description ?? ''}`;
+        const statusMap = {};
+        for (const r of origRows.rows) {
+          const key = itemKey(r.service_id, r.part_id, r.description);
+          // Keep the most advanced status if same service appears twice
+          if (!statusMap[key] || r.work_status === 'completed') {
+            statusMap[key] = { customer_approved: r.customer_approved, work_status: r.work_status };
+          }
+        }
+
+        // Clear FK references before delete
+        await client.query(
+          `UPDATE purchase_invoice_items SET estimate_item_id = NULL
+           WHERE estimate_item_id IN (
+             SELECT id FROM estimate_items WHERE estimate_id = $1
+           )`,
+          [id]
+        );
+        await client.query(
+          `UPDATE customer_invoice_items SET estimate_item_id = NULL
+           WHERE estimate_item_id IN (
+             SELECT id FROM estimate_items WHERE estimate_id = $1
+           )`,
+          [id]
+        );
         await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [id]);
         for (const item of data.items) {
-          const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(item);
+          const itemForCalc = forceZeroDiscount
+            ? { ...item, discount_type: null, discount_value: 0, discount_amount: 0 }
+            : item;
+          const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc);
           const svcId  = item.item_type === 'service' ? (item.service_id || item.item_id || null) : null;
           const partId = item.item_type === 'part'    ? (item.part_id    || item.item_id || null) : null;
-          await client.query(
+          const insertedRow = await client.query(
             `INSERT INTO estimate_items
                (estimate_id, item_type, service_id, part_id, description,
                 quantity, customer_rate, gst_percent, gst_amount, total_inc_gst,
@@ -412,7 +586,8 @@ function updateEstimate(req, res, next) {
                  (SELECT sac_code FROM services WHERE id = $3),
                  (SELECT hsn_code FROM parts    WHERE id = $4)
                ),
-               $12,$13,$14,$15)`,
+               $12,$13,$14,$15)
+             RETURNING id`,
             [
               id,
               item.item_type,
@@ -425,13 +600,48 @@ function updateEstimate(req, res, next) {
               gstAmount,
               totalIncGst,
               item.is_from_appointment ?? false,
-              item.discount_type   || null,
-              item.discount_value  || 0,
-              discountAmt,
-              item.discount_source || null,
+              forceZeroDiscount ? null : (item.discount_type   || null),
+              forceZeroDiscount ? 0    : (item.discount_value  || 0),
+              forceZeroDiscount ? 0    : discountAmt,
+              forceZeroDiscount ? null : (item.discount_source || null),
             ]
           );
+
+          // Restore original approval + work status using the exact new item id.
+          // Priority:
+          //   1. If estimate is work_completed → all items must be completed & approved
+          //   2. Else use statusMap (per-item saved status)
+          //   3. Else leave as default (null / pending)
+          const newItemId = insertedRow.rows[0].id;
+          let restoredApproved = null;
+          let restoredStatus   = null;
+
+          if (status === 'work_completed' || status === 'work_in_progress') {
+            restoredApproved = true;
+            restoredStatus   = status === 'work_completed' ? 'completed' : 'in_progress';
+          } else {
+            const origKey = itemKey(svcId, partId, item.description);
+            const orig    = statusMap[origKey];
+            if (orig && orig.work_status) {
+              restoredApproved = orig.customer_approved;
+              restoredStatus   = orig.work_status;
+            }
+          }
+
+          if (restoredStatus) {
+            await client.query(
+              `UPDATE estimate_items SET customer_approved = $1, work_status = $2 WHERE id = $3`,
+              [restoredApproved, restoredStatus, newItemId]
+            );
+          }
         }
+        await recalcTotals(client, id);
+      } else if (
+        data.discount_mode !== undefined ||
+        data.transaction_discount_type !== undefined ||
+        data.transaction_discount_value !== undefined
+      ) {
+        // Discount mode changed but items not resent — just recalc totals
         await recalcTotals(client, id);
       }
 
@@ -741,6 +951,76 @@ function updateItemWorkStatus(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/estimates/:id — Super admin only
+// Cascade: CI payments → CI items → CI → PI schedule → PI payments → PI items
+//          → estimate items → estimate
+// Blocked if CI is paid or PI payment_status is paid
+// ─────────────────────────────────────────────────────────────────────────────
+function deleteEstimate(req, res, next) {
+  handle(req, res, next, async () => {
+    if (!req.user?.is_super_admin) {
+      return res.status(403).json({ error: 'Only super admins can delete estimates.' });
+    }
+
+    const id = idParam.parse(req.params.id);
+
+    const estRow = await pool.query(`SELECT id FROM estimates WHERE id = $1`, [id]);
+    if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
+
+    // Check CI
+    const ciRow = await pool.query(
+      `SELECT id, status FROM customer_invoices WHERE estimate_id = $1 LIMIT 1`, [id]
+    );
+    const ci = ciRow.rows[0] || null;
+    if (ci && ci.status === 'paid') {
+      return res.status(400).json({ error: 'Cannot delete — Customer Invoice is already paid.' });
+    }
+
+    // Check ALL PIs (an estimate can have more than one purchase invoice)
+    const piRows = await pool.query(
+      `SELECT id, payment_status FROM purchase_invoices WHERE estimate_id = $1 ORDER BY id DESC`, [id]
+    );
+    const pis = piRows.rows;
+    if (pis.some(p => p.payment_status === 'paid')) {
+      return res.status(400).json({ error: 'Cannot delete — a Purchase Invoice is already paid.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Delete CI
+      if (ci) {
+        await client.query(`DELETE FROM customer_invoice_payments WHERE customer_invoice_id = $1`, [ci.id]);
+        await client.query(`DELETE FROM customer_invoice_items    WHERE customer_invoice_id = $1`, [ci.id]);
+        await client.query(`DELETE FROM customer_invoices          WHERE id = $1`, [ci.id]);
+      }
+
+      // Delete ALL PIs linked to this estimate
+      for (const pi of pis) {
+        await client.query(`DELETE FROM pi_payment_schedule WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM hub_payments         WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM purchase_invoices     WHERE id = $1`, [pi.id]);
+      }
+
+      // Delete estimate
+      await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [id]);
+      await client.query(`DELETE FROM estimates       WHERE id = $1`, [id]);
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ success: true });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   listEstimates,
@@ -752,4 +1032,5 @@ module.exports = {
   companyRevise,
   customerApproval,
   updateItemWorkStatus,
+  deleteEstimate,
 };

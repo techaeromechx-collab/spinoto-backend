@@ -1,12 +1,16 @@
 'use strict';
 
 const express = require('express');
-const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
+const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const c = require('../controllers/discount_master.controller');
 
 const router = express.Router();
 
-const canRead   = [requireAuth, requirePermission('MANAGE_DISCOUNTS', 'CREATE_DISCOUNT', 'EDIT_DISCOUNT', 'DELETE_DISCOUNT', 'MANAGE_MASTER_DATA','VIEW_ESTIMATE','CREATE_ESTIMATE','EDIT_ESTIMATE','VIEW_INVOICE','CREATE_INVOICE','EDIT_INVOICE','CREATE_LEAD','VIEW_LEAD')];
+// Read/lookup uses requirePermissionOrHub so hub users (who can create
+// estimates via requirePermissionOrHub on the estimates routes) can also
+// resolve auto-discounts — otherwise their lookup calls 403 and the frontend
+// silently applies no discount.
+const canRead   = [requireAuth, requirePermissionOrHub('MANAGE_DISCOUNTS', 'CREATE_DISCOUNT', 'EDIT_DISCOUNT', 'DELETE_DISCOUNT', 'MANAGE_MASTER_DATA','VIEW_ESTIMATE','CREATE_ESTIMATE','EDIT_ESTIMATE','VIEW_INVOICE','CREATE_INVOICE','EDIT_INVOICE','CREATE_LEAD','VIEW_LEAD')];
 const canCreate = [requireAuth, requirePermission('CREATE_DISCOUNT', 'MANAGE_DISCOUNTS', 'MANAGE_MASTER_DATA')];
 const canEdit   = [requireAuth, requirePermission('EDIT_DISCOUNT',   'MANAGE_DISCOUNTS', 'MANAGE_MASTER_DATA')];
 const canDelete = [requireAuth, requirePermission('DELETE_DISCOUNT', 'MANAGE_DISCOUNTS', 'MANAGE_MASTER_DATA')];

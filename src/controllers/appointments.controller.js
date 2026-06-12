@@ -109,11 +109,13 @@ const createSchema = z.object({
   pickup_address_line2: z.string().trim().max(200).optional().nullable(),
   pickup_city:          z.string().trim().max(100).optional().nullable(),
   pickup_pincode:       z.string().trim().max(10).optional().nullable(),
+  pickup_maps_link:     z.string().trim().max(500).optional().nullable(),
   drop_required:        z.boolean().optional().default(false),
   drop_address_line1:   z.string().trim().max(200).optional().nullable(),
   drop_address_line2:   z.string().trim().max(200).optional().nullable(),
   drop_city:            z.string().trim().max(100).optional().nullable(),
   drop_pincode:         z.string().trim().max(10).optional().nullable(),
+  drop_maps_link:       z.string().trim().max(500).optional().nullable(),
   services: z.array(z.object({
     service_id:  z.coerce.number().int().positive(),
     category_id: z.coerce.number().int().positive().optional().nullable(),
@@ -140,12 +142,18 @@ const updateSchema = z.object({
   pickup_address_line2: z.string().trim().max(200).optional().nullable(),
   pickup_city:          z.string().trim().max(100).optional().nullable(),
   pickup_pincode:       z.string().trim().max(10).optional().nullable(),
+  pickup_maps_link:     z.string().trim().max(500).optional().nullable(),
   pickup_timestamp:     z.string().datetime().optional().nullable(),
   drop_required:        z.boolean().optional(),
   drop_address_line1:   z.string().trim().max(200).optional().nullable(),
   drop_address_line2:   z.string().trim().max(200).optional().nullable(),
   drop_city:            z.string().trim().max(100).optional().nullable(),
   drop_pincode:         z.string().trim().max(10).optional().nullable(),
+  drop_maps_link:       z.string().trim().max(500).optional().nullable(),
+  reschedule_reason:    z.string().trim().max(200).optional().nullable(),
+  reschedule_notes:     z.string().trim().max(1000).optional().nullable(),
+  // These are set by the server on reschedule — not accepted from client
+  // original_scheduled_date, original_scheduled_time, rescheduled_by, rescheduled_at
   // Customer & vehicle fields for full edit
   customer_name:       z.string().trim().max(200).optional().nullable(),
   mobile:              z.string().trim().max(20).optional().nullable(),
@@ -198,12 +206,21 @@ const APPT_SELECT = `
     a.pickup_address_line2,
     a.pickup_city,
     a.pickup_pincode,
+    a.pickup_maps_link,
     a.pickup_timestamp,
     a.drop_required,
     a.drop_address_line1,
     a.drop_address_line2,
     a.drop_city,
     a.drop_pincode,
+    a.drop_maps_link,
+    a.reschedule_reason,
+    a.reschedule_notes,
+    a.original_scheduled_date,
+    a.original_scheduled_time,
+    a.rescheduled_at,
+    ru.id   AS rescheduled_by_id,
+    ru.name AS rescheduled_by_name,
     a.created_at,
     a.updated_at,
 
@@ -233,9 +250,18 @@ const APPT_SELECT = `
     u.id    AS created_by_id,
     u.name  AS created_by_name,
 
-    -- Linked estimate (used to lock fields in edit mode)
-    (SELECT e.id   FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_id,
-    EXISTS (SELECT 1 FROM estimates e WHERE e.appointment_id = a.id)                           AS has_estimate
+    -- Linked estimate (used to lock fields in edit mode + status prerequisite checks)
+    (SELECT e.id     FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_id,
+    (SELECT e.status FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_status,
+    EXISTS (SELECT 1 FROM estimates e WHERE e.appointment_id = a.id)                            AS has_estimate,
+
+    -- Linked customer invoice (for status prerequisite checks)
+    (SELECT ci.id     FROM customer_invoices ci
+       JOIN estimates e ON e.id = ci.estimate_id
+       WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_id,
+    (SELECT ci.status FROM customer_invoices ci
+       JOIN estimates e ON e.id = ci.estimate_id
+       WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status
 
   FROM appointments a
   LEFT JOIN vehicle_types     vt  ON vt.id  = a.vehicle_type_id
@@ -247,6 +273,7 @@ const APPT_SELECT = `
   LEFT JOIN appointment_statuses ast ON ast.id = a.status_id
   LEFT JOIN users             u   ON u.id   = a.created_by
   LEFT JOIN users             au  ON au.id  = a.assigned_to
+  LEFT JOIN users             ru  ON ru.id  = a.rescheduled_by
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,14 +332,14 @@ function createAppointment(req, res, next) {
           body_type_id, segment_ids, cc_category_id,
           hub_id, scheduled_date, scheduled_time,
           status_id, total_price, notes,
-          pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode,
-          drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode,
+          pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode, pickup_maps_link,
+          drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode, drop_maps_link,
           assigned_to, created_by
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-          $18,$19,$20,$21,$22,
-          $23,$24,$25,$26,$27,
-          $28,$29
+          $18,$19,$20,$21,$22,$23,
+          $24,$25,$26,$27,$28,$29,
+          $30,$31
         ) RETURNING id`,
         [
           data.lead_id        || null,           // $1
@@ -337,13 +364,15 @@ function createAppointment(req, res, next) {
           data.pickup_address_line2 || null,     // $20
           data.pickup_city          || null,     // $21
           data.pickup_pincode       || null,     // $22
-          data.drop_required   ?? false,         // $23
-          data.drop_address_line1   || null,     // $24
-          data.drop_address_line2   || null,     // $25
-          data.drop_city            || null,     // $26
-          data.drop_pincode         || null,     // $27
-          assignedTo,                            // $28
-          req.user.id,                           // $29
+          data.pickup_maps_link     || null,     // $23
+          data.drop_required   ?? false,         // $24
+          data.drop_address_line1   || null,     // $25
+          data.drop_address_line2   || null,     // $26
+          data.drop_city            || null,     // $27
+          data.drop_pincode         || null,     // $28
+          data.drop_maps_link       || null,     // $29
+          assignedTo,                            // $30
+          req.user.id,                           // $31
         ]
       );
 
@@ -551,12 +580,16 @@ function updateAppointment(req, res, next) {
     if (data.pickup_address_line2 !== undefined) { params.push(data.pickup_address_line2); fields.push(`pickup_address_line2 = $${params.length}`); }
     if (data.pickup_city          !== undefined) { params.push(data.pickup_city);          fields.push(`pickup_city          = $${params.length}`); }
     if (data.pickup_pincode       !== undefined) { params.push(data.pickup_pincode);       fields.push(`pickup_pincode       = $${params.length}`); }
+    if (data.pickup_maps_link     !== undefined) { params.push(data.pickup_maps_link);     fields.push(`pickup_maps_link     = $${params.length}`); }
     if (data.pickup_timestamp     !== undefined) { params.push(data.pickup_timestamp);     fields.push(`pickup_timestamp     = $${params.length}`); }
     if (data.drop_required        !== undefined) { params.push(data.drop_required);        fields.push(`drop_required        = $${params.length}`); }
     if (data.drop_address_line1   !== undefined) { params.push(data.drop_address_line1);   fields.push(`drop_address_line1   = $${params.length}`); }
     if (data.drop_address_line2   !== undefined) { params.push(data.drop_address_line2);   fields.push(`drop_address_line2   = $${params.length}`); }
     if (data.drop_city            !== undefined) { params.push(data.drop_city);            fields.push(`drop_city            = $${params.length}`); }
     if (data.drop_pincode         !== undefined) { params.push(data.drop_pincode);         fields.push(`drop_pincode         = $${params.length}`); }
+    if (data.drop_maps_link       !== undefined) { params.push(data.drop_maps_link);       fields.push(`drop_maps_link       = $${params.length}`); }
+    if (data.reschedule_reason    !== undefined) { params.push(data.reschedule_reason);    fields.push(`reschedule_reason    = $${params.length}`); }
+    if (data.reschedule_notes     !== undefined) { params.push(data.reschedule_notes);     fields.push(`reschedule_notes     = $${params.length}`); }
     // Customer & vehicle fields
     if (data.customer_name   !== undefined) { params.push(data.customer_name);   fields.push(`customer_name   = $${params.length}`); }
     if (data.mobile          !== undefined) { params.push(data.mobile);          fields.push(`mobile          = $${params.length}`); }
@@ -568,8 +601,25 @@ function updateAppointment(req, res, next) {
     if (data.cc_category_id  !== undefined) { params.push(data.cc_category_id);  fields.push(`cc_category_id  = $${params.length}`); }
     if (data.segment_ids     !== undefined) { params.push(data.segment_ids);     fields.push(`segment_ids     = $${params.length}`); }
 
-    // Auto-set status to "rescheduled" when date or time is changed (and caller didn't explicitly set a status)
+    // When date/time is changing, capture the original values + who rescheduled + when
     const isRescheduling = data.scheduled_date !== undefined || data.scheduled_time !== undefined;
+    if (isRescheduling && data.reschedule_reason !== undefined) {
+      const orig = await pool.query(
+        `SELECT scheduled_date, scheduled_time FROM appointments WHERE id = $1`, [id]
+      );
+      if (orig.rows[0]) {
+        const origDate = orig.rows[0].scheduled_date
+          ? new Date(orig.rows[0].scheduled_date).toISOString().slice(0, 10)
+          : null;
+        const origTime = orig.rows[0].scheduled_time || null;
+        params.push(origDate);      fields.push(`original_scheduled_date = $${params.length}`);
+        params.push(origTime);      fields.push(`original_scheduled_time = $${params.length}`);
+        params.push(req.user.id);   fields.push(`rescheduled_by          = $${params.length}`);
+        params.push(new Date());    fields.push(`rescheduled_at          = $${params.length}`);
+      }
+    }
+
+    // Auto-set status to "rescheduled" when date or time is changed (and caller didn't explicitly set a status)
     if (isRescheduling && data.status_id === undefined) {
       const rescRow = await pool.query(
         `SELECT id FROM appointment_statuses WHERE slug = 'rescheduled' LIMIT 1`

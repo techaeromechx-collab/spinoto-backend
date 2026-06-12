@@ -52,6 +52,9 @@ const allowedOrigins = (process.env.CORS_ORIGIN || '*')
   .map(o => o.trim())
   .filter(Boolean);
 
+if (allowedOrigins.includes('*') && process.env.NODE_ENV === 'production') {
+  console.warn('[cors] CORS_ORIGIN is not set — all origins are allowed. Set CORS_ORIGIN in production.');
+}
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (mobile apps, curl, Postman)
@@ -61,7 +64,9 @@ app.use(cors({
     }
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
-  credentials: true,
+  // Auth uses Bearer tokens (Authorization header), not cookies — so
+  // credentials are not needed. Never combine credentials with origin '*'.
+  credentials: false,
 }));
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
@@ -75,7 +80,8 @@ app.get('/api/health', async (_req, res) => {
     const r = await pool.query('SELECT NOW() AS now');
     res.json({ ok: true, db_time: r.rows[0].now });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('[health]', err);
+    res.status(500).json({ ok: false, error: 'Database unreachable' });
   }
 });
 
@@ -129,7 +135,10 @@ app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, _req, res, _next) => {
   console.error('[error]', err);
   const status = err.status || 500;
-  res.status(status).json({ error: err.message || 'Internal server error' });
+  // Only expose messages for intentional errors (err.status set by our code).
+  // Unexpected 500s (pg errors etc.) must not leak internals to the client.
+  const message = err.status ? err.message : 'Internal server error';
+  res.status(status).json({ error: message });
 });
 
 // ---- Boot ----------------------------------------------------------------

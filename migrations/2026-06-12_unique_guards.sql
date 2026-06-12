@@ -1,0 +1,2 @@
+-- Superseded — this file was moved to db/migrations/075_unique_estimate_ci_guards.sql
+-- to follow the project's numbered migration convention. Safe to delete this file.

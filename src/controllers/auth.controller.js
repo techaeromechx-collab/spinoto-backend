@@ -16,7 +16,7 @@ async function login(req, res, next) {
     const r = await pool.query(
       `SELECT u.id, u.name, u.email, u.password_hash, u.is_active, u.is_super_admin,
               u.mobile, u.department, u.joining_date, u.profile_photo,
-              u.notification_settings, u.manager_id, u.hub_id,
+              u.notification_settings, u.manager_id, u.hub_id, u.last_login,
               m.name AS manager_name,
               h.hub_name,
               COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions
@@ -37,12 +37,19 @@ async function login(req, res, next) {
     }
 
     const user = r.rows[0];
-    if (!user.is_active) return res.status(403).json({ error: 'Account is disabled' });
 
+    // Verify the password BEFORE revealing account state — returning
+    // "Account is disabled" on a bad password would confirm the account
+    // exists (user enumeration).
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) {
       logLogin({ userId: user.id, email, success: false, ip, userAgent });
       return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    if (!user.is_active) {
+      logLogin({ userId: user.id, email, success: false, ip, userAgent });
+      return res.status(403).json({ error: 'Account is disabled' });
     }
 
     const token = jwt.sign(
@@ -72,7 +79,7 @@ async function login(req, res, next) {
         manager_name:         user.manager_name || null,
         hub_id:               user.hub_id       || null,
         hub_name:             user.hub_name     || null,
-        last_login:           null, // updated async — will be correct on next /api/me call
+        last_login:           user.last_login || null,
       },
     });
   } catch (err) {

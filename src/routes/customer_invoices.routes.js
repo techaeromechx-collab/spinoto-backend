@@ -6,6 +6,7 @@ const {
   addPayment, deletePayment,
   approveCustomerInvoice,
   generateCustomerInvoiceFromEstimate,
+  syncCustomerInvoiceFromEstimate,
   getVehicleHistory,
 } = require('../controllers/customer_invoices.controller');
 const router = express.Router();
@@ -22,6 +23,7 @@ router.post('/from-estimate',          canCreate,  generateCustomerInvoiceFromEs
 router.get('/vehicle-history/:vnum',   canView,    getVehicleHistory);
 router.get('/:id',                     canView,    getCustomerInvoice);
 router.post('/:id/approve',            canEdit,    approveCustomerInvoice);
+router.post('/:id/sync-from-estimate', canEdit,    syncCustomerInvoiceFromEstimate);
 router.post('/:id/payments',           canPayment, addPayment);
 router.delete('/:id/payments/:payId',  canPayment, deletePayment);
 module.exports = router;

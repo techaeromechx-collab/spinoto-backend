@@ -1,12 +1,16 @@
 const express       = require('express');
-const { requireAuth, requireSuperAdmin } = require('../middleware/auth.middleware');
+const { requireAuth, requireSuperAdmin, requirePermission } = require('../middleware/auth.middleware');
 const c             = require('../controllers/roles.controller');
 
 const router = express.Router();
 
-// All role endpoints require super admin
-router.get   ('/',                          requireAuth, requireSuperAdmin, c.listRoles);
-router.get   ('/:id',                       requireAuth, requireSuperAdmin, c.getRole);
+// Read: MANAGE_USERS may list/view roles (needed for the role dropdown on the
+// Users page — it was silently empty for non-super-admin managers before).
+// requirePermission always passes super admins automatically.
+router.get   ('/',                          requireAuth, requirePermission('MANAGE_USERS'), c.listRoles);
+router.get   ('/:id',                       requireAuth, requirePermission('MANAGE_USERS'), c.getRole);
+
+// Writes: super admin only
 router.post  ('/',                          requireAuth, requireSuperAdmin, c.createRole);
 router.put   ('/:id',                       requireAuth, requireSuperAdmin, c.updateRole);
 router.delete('/:id',                       requireAuth, requireSuperAdmin, c.deleteRole);

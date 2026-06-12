@@ -22,6 +22,8 @@ const CI_SELECT = `
     COALESCE(ci.vehicle_number, a.vehicle_number) AS vehicle_number,
     ci.status, ci.subtotal_ex_gst, ci.total_gst, ci.grand_total, ci.amount_paid,
     ci.notes, ci.created_at, ci.updated_at,
+    ci.discount_mode, ci.transaction_discount_type,
+    ci.transaction_discount_value, ci.transaction_discount_amount,
     h.hub_name, h.gst_number AS hub_gst,
     (ci.grand_total - ci.amount_paid) AS balance,
     (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
@@ -235,7 +237,10 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
 
     // Validate estimate exists and is work_completed
     const estRow = await pool.query(
-      `SELECT e.id, e.status, e.appointment_id, e.hub_id FROM estimates e WHERE e.id = $1`,
+      `SELECT e.id, e.status, e.appointment_id, e.hub_id,
+              e.discount_mode, e.transaction_discount_type,
+              e.transaction_discount_value, e.transaction_discount_amount
+       FROM estimates e WHERE e.id = $1`,
       [estimate_id]
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
@@ -293,33 +298,69 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       });
     }
 
-    // Calculate totals at customer rates (inc GST)
+    // Use the estimate items' STORED amounts — these already have line-item
+    // discounts and GST baked in, so CI totals always match the estimate.
+    // (Recomputing from rate × qty here would silently drop line discounts.)
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const ciItems = itemsRow.rows.map(item => {
-      const qty         = Number(item.quantity);
-      const custRate    = Number(item.customer_rate);
-      const gstPct      = Number(item.gst_percent);
-      const amtExGst    = parseFloat((custRate * qty).toFixed(2));
-      const gstAmt      = parseFloat((amtExGst * gstPct / 100).toFixed(2));
-      const totalIncGst = parseFloat((amtExGst + gstAmt).toFixed(2));
+      const totalIncGst = parseFloat(item.total_inc_gst) || 0;
+      const gstAmt      = parseFloat(item.gst_amount)    || 0;
+      const amtExGst    = parseFloat((totalIncGst - gstAmt).toFixed(2));
       subtotalExGst += amtExGst;
       totalGst      += gstAmt;
       grandTotal    += totalIncGst;
       return { ...item, gst_amount: gstAmt, total_inc_gst: totalIncGst };
     });
 
+    // Apply transaction-level discount on CI grand total if applicable
+    const discountMode     = est.discount_mode              || 'line_item';
+    const txDiscountType   = est.transaction_discount_type  || null;
+    const txDiscountValue  = parseFloat(est.transaction_discount_value)  || 0;
+    let   txDiscountAmount = 0;
+
+    if (discountMode === 'transaction' && txDiscountValue > 0) {
+      if (txDiscountType === 'percent') {
+        txDiscountAmount = parseFloat((grandTotal * txDiscountValue / 100).toFixed(2));
+      } else if (txDiscountType === 'flat') {
+        txDiscountAmount = Math.min(txDiscountValue, grandTotal);
+      }
+      grandTotal = parseFloat((grandTotal - txDiscountAmount).toFixed(2));
+    }
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // Serialize concurrent CI generation for the same estimate and re-check
+      // the one-CI-per-estimate guard inside the transaction.
+      await client.query(`SELECT pg_advisory_xact_lock(2, $1)`, [estimate_id]);
+      const dupInTx = await client.query(
+        `SELECT id FROM customer_invoices WHERE estimate_id = $1 LIMIT 1`,
+        [estimate_id]
+      );
+      if (dupInTx.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'Customer invoice already exists for this estimate.',
+          customer_invoice_id: dupInTx.rows[0].id,
+        });
+      }
+
       const ciRow = await client.query(
         `INSERT INTO customer_invoices
            (estimate_id, appointment_id, hub_id,
             customer_name, mobile, vehicle_number,
-            subtotal_ex_gst, total_gst, grand_total)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-        [estimate_id, est.appointment_id, est.hub_id,
-         appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
-         subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2)]
+            subtotal_ex_gst, total_gst, grand_total,
+            discount_mode, transaction_discount_type,
+            transaction_discount_value, transaction_discount_amount)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+        [
+          estimate_id, est.appointment_id, est.hub_id,
+          appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          discountMode, txDiscountType,
+          txDiscountValue, txDiscountAmount.toFixed(2),
+        ]
       );
       const ciId = ciRow.rows[0].id;
 
@@ -428,4 +469,125 @@ function getVehicleHistory(req, res, next) {
   });
 }
 
-module.exports = { listCustomerInvoices, getCustomerInvoice, addPayment, deletePayment, approveCustomerInvoice, generateCustomerInvoiceFromEstimate, getVehicleHistory };
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/customer-invoices/:id/sync-from-estimate
+// Re-derives all line items + totals from the linked estimate.
+// Blocked if CI status = 'paid'.
+// ─────────────────────────────────────────────────────────────────────────────
+function syncCustomerInvoiceFromEstimate(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+
+    const ciRow = await pool.query(
+      `SELECT id, estimate_id, status FROM customer_invoices WHERE id = $1`, [id]
+    );
+    if (!ciRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    const ci = ciRow.rows[0];
+
+    if (ci.status === 'paid') {
+      return res.status(400).json({ error: 'Cannot sync — Customer Invoice is already paid.' });
+    }
+
+    // Re-fetch estimate discount fields
+    const estRow = await pool.query(
+      `SELECT e.discount_mode, e.transaction_discount_type, e.transaction_discount_value
+       FROM estimates e WHERE e.id = $1`,
+      [ci.estimate_id]
+    );
+    if (!estRow.rows[0]) return res.status(404).json({ error: 'Linked estimate not found' });
+    const est = estRow.rows[0];
+
+    // Eligible items
+    const itemsRow = await pool.query(
+      `SELECT * FROM estimate_items
+       WHERE estimate_id = $1 AND customer_approved = TRUE AND work_status = 'completed'`,
+      [ci.estimate_id]
+    );
+    if (itemsRow.rowCount === 0) {
+      return res.status(400).json({ error: 'No completed & customer-approved items found in estimate.' });
+    }
+
+    // Use the estimate items' STORED amounts — discounts + GST already baked
+    // in, so CI totals always match the estimate (see generate handler).
+    let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
+    const ciItems = itemsRow.rows.map(item => {
+      const totalIncGst = parseFloat(item.total_inc_gst) || 0;
+      const gstAmt      = parseFloat(item.gst_amount)    || 0;
+      const amtExGst    = parseFloat((totalIncGst - gstAmt).toFixed(2));
+      subtotalExGst += amtExGst;
+      totalGst      += gstAmt;
+      grandTotal    += totalIncGst;
+      return { ...item, gst_amount: gstAmt, total_inc_gst: totalIncGst };
+    });
+
+    // Apply transaction discount
+    const discountMode    = est.discount_mode || 'none';
+    const txDiscountType  = est.transaction_discount_type || null;
+    const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
+    let txDiscountAmount  = 0;
+    if (discountMode === 'transaction' && txDiscountValue > 0) {
+      if (txDiscountType === 'percent') {
+        txDiscountAmount = parseFloat((grandTotal * txDiscountValue / 100).toFixed(2));
+      } else if (txDiscountType === 'flat') {
+        txDiscountAmount = Math.min(txDiscountValue, grandTotal);
+      }
+      grandTotal = parseFloat((grandTotal - txDiscountAmount).toFixed(2));
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Replace items
+      await client.query(`DELETE FROM customer_invoice_items WHERE customer_invoice_id = $1`, [id]);
+      for (const item of ciItems) {
+        await client.query(
+          `INSERT INTO customer_invoice_items
+             (customer_invoice_id, estimate_item_id, item_type, description,
+              quantity, customer_rate, gst_percent, gst_amount, total_inc_gst, hsn_sac,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+          [
+            id, item.id, item.item_type, item.description,
+            item.quantity, item.customer_rate, item.gst_percent,
+            item.gst_amount, item.total_inc_gst, item.hsn_sac || null,
+            item.discount_type || null, item.discount_value || 0, item.discount_amount || 0,
+          ]
+        );
+      }
+
+      // Update CI totals + discount fields
+      await client.query(
+        `UPDATE customer_invoices
+         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3,
+             discount_mode=$4, transaction_discount_type=$5,
+             transaction_discount_value=$6, transaction_discount_amount=$7,
+             updated_at=NOW()
+         WHERE id=$8`,
+        [
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          discountMode, txDiscountType,
+          txDiscountValue, txDiscountAmount.toFixed(2),
+          id,
+        ]
+      );
+
+      // Recompute paid status in case grand_total changed
+      await _recalcStatus(client, id);
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
+    full.rows[0].items    = await _getItems(id);
+    full.rows[0].payments = await _getPayments(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
+module.exports = { listCustomerInvoices, getCustomerInvoice, addPayment, deletePayment, approveCustomerInvoice, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };

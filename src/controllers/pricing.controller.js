@@ -159,32 +159,45 @@ function listPricing(req, res, next) {
 
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
 
-    const countR = await pool.query(
-      `SELECT COUNT(*)::int AS total FROM pricing p ${where}`,
-      params
-    );
-    const total = countR.rows[0].total;
+    // rule_type and search filter on DERIVED fields, so they must be applied
+    // BEFORE pagination. When either is present, fetch the full filtered set,
+    // filter in memory, then paginate the result — otherwise paginate in SQL.
+    const hasDerivedFilters = Boolean(ruleT || search);
 
-    const dataR = await pool.query(
-      `${PRICING_SELECT} ${where}
-       ORDER BY p.created_at DESC
-       LIMIT $${n++} OFFSET $${n++}`,
-      [...params, limit, offset]
-    );
-
-    let rows = dataR.rows.map(enrichRow);
-
-    // In-memory filter by rule_type (derived field)
-    if (ruleT) rows = rows.filter((r) => r.rule_type === ruleT || r.rule_type?.includes(ruleT));
-
-    // In-memory search
-    if (search) {
-      const q = search.toLowerCase();
-      rows = rows.filter((r) =>
-        r.applies_to.toLowerCase().includes(q) ||
-        (r.service_name  || '').toLowerCase().includes(q) ||
-        (r.category_name || '').toLowerCase().includes(q)
+    let rows, total;
+    if (hasDerivedFilters) {
+      const dataR = await pool.query(
+        `${PRICING_SELECT} ${where} ORDER BY p.created_at DESC`,
+        params
       );
+      rows = dataR.rows.map(enrichRow);
+
+      if (ruleT) rows = rows.filter((r) => r.rule_type === ruleT || r.rule_type?.includes(ruleT));
+      if (search) {
+        const q = search.toLowerCase();
+        rows = rows.filter((r) =>
+          r.applies_to.toLowerCase().includes(q) ||
+          (r.service_name  || '').toLowerCase().includes(q) ||
+          (r.category_name || '').toLowerCase().includes(q)
+        );
+      }
+
+      total = rows.length;
+      rows  = rows.slice(offset, offset + limit);
+    } else {
+      const countR = await pool.query(
+        `SELECT COUNT(*)::int AS total FROM pricing p ${where}`,
+        params
+      );
+      total = countR.rows[0].total;
+
+      const dataR = await pool.query(
+        `${PRICING_SELECT} ${where}
+         ORDER BY p.created_at DESC
+         LIMIT $${n++} OFFSET $${n++}`,
+        [...params, limit, offset]
+      );
+      rows = dataR.rows.map(enrichRow);
     }
 
     res.json({ items: rows, total, page, limit, pages: Math.ceil(total / limit) });
@@ -335,7 +348,7 @@ function deletePricing(req, res, next) {
  * Specificity weights (higher = more specific):
  *   model_id       → 64
  *   make_id        → 32
- *   segment_id     →  8
+ *   segment_id     →  9
  *   body_type_id   →  8
  *   cc_category_id →  8
  *   vehicle_type_id →  4
@@ -376,7 +389,7 @@ function lookupPrice(req, res, next) {
      *
      * Then order by descending specificity score and take the top 1.
      */
-    const r = await pool.query(
+    const runLookup = (svcId, catId) => pool.query(
       `${PRICING_SELECT}
        WHERE p.is_active = TRUE
          AND ($1::int IS NULL OR p.service_id  = $1)
@@ -395,8 +408,19 @@ function lookupPrice(req, res, next) {
           CASE WHEN p.cc_category_id  IS NOT NULL THEN  8 ELSE 0 END +
           CASE WHEN p.vehicle_type_id IS NOT NULL THEN  4 ELSE 0 END) DESC
        LIMIT 1`,
-      [serviceId, categoryId, vehicleTypeId, bodyTypeId, segmentId, makeId, modelId, ccCategoryId]
+      [svcId, catId, vehicleTypeId, bodyTypeId, segmentId, makeId, modelId, ccCategoryId]
     );
+
+    let r = await runLookup(serviceId, categoryId);
+
+    // Category fallback: if a service-level lookup found no rule, retry at
+    // the service's category level. Service rules always win over category
+    // rules (per CLAUDE.md pricing reference).
+    if (r.rowCount === 0 && serviceId) {
+      const svc = await pool.query(`SELECT category_id FROM services WHERE id = $1`, [serviceId]);
+      const catId = svc.rows[0]?.category_id;
+      if (catId) r = await runLookup(null, catId);
+    }
 
     if (r.rowCount === 0) {
       return res.json({

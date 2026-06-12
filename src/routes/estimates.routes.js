@@ -12,6 +12,7 @@ const {
   companyRevise,
   customerApproval,
   updateItemWorkStatus,
+  deleteEstimate,
 } = require('../controllers/estimates.controller');
 
 const router = express.Router();
@@ -35,5 +36,6 @@ router.post('/:id/company-approve',                canApprove, companyApprove);
 router.post('/:id/company-revise',                 canRevise,  companyRevise);
 router.post('/:id/customer-approval',              canExecute,   customerApproval);
 router.patch('/:id/items/:itemId/work-status',     canExecute, updateItemWorkStatus);
+router.delete('/:id',                              requireAuth, deleteEstimate);
 
 module.exports = router;

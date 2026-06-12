@@ -34,9 +34,12 @@ const roleSchema = z.object({
 function listRoles(req, res, next) {
   handle(req, res, next, async () => {
     const r = await pool.query(`
-      SELECT id, name, description, permissions, is_active, created_at, updated_at
-        FROM roles
-       ORDER BY name ASC
+      SELECT r.id, r.name, r.description, r.permissions, r.is_active, r.created_at, r.updated_at,
+             COUNT(u.id) FILTER (WHERE u.is_active = TRUE AND u.hub_id IS NULL)::int AS user_count
+        FROM roles r
+        LEFT JOIN users u ON u.role_id = r.id
+       GROUP BY r.id
+       ORDER BY r.name ASC
     `);
     res.json({ items: r.rows });
   });
@@ -89,9 +92,10 @@ function updateRole(req, res, next) {
 
     if (data.permissions) assertValidCodes(data.permissions);
 
-    // Check exists
-    const existing = await pool.query(`SELECT id FROM roles WHERE id = $1`, [id]);
+    // Check exists — also grab current permissions so propagation can diff
+    const existing = await pool.query(`SELECT id, permissions FROM roles WHERE id = $1`, [id]);
     if (!existing.rows.length) return res.status(404).json({ error: 'Role not found' });
+    const oldPerms = existing.rows[0].permissions || [];
 
     // Duplicate name check (excluding self)
     if (data.name) {
@@ -115,13 +119,54 @@ function updateRole(req, res, next) {
     if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
 
     params.push(id);
-    const r = await pool.query(`
-      UPDATE roles SET ${fields.join(', ')}, updated_at = NOW()
-       WHERE id = $${params.length}
-      RETURNING id, name, description, permissions, is_active, created_at, updated_at
-    `, params);
+    const client = await pool.connect();
+    let updatedRole;
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(`
+        UPDATE roles SET ${fields.join(', ')}, updated_at = NOW()
+         WHERE id = $${params.length}
+        RETURNING id, name, description, permissions, is_active, created_at, updated_at
+      `, params);
+      updatedRole = r.rows[0];
 
-    res.json({ item: r.rows[0] });
+      // If permissions changed, propagate the DIFF to all users with this role:
+      // remove codes the role lost, add codes the role gained — but keep any
+      // extra permissions that were granted to a user individually.
+      if (data.permissions !== undefined) {
+        const newPerms = data.permissions;
+        const removed  = oldPerms.filter(p => !newPerms.includes(p));
+        const added    = newPerms.filter(p => !oldPerms.includes(p));
+
+        if (removed.length || added.length) {
+          const usersRes = await client.query(`SELECT id FROM users WHERE role_id = $1`, [id]);
+          for (const u of usersRes.rows) {
+            if (removed.length) {
+              await client.query(
+                `DELETE FROM user_permissions WHERE user_id = $1 AND permission_code = ANY($2)`,
+                [u.id, removed]
+              );
+            }
+            if (added.length) {
+              const vals = added.map((_, i) => `($1, $${i + 2})`).join(', ');
+              await client.query(
+                `INSERT INTO user_permissions (user_id, permission_code) VALUES ${vals} ON CONFLICT DO NOTHING`,
+                [u.id, ...added]
+              );
+            }
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ item: updatedRole });
   });
 }
 
@@ -153,11 +198,14 @@ function applyRoleToUser(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Update role_id on the user so badge shows correct role name
+      await client.query(`UPDATE users SET role_id = $1 WHERE id = $2`, [roleId, userId]);
+      // Replace permissions
       await client.query(`DELETE FROM user_permissions WHERE user_id = $1`, [userId]);
       if (perms.length) {
         const values = perms.map((_, i) => `($1, $${i + 2})`).join(', ');
         await client.query(
-          `INSERT INTO user_permissions (user_id, permission_code) VALUES ${values}`,
+          `INSERT INTO user_permissions (user_id, permission_code) VALUES ${values} ON CONFLICT DO NOTHING`,
           [userId, ...perms]
         );
       }

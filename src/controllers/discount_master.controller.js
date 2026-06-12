@@ -4,7 +4,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 
 // ── Validators ────────────────────────────────────────────────────────────────
-const discountSchema = z.object({
+const discountBaseSchema = z.object({
   name:           z.string().trim().min(1).max(200),
   discount_type:  z.enum(['percent', 'flat']),
   discount_value: z.coerce.number().min(0),
@@ -14,6 +14,13 @@ const discountSchema = z.object({
   valid_until:    z.string().optional().nullable(),
   is_active:      z.boolean().optional(),
 });
+
+// Percent discounts above 100% would produce free/negative line items.
+const percentCap = (d) =>
+  !(d.discount_type === 'percent' && Number(d.discount_value) > 100);
+const PERCENT_CAP_MSG = { message: 'Percent discounts cannot exceed 100%' };
+
+const discountSchema = discountBaseSchema.refine(percentCap, PERCENT_CAP_MSG);
 
 const idParam = z.coerce.number().int().positive();
 
@@ -105,7 +112,25 @@ function createDiscount(req, res, next) {
 function updateDiscount(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
-    const data = discountSchema.partial().parse(req.body);
+    const data = discountBaseSchema.partial().parse(req.body);
+
+    // applies_to and ref_id must change together — updating one alone would
+    // leave the discount pointing at the wrong record.
+    if ((data.applies_to !== undefined) !== (data.ref_id !== undefined)) {
+      return res.status(400).json({ error: 'applies_to and ref_id must be updated together' });
+    }
+
+    // Enforce the percent ≤ 100 cap against the MERGED type + value
+    // (the payload may change only one of the two fields).
+    const curRow = await pool.query(
+      `SELECT discount_type, discount_value FROM discount_master WHERE id = $1`, [id]
+    );
+    if (curRow.rowCount === 0) return res.status(404).json({ error: 'Discount not found' });
+    const mergedType  = data.discount_type  ?? curRow.rows[0].discount_type;
+    const mergedValue = data.discount_value ?? curRow.rows[0].discount_value;
+    if (mergedType === 'percent' && Number(mergedValue) > 100) {
+      return res.status(400).json({ error: 'Percent discounts cannot exceed 100%' });
+    }
 
     const fields = [];
     const values = [];
@@ -122,6 +147,7 @@ function updateDiscount(req, res, next) {
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
+    fields.push(`updated_at = NOW()`);
     values.push(id);
     const upd = await pool.query(
       `UPDATE discount_master SET ${fields.join(', ')} WHERE id = $${n} RETURNING id`,
