@@ -233,6 +233,14 @@ function updateUser(req, res, next) {
     if (data.is_super_admin === false && req.user.id === id) {
       return res.status(400).json({ error: "You can't remove your own Super Admin flag" });
     }
+
+    // Ensure at least one Super Admin always exists.
+    if (data.is_super_admin === false) {
+      const countRes = await pool.query('SELECT COUNT(*) FROM users WHERE is_super_admin = TRUE');
+      if (parseInt(countRes.rows[0].count, 10) <= 1) {
+        return res.status(400).json({ error: 'Cannot revoke — at least one Super Admin must always exist' });
+      }
+    }
     if (data.is_active === false && req.user.id === id) {
       return res.status(400).json({ error: "You can't deactivate your own account" });
     }
@@ -385,6 +393,19 @@ function setUserPermissions(req, res, next) {
 // Accessible to any authenticated user who can interact with leads.
 // Returns only {id, name} — no permissions or sensitive data.
 // =====================================================================
+function listSuperAdmins(req, res, next) {
+  handle(req, res, next, async () => {
+    const r = await pool.query(
+      `SELECT u.id, u.name, u.email, u.is_active, u.created_at, u.last_login,
+              u.profile_photo, u.mobile, u.department
+       FROM users u
+       WHERE u.is_super_admin = TRUE
+       ORDER BY u.name ASC`
+    );
+    res.json({ items: r.rows });
+  });
+}
+
 function listAssignableUsers(req, res, next) {
   handle(req, res, next, async () => {
     const r = await pool.query(
@@ -405,6 +426,7 @@ module.exports = {
   listCatalog,
   listUsers,
   listAssignableUsers,
+  listSuperAdmins,
   getUser,
   createUser,
   updateUser,

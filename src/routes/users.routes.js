@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
+const { requireAuth, requirePermission, requireSuperAdmin } = require('../middleware/auth.middleware');
 const c = require('../controllers/users.controller');
 
 const router = express.Router();
@@ -21,7 +21,8 @@ const canAssign = [requireAuth, requirePermission(
   'CREATE_LEAD', 'EDIT_LEAD', 'ASSIGN_LEAD',
   'CREATE_HUB', 'EDIT_HUB', 'MANAGE_HUBS',
 )];
-router.get('/assignable', canAssign, c.listAssignableUsers);
+router.get('/assignable',   canAssign,                              c.listAssignableUsers);
+router.get('/super-admins', requireAuth, requireSuperAdmin,          c.listSuperAdmins);
 
 router.get   ('/',    canRead,   c.listUsers);
 router.post  ('/',    canManage, c.createUser);
