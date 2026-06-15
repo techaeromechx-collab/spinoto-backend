@@ -14,11 +14,12 @@ const canManage = [requireAuth, requirePermission('MANAGE_USERS')];
 // Read operations — MANAGE_USERS gets all users; VIEW_TEAM_LEADS gets own team only.
 const canRead = [requireAuth, requirePermission('MANAGE_USERS', 'VIEW_TEAM_LEADS')];
 
-// Lightweight assignable list — any user who can touch leads can see this.
+// Lightweight assignable list — any user who can touch leads or manage hubs can see this.
 // Returns only {id, name}, no permissions or sensitive data.
 const canAssign = [requireAuth, requirePermission(
   'MANAGE_USERS', 'VIEW_TEAM_LEADS', 'VIEW_LEAD', 'VIEW_OWN_LEADS',
   'CREATE_LEAD', 'EDIT_LEAD', 'ASSIGN_LEAD',
+  'CREATE_HUB', 'EDIT_HUB', 'MANAGE_HUBS',
 )];
 router.get('/assignable', canAssign, c.listAssignableUsers);
 
