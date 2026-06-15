@@ -484,10 +484,6 @@ function listAppointments(req, res, next) {
           OR LOWER(COALESCE(a.vehicle_number,'')) LIKE $${n})`
       );
     }
-    if (statusId) {
-      params.push(Number(statusId));
-      conditions.push(`a.status_id = $${params.length}`);
-    }
     if (hubId) {
       params.push(Number(hubId));
       conditions.push(`a.hub_id = $${params.length}`);
@@ -505,19 +501,37 @@ function listAppointments(req, res, next) {
       conditions.push(`a.scheduled_date <= $${params.length}`);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    // Snapshot BEFORE the status filter — per-status tab counts must ignore
+    // the active status filter so the numbers stay stable when a tab is picked.
+    const countConditions = [...conditions];
+    const countParams     = [...params];
 
-    const [dataRes, countRes] = await Promise.all([
+    if (statusId) {
+      params.push(Number(statusId));
+      conditions.push(`a.status_id = $${params.length}`);
+    }
+
+    const where      = conditions.length      ? `WHERE ${conditions.join(' AND ')}`      : '';
+    const countWhere = countConditions.length ? `WHERE ${countConditions.join(' AND ')}` : '';
+
+    const [dataRes, countRes, statusCountsRes] = await Promise.all([
       pool.query(
         `${APPT_SELECT} ${where} ORDER BY a.created_at DESC, a.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
       pool.query(`SELECT COUNT(*) FROM appointments a ${where}`, params),
+      pool.query(
+        `SELECT a.status_id, COUNT(*)::int AS count
+         FROM appointments a ${countWhere}
+         GROUP BY a.status_id`,
+        countParams
+      ),
     ]);
 
     return res.json({
       items: dataRes.rows,
       total: parseInt(countRes.rows[0].count, 10),
+      status_counts: statusCountsRes.rows, // [{ status_id, count }]
       page,
       limit,
     });

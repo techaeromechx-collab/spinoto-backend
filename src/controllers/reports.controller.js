@@ -648,6 +648,15 @@ async function getTeamPerformance(req, res, next) {
       periodStart = today.slice(0, 7) + '-01'; // this month
     }
 
+    // Managers (VIEW_TEAM_LEADS only, no MANAGE_USERS, not super admin) see only their own team.
+    // Admins / super admins / VIEW_REPORTS users see everyone.
+    const isManagerOnly = !req.user.is_super_admin
+      && !req.user.permissions.has('MANAGE_USERS')
+      && !req.user.permissions.has('VIEW_REPORTS');
+
+    const teamFilter  = isManagerOnly ? 'AND u.manager_id = $3' : '';
+    const queryParams = isManagerOnly ? [today, periodStart, req.user.id] : [today, periodStart];
+
     const rows = await pool.query(
       `SELECT
          u.id   AS user_id,
@@ -688,8 +697,9 @@ async function getTeamPerformance(req, res, next) {
        FROM users u
        WHERE u.hub_id IS NULL
          AND u.is_super_admin IS NOT TRUE
+         ${teamFilter}
        ORDER BY leads_generated DESC`,
-      [today, periodStart]
+      queryParams
     );
 
     res.json({ items: rows.rows });
