@@ -52,7 +52,7 @@ const IMPORT_TYPES = {
   },
   parts: {
     required:       ['name'],
-    optional:       ['category', 'vehicle_type', 'gst_percent', 'hsn_code'],
+    optional:       ['category', 'vehicle_type', 'customer_rate', 'gst_percent', 'hsn_code'],
     label:          'Part',
     identityFields: ['name'],
   },
@@ -83,11 +83,11 @@ const TEMPLATE_SAMPLES = {
     { category: 'Detailing',   service: 'Engine Bay Cleaning', description: 'Professional engine degreasing',   vehicle_class: 'both', gst_percent: '18', sac_code: ''       },
   ],
   parts: [
-    { name: 'Engine Oil Filter',  category: 'Engine',   vehicle_type: 'both', gst_percent: '28', hsn_code: '84099900' },
-    { name: 'Air Filter',         category: 'Engine',   vehicle_type: 'both', gst_percent: '28', hsn_code: '84212300' },
-    { name: 'Brake Pad Set',      category: 'Brakes',   vehicle_type: '4W',   gst_percent: '28', hsn_code: '87083000' },
-    { name: 'Brake Shoe',         category: 'Brakes',   vehicle_type: '2W',   gst_percent: '28', hsn_code: '87083000' },
-    { name: 'Spark Plug',         category: 'Engine',   vehicle_type: '',     gst_percent: '18', hsn_code: '85111000' },
+    { name: 'Engine Oil Filter',  category: 'Engine',   vehicle_type: 'both', customer_rate: '450.00', gst_percent: '28', hsn_code: '84099900' },
+    { name: 'Air Filter',         category: 'Engine',   vehicle_type: 'both', customer_rate: '320.00', gst_percent: '28', hsn_code: '84212300' },
+    { name: 'Brake Pad Set',      category: 'Brakes',   vehicle_type: '4W',   customer_rate: '1200.00', gst_percent: '28', hsn_code: '87083000' },
+    { name: 'Brake Shoe',         category: 'Brakes',   vehicle_type: '2W',   customer_rate: '350.00', gst_percent: '28', hsn_code: '87083000' },
+    { name: 'Spark Plug',         category: 'Engine',   vehicle_type: '',     customer_rate: '',        gst_percent: '18', hsn_code: '85111000' },
     { name: 'Wiper Blade',        category: 'Body',     vehicle_type: '4W',   gst_percent: '18', hsn_code: '85122000' },
     { name: 'Chain Lubrication',  category: '',         vehicle_type: '2W',   gst_percent: '18', hsn_code: ''         },
   ],
@@ -1867,24 +1867,31 @@ async function upsertParts(client, rows, getValue) {
     // Optional HSN code — trim, store as string or null
     const hsnCode = (getValue(row, 'hsn_code') || '').trim() || null;
 
+    // Optional customer rate (inc. GST) — store as numeric or null
+    const rateRaw      = getValue(row, 'customer_rate');
+    const customerRate = rateRaw !== '' && rateRaw != null && !isNaN(parseFloat(rateRaw))
+      ? parseFloat(rateRaw)
+      : null;
+
     // Look up existing part by name (case-insensitive)
     const existing = await client.query(
-      'SELECT id, category, vehicle_type, gst_percent, hsn_code FROM parts WHERE LOWER(name) = LOWER($1)',
+      'SELECT id, category, vehicle_type, customer_rate, gst_percent, hsn_code FROM parts WHERE LOWER(name) = LOWER($1)',
       [partName]
     );
 
     if (existing.rows.length > 0) {
       const { id, category: currentCat, vehicle_type: currentVt,
-              gst_percent: currentGst, hsn_code: currentHsn } = existing.rows[0];
-      const catChanged = (category    ?? null) !== (currentCat ?? null);
-      const vtChanged  = (vehicleType ?? null) !== (currentVt  ?? null);
-      const gstChanged = (gstPercent  ?? null) !== (currentGst ?? null);
-      const hsnChanged = (hsnCode     ?? null) !== (currentHsn ?? null);
+              customer_rate: currentRate, gst_percent: currentGst, hsn_code: currentHsn } = existing.rows[0];
+      const catChanged  = (category     ?? null) !== (currentCat  ?? null);
+      const vtChanged   = (vehicleType  ?? null) !== (currentVt   ?? null);
+      const rateChanged = (customerRate ?? null) !== (currentRate != null ? parseFloat(currentRate) : null);
+      const gstChanged  = (gstPercent   ?? null) !== (currentGst  ?? null);
+      const hsnChanged  = (hsnCode      ?? null) !== (currentHsn  ?? null);
 
-      if (catChanged || vtChanged || gstChanged || hsnChanged) {
+      if (catChanged || vtChanged || rateChanged || gstChanged || hsnChanged) {
         await client.query(
-          'UPDATE parts SET category = $1, vehicle_type = $2, gst_percent = $3, hsn_code = $4 WHERE id = $5',
-          [category, vehicleType, gstPercent, hsnCode, id]
+          'UPDATE parts SET category = $1, vehicle_type = $2, customer_rate = $3, gst_percent = $4, hsn_code = $5 WHERE id = $6',
+          [category, vehicleType, customerRate, gstPercent, hsnCode, id]
         );
         updated++;
       } else {
@@ -1892,8 +1899,8 @@ async function upsertParts(client, rows, getValue) {
       }
     } else {
       await client.query(
-        'INSERT INTO parts (name, category, vehicle_type, gst_percent, hsn_code) VALUES ($1, $2, $3, $4, $5)',
-        [partName, category, vehicleType, gstPercent, hsnCode]
+        'INSERT INTO parts (name, category, vehicle_type, customer_rate, gst_percent, hsn_code) VALUES ($1, $2, $3, $4, $5, $6)',
+        [partName, category, vehicleType, customerRate, gstPercent, hsnCode]
       );
       inserted++;
     }
