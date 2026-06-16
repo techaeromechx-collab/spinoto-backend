@@ -188,6 +188,7 @@ function listModels(req, res, next) {
     const makeId     = req.query.make_id      ? idParam.parse(req.query.make_id)      : null;
     const bodyTypeId = req.query.body_type_id ? idParam.parse(req.query.body_type_id) : null;
     const segmentId  = req.query.segment_id  ? idParam.parse(req.query.segment_id)  : null;
+    const typeClass  = req.query.type_class   || null; // '2W' | '4W'
 
     const conds  = [];
     const params = [];
@@ -205,6 +206,19 @@ function listModels(req, res, next) {
         SELECT id FROM segments WHERE LOWER(name) = (SELECT LOWER(name) FROM segments WHERE id = $${n++} LIMIT 1)
       )`);
       params.push(segmentId);
+    }
+    if (typeClass === '2W') {
+      conds.push(`vm.make_id IN (
+        SELECT m.id FROM vehicle_makes m
+        JOIN vehicle_types vt ON vt.id = m.vehicle_type_id
+        WHERE LOWER(vt.name) SIMILAR TO '%(two|2w|2-w|bike|scoot|motor)%'
+      )`);
+    } else if (typeClass === '4W') {
+      conds.push(`vm.make_id IN (
+        SELECT m.id FROM vehicle_makes m
+        JOIN vehicle_types vt ON vt.id = m.vehicle_type_id
+        WHERE LOWER(vt.name) NOT SIMILAR TO '%(two|2w|2-w|bike|scoot|motor)%'
+      )`);
     }
 
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
