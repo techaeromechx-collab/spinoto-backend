@@ -148,6 +148,13 @@ function listEvents(req, res, next) {
 
     const due = getDueClause();
 
+    // Exclude leads that have been converted to an appointment — their follow-ups
+    // are auto-closed on conversion going forward, but this guards existing open events.
+    const NOT_CONVERTED = `
+      AND l.status NOT IN (
+        SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+      )`;
+
     if (is_super_admin) {
       r = await pool.query(
         `SELECT ${SELECT}, FALSE AS is_team_followup
@@ -156,6 +163,7 @@ function listEvents(req, res, next) {
          LEFT JOIN users au ON au.id = l.assigned_to
          WHERE e.is_done = FALSE
            AND (${due.sql})
+           ${NOT_CONVERTED}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         due.args
       );
@@ -176,6 +184,7 @@ function listEvents(req, res, next) {
          WHERE e.is_done = FALSE
            AND (l.created_by = ANY($${offset + 2}) OR l.assigned_to = ANY($${offset + 2}))
            AND (${due.sql})
+           ${NOT_CONVERTED}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         [...due.args, userId, allIds]
       );
@@ -191,6 +200,7 @@ function listEvents(req, res, next) {
          WHERE e.is_done = FALSE
            AND (l.created_by = $${offset + 1} OR l.assigned_to = $${offset + 1})
            AND (${due.sql})
+           ${NOT_CONVERTED}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         [...due.args, userId]
       );
@@ -211,14 +221,21 @@ function pendingCount(req, res, next) {
 
     let r;
 
+    const NOT_CONVERTED_COUNT = `
+      AND l.status NOT IN (
+        SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+      )`;
+
     if (is_super_admin) {
       r = await pool.query(
-        `SELECT COUNT(*) AS count FROM lead_events
-         WHERE is_done = FALSE
+        `SELECT COUNT(*) AS count FROM lead_events e
+         JOIN leads l ON l.id = e.lead_id
+         WHERE e.is_done = FALSE
            AND (
-             (due_at IS NOT NULL AND due_at <= $1)
-             OR (due_at IS NULL AND due_date <= $2)
-           )`,
+             (e.due_at IS NOT NULL AND e.due_at <= $1)
+             OR (e.due_at IS NULL AND e.due_date <= $2)
+           )
+           ${NOT_CONVERTED_COUNT}`,
         [now, today]
       );
 
@@ -237,7 +254,8 @@ function pendingCount(req, res, next) {
            AND (
              (e.due_at IS NOT NULL AND e.due_at <= $1)
              OR (e.due_at IS NULL AND e.due_date <= $2)
-           )`,
+           )
+           ${NOT_CONVERTED_COUNT}`,
         [now, today, allIds]
       );
 
@@ -250,7 +268,8 @@ function pendingCount(req, res, next) {
            AND (
              (e.due_at IS NOT NULL AND e.due_at <= $1)
              OR (e.due_at IS NULL AND e.due_date <= $2)
-           )`,
+           )
+           ${NOT_CONVERTED_COUNT}`,
         [now, today, userId]
       );
     }
