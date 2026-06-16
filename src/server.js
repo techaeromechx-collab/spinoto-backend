@@ -1,9 +1,11 @@
 require('dotenv').config();
 
+const http    = require('http');
 const express = require('express');
 const cors    = require('cors');
 const morgan  = require('morgan');
 const path    = require('path');
+const { initIO } = require('./socket');
 
 const { pool } = require('./config/db');
 const { ensureSeedPasswords } = require('./utils/seedPasswords');
@@ -168,7 +170,9 @@ const PORT = process.env.PORT || 4000;
         OR NOT (notification_settings ? 'note_added')`
   ).catch(() => {});
 
-  app.listen(PORT, () => {
+  const httpServer = http.createServer(app);
+  initIO(httpServer);
+  httpServer.listen(PORT, () => {
     console.log(`Spinoto API listening on http://localhost:${PORT}`);
     startScheduler();
     startReminderPoller();

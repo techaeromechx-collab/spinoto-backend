@@ -2,6 +2,7 @@
 
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 const discountBaseSchema = z.object({
@@ -104,6 +105,7 @@ function createDiscount(req, res, next) {
     );
 
     const full = await pool.query(`${DM_SELECT} WHERE dm.id = $1`, [r.rows[0].id]);
+    getIO().emit('invalidate', { topic: 'discounts' });
     res.status(201).json({ item: full.rows[0] });
   });
 }
@@ -156,6 +158,7 @@ function updateDiscount(req, res, next) {
     if (upd.rowCount === 0) return res.status(404).json({ error: 'Discount not found' });
 
     const full = await pool.query(`${DM_SELECT} WHERE dm.id = $1`, [id]);
+    getIO().emit('invalidate', { topic: 'discounts' });
     res.json({ item: full.rows[0] });
   });
 }
@@ -166,6 +169,7 @@ function deleteDiscount(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM discount_master WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Discount not found' });
+    getIO().emit('invalidate', { topic: 'discounts' });
     res.status(204).end();
   });
 }

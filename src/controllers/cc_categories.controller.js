@@ -2,6 +2,7 @@
 
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 const ccSchemaBase = z.object({
@@ -63,6 +64,7 @@ function createCategory(req, res, next) {
        RETURNING id, name, min_cc, max_cc, description, is_active`,
       [data.name, data.min_cc, data.max_cc, data.description ?? null, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'cc_categories' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -101,6 +103,7 @@ function updateCategory(req, res, next) {
       values
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
+    getIO().emit('invalidate', { topic: 'cc_categories' });
 
     // ── Re-classify all vehicle_models whose engine_cc falls within any active range ──
     // This keeps the stored cc_category_id in sync whenever a range is changed.
@@ -147,6 +150,7 @@ function deleteCategory(req, res, next) {
         [id]
       );
       if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
+      getIO().emit('invalidate', { topic: 'cc_categories' });
       return res.json({
         warning: 'This category is referenced by pricing rules or vehicles and has been deactivated instead of deleted.',
         deactivated: true,
@@ -155,6 +159,7 @@ function deleteCategory(req, res, next) {
 
     const r = await pool.query('DELETE FROM cc_categories WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
+    getIO().emit('invalidate', { topic: 'cc_categories' });
     res.status(204).end();
   });
 }

@@ -2,6 +2,7 @@
 
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 const partSchema = z.object({
@@ -58,6 +59,7 @@ function createPart(req, res, next) {
        RETURNING id, name, category, vehicle_type, is_active, customer_rate, gst_percent, hsn_code, created_at, updated_at`,
       [data.name, data.category ?? null, data.vehicle_type ?? null, data.is_active, data.customer_rate ?? null, data.gst_percent ?? null, data.hsn_code ?? null]
     );
+    getIO().emit('invalidate', { topic: 'parts' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -89,6 +91,7 @@ function updatePart(req, res, next) {
       values
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Part not found' });
+    getIO().emit('invalidate', { topic: 'parts' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -99,6 +102,7 @@ function deletePart(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM parts WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Part not found' });
+    getIO().emit('invalidate', { topic: 'parts' });
     res.status(204).end();
   });
 }

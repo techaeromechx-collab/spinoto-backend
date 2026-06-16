@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 
@@ -257,6 +258,7 @@ function createPricing(req, res, next) {
     );
 
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [r.rows[0].id]);
+    getIO().emit('invalidate', { topic: 'pricing' });
     res.status(201).json({ item: enrichRow(full.rows[0]) });
   });
 }
@@ -305,6 +307,7 @@ function updatePricing(req, res, next) {
     if (upd.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
 
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [id]);
+    getIO().emit('invalidate', { topic: 'pricing' });
     res.json({ item: enrichRow(full.rows[0]) });
   });
 }
@@ -322,6 +325,7 @@ function togglePricingStatus(req, res, next) {
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [id]);
+    getIO().emit('invalidate', { topic: 'pricing' });
     res.json({ item: enrichRow(full.rows[0]) });
   });
 }
@@ -334,6 +338,7 @@ function deletePricing(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM pricing WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
+    getIO().emit('invalidate', { topic: 'pricing' });
     res.status(204).end();
   });
 }

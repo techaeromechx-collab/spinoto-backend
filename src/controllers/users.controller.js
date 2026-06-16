@@ -14,6 +14,7 @@
 const bcrypt = require('bcryptjs');
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 const {
   PERMISSION_CATALOG,
   PERMISSION_CODES,
@@ -214,6 +215,7 @@ function createUser(req, res, next) {
       }
       await client.query('COMMIT');
       const user = await loadUser(newId);
+      getIO().emit('invalidate', { topic: 'users' });
       res.status(201).json({ item: user });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -313,6 +315,7 @@ function updateUser(req, res, next) {
     }
 
     const user = await loadUser(id);
+    getIO().emit('invalidate', { topic: 'users' });
     res.json({ item: user });
   });
 }
@@ -342,6 +345,7 @@ function deleteUser(req, res, next) {
       }
       throw err;
     }
+    getIO().emit('invalidate', { topic: 'users' });
     res.status(204).end();
   });
 }
@@ -384,6 +388,7 @@ function setUserPermissions(req, res, next) {
     }
 
     const user = await loadUser(id);
+    getIO().emit('invalidate', { topic: 'users' });
     res.json({ item: user });
   });
 }

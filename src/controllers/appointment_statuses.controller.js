@@ -1,6 +1,7 @@
 'use strict';
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(err => {
@@ -56,6 +57,7 @@ function createStatus(req, res, next) {
         [data.name, data.color, data.bg_color, nextOrder, data.is_active, data.is_default]
       );
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'appointment_statuses' });
       res.status(201).json({ item: r.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -106,6 +108,7 @@ function updateStatus(req, res, next) {
       );
       if (!r.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Status not found' }); }
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'appointment_statuses' });
       res.json({ item: r.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -124,6 +127,7 @@ function deleteStatus(req, res, next) {
     if (row.rows[0].is_system)   return res.status(403).json({ error: 'Cannot delete a system status.' });
     if (row.rows[0].is_default) return res.status(409).json({ error: 'Cannot delete the default status. Set another status as default first.' });
     await pool.query('DELETE FROM appointment_statuses WHERE id = $1', [id]);
+    getIO().emit('invalidate', { topic: 'appointment_statuses' });
     res.status(204).end();
   });
 }
@@ -141,6 +145,7 @@ function reorderStatuses(req, res, next) {
         await client.query('UPDATE appointment_statuses SET sort_order = $1 WHERE id = $2', [i + 1, ids[i]]);
       }
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'appointment_statuses' });
       res.json({ ok: true });
     } catch (err) {
       await client.query('ROLLBACK');

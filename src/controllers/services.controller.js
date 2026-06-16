@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 const VALID_DIMENSIONS = ['vehicle_type', 'body_type', 'segment', 'make', 'model', 'cc_category'];
@@ -68,6 +69,7 @@ function createCategory(req, res, next) {
        RETURNING id, name, description, is_active, pricing_config, vehicle_class`,
       [data.name, data.description ?? null, data.is_active, data.pricing_config ? JSON.stringify(data.pricing_config) : null, data.vehicle_class ?? null]
     );
+    getIO().emit('invalidate', { topic: 'services' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -96,6 +98,7 @@ function updateCategory(req, res, next) {
       values
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Category not found' });
+    getIO().emit('invalidate', { topic: 'services' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -105,6 +108,7 @@ function deleteCategory(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM service_categories WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Category not found' });
+    getIO().emit('invalidate', { topic: 'services' });
     res.status(204).end();
   });
 }
@@ -162,6 +166,7 @@ function createService(req, res, next) {
       [data.category_id, data.name, data.description ?? null, data.is_active, data.vehicle_class ?? null,
        data.customer_rate ?? null, data.gst_percent ?? null, data.sac_code ?? null]
     );
+    getIO().emit('invalidate', { topic: 'services' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -187,6 +192,7 @@ function updateService(req, res, next) {
        data.customer_rate ?? null, data.gst_percent ?? null, data.sac_code ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Service not found' });
+    getIO().emit('invalidate', { topic: 'services' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -196,6 +202,7 @@ function deleteService(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM services WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Service not found' });
+    getIO().emit('invalidate', { topic: 'services' });
     res.status(204).end();
   });
 }

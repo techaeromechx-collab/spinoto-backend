@@ -1,6 +1,7 @@
 'use strict';
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(err => {
@@ -46,6 +47,7 @@ function createSource(req, res, next) {
        RETURNING id, name, is_active, sort_order, created_at`,
       [data.name, data.is_active, nextOrder]
     );
+    getIO().emit('invalidate', { topic: 'lead_sources' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -73,6 +75,7 @@ function updateSource(req, res, next) {
       [data.name ?? null, data.is_active ?? null, data.sort_order ?? null, id]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Source not found' });
+    getIO().emit('invalidate', { topic: 'lead_sources' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -83,6 +86,7 @@ function deleteSource(req, res, next) {
     const id = parseInt(req.params.id, 10);
     const r  = await pool.query('DELETE FROM lead_sources WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Source not found' });
+    getIO().emit('invalidate', { topic: 'lead_sources' });
     res.status(204).end();
   });
 }
@@ -95,6 +99,7 @@ function reorderSources(req, res, next) {
     await Promise.all(ids.map((id, i) =>
       pool.query('UPDATE lead_sources SET sort_order = $1 WHERE id = $2', [i + 1, id])
     ));
+    getIO().emit('invalidate', { topic: 'lead_sources' });
     res.json({ ok: true });
   });
 }

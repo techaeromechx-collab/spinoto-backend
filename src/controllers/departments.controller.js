@@ -9,6 +9,7 @@
 
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -54,6 +55,7 @@ function createDepartment(req, res, next) {
        RETURNING id, name, is_active, created_at`,
       [data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'departments' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -73,6 +75,7 @@ function updateDepartment(req, res, next) {
       [data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Department not found' });
+    getIO().emit('invalidate', { topic: 'departments' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -83,6 +86,7 @@ function deleteDepartment(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM departments WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Department not found' });
+    getIO().emit('invalidate', { topic: 'departments' });
     res.status(204).end();
   });
 }

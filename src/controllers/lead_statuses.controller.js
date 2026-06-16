@@ -1,6 +1,7 @@
 'use strict';
 const { z }    = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(err => {
@@ -61,6 +62,7 @@ function createStatus(req, res, next) {
          data.needs_follow_up, data.converts_to_appointment, data.is_pipeline]
       );
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'lead_statuses' });
       res.status(201).json({ item: r.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -99,6 +101,7 @@ function updateStatus(req, res, next) {
       );
       if (!r.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Status not found' }); }
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'lead_statuses' });
       res.json({ item: r.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -124,6 +127,7 @@ function deleteStatus(req, res, next) {
       });
     }
     await pool.query('DELETE FROM lead_statuses WHERE id = $1', [id]);
+    getIO().emit('invalidate', { topic: 'lead_statuses' });
     res.status(204).end();
   });
 }
@@ -141,6 +145,7 @@ function reorderStatuses(req, res, next) {
         await client.query('UPDATE lead_statuses SET sort_order = $1 WHERE id = $2', [i + 1, ids[i]]);
       }
       await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'lead_statuses' });
       res.json({ ok: true });
     } catch (err) {
       await client.query('ROLLBACK');

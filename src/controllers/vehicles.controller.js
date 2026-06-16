@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ---------- validators ----------
 const idParam = z.coerce.number().int().positive();
@@ -63,6 +64,7 @@ function createType(req, res, next) {
       'INSERT INTO vehicle_types (name, is_active) VALUES ($1, COALESCE($2, TRUE)) RETURNING id, name, is_active',
       [data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -79,6 +81,7 @@ function updateType(req, res, next) {
       [data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Vehicle type not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -87,6 +90,7 @@ function deleteType(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM vehicle_types WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Vehicle type not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }
@@ -151,6 +155,7 @@ function createMake(req, res, next) {
       'INSERT INTO vehicle_makes (vehicle_type_id, name, is_active) VALUES ($1, $2, COALESCE($3, TRUE)) RETURNING id, vehicle_type_id, name, is_active',
       [data.vehicle_type_id, data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -168,6 +173,7 @@ function updateMake(req, res, next) {
       [data.vehicle_type_id ?? null, data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Make not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -176,6 +182,7 @@ function deleteMake(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM vehicle_makes WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Make not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }
@@ -242,6 +249,7 @@ function createModel(req, res, next) {
       'INSERT INTO vehicle_models (make_id, name, is_active) VALUES ($1, $2, COALESCE($3, TRUE)) RETURNING id, make_id, name, is_active',
       [data.make_id, data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -259,6 +267,7 @@ function updateModel(req, res, next) {
       [data.make_id ?? null, data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Model not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -267,6 +276,7 @@ function deleteModel(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM vehicle_models WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Model not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }
@@ -292,6 +302,7 @@ function createSegment(req, res, next) {
       'INSERT INTO segments (name, is_active) VALUES ($1, COALESCE($2, TRUE)) RETURNING id, name, is_active',
       [data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -308,6 +319,7 @@ function updateSegment(req, res, next) {
       [data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Segment not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -316,6 +328,7 @@ function deleteSegment(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM segments WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Segment not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }
@@ -341,6 +354,7 @@ function createBodyType(req, res, next) {
       'INSERT INTO body_types (name, is_active) VALUES ($1, COALESCE($2, TRUE)) RETURNING id, name, is_active',
       [data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -357,6 +371,7 @@ function updateBodyType(req, res, next) {
       [data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Body type not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -365,6 +380,7 @@ function deleteBodyType(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM body_types WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Body type not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }
@@ -590,6 +606,7 @@ function createVehicleRecord(req, res, next) {
 
       // Return full record
       const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [newId]);
+      getIO().emit('invalidate', { topic: 'vehicles' });
       res.status(201).json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -734,6 +751,7 @@ function updateVehicleRecord(req, res, next) {
       await client.query('COMMIT');
 
       const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [id]);
+      getIO().emit('invalidate', { topic: 'vehicles' });
       res.json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -750,6 +768,7 @@ function deleteVehicleRecord(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query('DELETE FROM vehicle_models WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Vehicle not found' });
+    getIO().emit('invalidate', { topic: 'vehicles' });
     res.status(204).end();
   });
 }

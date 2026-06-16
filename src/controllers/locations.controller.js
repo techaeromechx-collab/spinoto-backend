@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { getIO } = require('../socket');
 
 // ---------- validators ----------
 const stateSchema = z.object({
@@ -62,6 +63,7 @@ function createState(req, res, next) {
       'INSERT INTO states (name, code, is_active) VALUES ($1, $2, COALESCE($3, TRUE)) RETURNING id, name, code, is_active',
       [data.name, data.code || null, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -80,6 +82,7 @@ function updateState(req, res, next) {
       [data.name ?? null, data.code ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'State not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -89,6 +92,7 @@ function deleteState(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM states WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'State not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(204).end();
   });
 }
@@ -119,6 +123,7 @@ function createCity(req, res, next) {
       'INSERT INTO cities (state_id, name, is_active) VALUES ($1, $2, COALESCE($3, TRUE)) RETURNING id, state_id, name, is_active',
       [data.state_id, data.name, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -137,6 +142,7 @@ function updateCity(req, res, next) {
       [data.state_id ?? null, data.name ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'City not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -146,6 +152,7 @@ function deleteCity(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM cities WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'City not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(204).end();
   });
 }
@@ -175,6 +182,7 @@ function createArea(req, res, next) {
       'INSERT INTO areas (city_id, name, pincode, is_active) VALUES ($1, $2, $3, COALESCE($4, TRUE)) RETURNING id, city_id, name, pincode, is_active',
       [data.city_id, data.name, data.pincode || null, data.is_active]
     );
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(201).json({ item: r.rows[0] });
   });
 }
@@ -194,6 +202,7 @@ function updateArea(req, res, next) {
       [data.city_id ?? null, data.name ?? null, data.pincode ?? null, data.is_active ?? null, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Area not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.json({ item: r.rows[0] });
   });
 }
@@ -203,6 +212,7 @@ function deleteArea(req, res, next) {
     const id = idParam.parse(req.params.id);
     const r = await pool.query('DELETE FROM areas WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Area not found' });
+    getIO().emit('invalidate', { topic: 'locations' });
     res.status(204).end();
   });
 }
