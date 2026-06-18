@@ -52,6 +52,7 @@ const baseHubSchema = z.object({
   vehicle_capacity:     z.coerce.number().int().min(0).optional().nullable(),
   workshop_area_sqft:   z.coerce.number().min(0).optional().nullable(),
   no_of_mechanics:      z.coerce.number().int().min(0).optional().nullable(),
+  company_name:         z.string().trim().max(200).optional().nullable(),
 });
 
 // createSchema adds the cross-field GST refine on top
@@ -105,6 +106,7 @@ const HUB_SELECT = `
   SELECT
     h.id,
     h.hub_name,
+    h.company_name,
     h.person_name,
     h.contact_number,
     h.owner_name,
@@ -162,6 +164,7 @@ const HUB_SELECT_LIST = `
   SELECT
     h.id,
     h.hub_name,
+    h.company_name,
     h.person_name,
     h.contact_number,
     h.owner_name,
@@ -324,8 +327,8 @@ function createHub(req, res, next) {
           commission_percent, payout_terms, payout_cycle_days,
           bank_account_number, bank_ifsc, bank_name, account_holder_name,
           vehicle_capacity, workshop_area_sqft, no_of_mechanics,
-          created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+          company_name, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
        RETURNING id`,
       [
         data.hub_name, data.person_name, data.contact_number,
@@ -347,6 +350,7 @@ function createHub(req, res, next) {
         data.vehicle_capacity    ?? null,
         data.workshop_area_sqft  ?? null,
         data.no_of_mechanics     ?? null,
+        data.company_name        || null,
         createdBy,
       ]
     );
@@ -425,11 +429,12 @@ function updateHub(req, res, next) {
          vehicle_capacity     = COALESCE($27, vehicle_capacity),
          workshop_area_sqft   = COALESCE($28, workshop_area_sqft),
          no_of_mechanics      = COALESCE($29, no_of_mechanics),
+         company_name         = COALESCE($30, company_name),
          -- If hub was rejected, reset to pending so it goes back for re-review
-         verification_status  = CASE WHEN $31 THEN 'pending' ELSE verification_status END,
-         rejection_reason     = CASE WHEN $31 THEN NULL ELSE rejection_reason END,
+         verification_status  = CASE WHEN $32 THEN 'pending' ELSE verification_status END,
+         rejection_reason     = CASE WHEN $32 THEN NULL ELSE rejection_reason END,
          updated_at           = NOW()
-       WHERE id = $30 AND deleted_at IS NULL`,
+       WHERE id = $31 AND deleted_at IS NULL`,
       [
         data.hub_name       ?? null,
         data.person_name    ?? null,
@@ -460,8 +465,9 @@ function updateHub(req, res, next) {
         data.vehicle_capacity    ?? null,
         data.workshop_area_sqft  ?? null,
         data.no_of_mechanics     ?? null,
-        id,
-        wasRejected,  // $31 — if true, resets verification_status to 'pending'
+        data.company_name        ?? null,  // $30
+        id,                                // $31
+        wasRejected,                       // $32 — if true, resets verification_status to 'pending'
       ]
     );
 
