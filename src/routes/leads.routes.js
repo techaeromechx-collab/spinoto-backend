@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
-const c = require('../controllers/leads.controller');
+const c  = require('../controllers/leads.controller');
+const cl = require('../controllers/call_logs.controller');
 
 const router = express.Router();
 
@@ -16,6 +17,9 @@ router.get('/stage-stats', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEA
 // duplicate mobile check — before /:id
 router.get('/check-mobile', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS', 'CREATE_LEAD'), c.checkMobile);
 
+// Call log summary — must be before /:id
+router.get('/calls/summary', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), cl.getCallSummary);
+
 // LIST: any of the three view-level permissions grants access; filtering happens inside the controller
 router.get ('/',     requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.listLeads);
 router.post('/',    requireAuth, requirePermission('CREATE_LEAD'), c.createLead);
@@ -24,5 +28,9 @@ router.post('/bulk-delete',  requireAuth, requirePermission('DELETE_LEAD'), c.bu
 router.get ('/:id', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.getLead);
 router.patch('/:id', requireAuth, requirePermission('EDIT_LEAD'),  c.updateLead);
 router.delete('/:id', requireAuth, requirePermission('DELETE_LEAD'), c.deleteLead);
+
+// Call logs per lead
+router.get ('/:id/calls', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), cl.getLeadCallLogs);
+router.post('/:id/calls', requireAuth, requirePermission('EDIT_LEAD'), cl.createCallLog);
 
 module.exports = router;

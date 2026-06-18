@@ -188,7 +188,7 @@ async function getByUser(req, res, next) {
           WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
         ), 0)::numeric                                                              AS realized_revenue
       FROM users u
-      LEFT JOIN leads l ON l.created_by = u.id ${dateCond}
+      LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
       WHERE ${userWhere}
       GROUP BY u.id, u.name, u.email
       ORDER BY total_leads DESC NULLS LAST, u.name ASC
@@ -246,7 +246,7 @@ async function getUserDetail(req, res, next) {
           WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
         ), 0)::numeric                                                                 AS realized_revenue
       FROM users u
-      LEFT JOIN leads l ON l.created_by = u.id ${dateCond}
+      LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
       WHERE u.id = $1
       GROUP BY u.id, u.name, u.email, u.is_super_admin
     `, params);
@@ -262,7 +262,7 @@ async function getUserDetail(req, res, next) {
         COALESCE(status, 'New Lead') AS status_name,
         COUNT(*)::int AS count
       FROM leads
-      WHERE created_by = $1 ${sbWhere}
+      WHERE (created_by = $1 OR assigned_to = $1) ${sbWhere}
       GROUP BY status
       ORDER BY count DESC
     `, sbParams);
@@ -274,7 +274,7 @@ async function getUserDetail(req, res, next) {
         l.id AS lead_id, l.name AS lead_name, l.mobile AS lead_mobile, l.status AS lead_status
       FROM lead_events e
       JOIN leads l ON l.id = e.lead_id
-      WHERE l.created_by = $1
+      WHERE (l.created_by = $1 OR l.assigned_to = $1)
         AND e.is_done = FALSE
         AND e.due_date <= $2
       ORDER BY e.due_date ASC, e.created_at ASC
@@ -289,7 +289,7 @@ async function getUserDetail(req, res, next) {
         l.created_at
       FROM leads l
       LEFT JOIN vehicle_types vt ON vt.id = l.vehicle_type_id
-      WHERE l.created_by = $1
+      WHERE (l.created_by = $1 OR l.assigned_to = $1)
       ORDER BY l.created_at DESC
       LIMIT 10
     `, [userId]);

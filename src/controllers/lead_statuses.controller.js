@@ -20,11 +20,13 @@ const statusSchema = z.object({
   needs_follow_up:         z.boolean().default(false),
   converts_to_appointment: z.boolean().default(false),
   is_pipeline:             z.boolean().default(true),
+  logs_call:               z.boolean().default(false),
+  is_locked:               z.boolean().default(false),
 });
 
 const SELECT_COLS = `
   id, name, color, bg_color, sort_order, is_active, is_default,
-  needs_follow_up, converts_to_appointment, is_pipeline, created_at
+  needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, created_at
 `;
 
 function listStatuses(req, res, next) {
@@ -56,10 +58,10 @@ function createStatus(req, res, next) {
       }
       const r = await client.query(
         `INSERT INTO lead_statuses
-           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ${SELECT_COLS}`,
+           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ${SELECT_COLS}`,
         [data.name, data.color, data.bg_color, nextOrder, data.is_active, data.is_default,
-         data.needs_follow_up, data.converts_to_appointment, data.is_pipeline]
+         data.needs_follow_up, data.converts_to_appointment, data.is_pipeline, data.logs_call ?? false, data.is_locked ?? false]
       );
       await client.query('COMMIT');
       getIO().emit('invalidate', { topic: 'lead_statuses' });

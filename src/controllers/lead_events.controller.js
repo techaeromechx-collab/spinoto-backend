@@ -148,11 +148,13 @@ function listEvents(req, res, next) {
 
     const due = getDueClause();
 
-    // Exclude leads that have been converted to an appointment — their follow-ups
-    // are auto-closed on conversion going forward, but this guards existing open events.
+    // Exclude leads whose current status is terminal (locked) or already converted to an
+    // appointment — follow-ups on those leads are no longer actionable.
     const NOT_CONVERTED = `
       AND l.status NOT IN (
-        SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+        SELECT name FROM lead_statuses
+        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
+          AND is_active = TRUE
       )`;
 
     if (is_super_admin) {
@@ -223,7 +225,9 @@ function pendingCount(req, res, next) {
 
     const NOT_CONVERTED_COUNT = `
       AND l.status NOT IN (
-        SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
+        SELECT name FROM lead_statuses
+        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
+          AND is_active = TRUE
       )`;
 
     if (is_super_admin) {

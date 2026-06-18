@@ -43,6 +43,7 @@ const settingsRoutes             = require('./routes/settings.routes');
 const rolesRoutes                = require('./routes/roles.routes');
 const logsRoutes                 = require('./routes/logs.routes');
 const discountMasterRoutes       = require('./routes/discount_master.routes');
+const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
 const pushRoutes                 = require('./routes/push.routes');
 
 const app = express();
@@ -117,6 +118,7 @@ app.use('/api/invoices/:id/payments',       invoicePaymentsRoutes);
 app.use('/api/parts',             partsRoutes);
 app.use('/api/estimates',         estimatesRoutes);
 app.use('/api/discount-master',   discountMasterRoutes);
+app.use('/api/call-outcomes',     callOutcomesRoutes);
 app.use('/api/settings',   settingsRoutes);
 
 const purchaseInvoicesRouter = require('./routes/purchase_invoices.routes');
