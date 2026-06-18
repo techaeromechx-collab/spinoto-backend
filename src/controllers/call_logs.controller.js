@@ -82,7 +82,6 @@ function getCallSummary(req, res, next) {
          FROM call_logs cl
          JOIN users u ON u.id = cl.called_by
          WHERE cl.called_at::date = $1
-           AND cl.called_at::time BETWEEN '09:00' AND '18:00'
          GROUP BY u.id, u.name, cl.outcome
        ) sub
        GROUP BY user_id, agent_name
