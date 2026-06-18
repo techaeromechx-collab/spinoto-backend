@@ -53,7 +53,7 @@ function listCategories(req, res, next) {
         WHERE ($1::text IS NULL OR sc.name ILIKE $1)
           AND ($2::text IS NULL OR sc.vehicle_class = $2 OR sc.vehicle_class = 'both')
         GROUP BY sc.id
-        ORDER BY sc.name ASC`,
+        ORDER BY sc.sort_order ASC, sc.name ASC`,
       [search, vehicleClass]
     );
     res.json({ items: r.rows });
@@ -132,7 +132,7 @@ function listServices(req, res, next) {
         WHERE ($1::int IS NULL OR s.category_id = $1)
           AND ($2::text IS NULL OR s.name ILIKE $2)
           AND ($3::text IS NULL OR s.vehicle_class = $3 OR s.vehicle_class = 'both')
-        ORDER BY s.name ASC`,
+        ORDER BY s.sort_order ASC, s.name ASC`,
       [categoryId, search, vehicleClass]
     );
     res.json({ items: r.rows });
@@ -207,7 +207,53 @@ function deleteService(req, res, next) {
   });
 }
 
+function reorderCategories(req, res, next) {
+  handle(req, res, next, async () => {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0)
+      return res.status(400).json({ error: 'ids must be a non-empty array' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < ids.length; i++) {
+        await client.query('UPDATE service_categories SET sort_order = $1 WHERE id = $2', [i + 1, ids[i]]);
+      }
+      await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'services' });
+      res.json({ ok: true });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+}
+
+function reorderServices(req, res, next) {
+  handle(req, res, next, async () => {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0)
+      return res.status(400).json({ error: 'ids must be a non-empty array' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < ids.length; i++) {
+        await client.query('UPDATE services SET sort_order = $1 WHERE id = $2', [i + 1, ids[i]]);
+      }
+      await client.query('COMMIT');
+      getIO().emit('invalidate', { topic: 'services' });
+      res.json({ ok: true });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+}
+
 module.exports = {
-  listCategories, createCategory, updateCategory, deleteCategory,
-  listServices, getService, createService, updateService, deleteService,
+  listCategories, createCategory, updateCategory, deleteCategory, reorderCategories,
+  listServices, getService, createService, updateService, deleteService, reorderServices,
 };
