@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
-const { listEvents, pendingCount, markDone, getCompliance } = require('../controllers/lead_events.controller');
+const { listEvents, pendingCount, markDone, getCompliance, getStats } = require('../controllers/lead_events.controller');
 
 const router = express.Router();
 
@@ -12,6 +12,7 @@ router.use(requireAuth);
 
 router.get('/',              canFollowUp,   listEvents);
 router.get('/pending-count', canFollowUp,   pendingCount);
+router.get('/stats',         canFollowUp,   getStats);        // must be before /:id
 router.get('/compliance',    canCompliance, getCompliance);   // must be before /:id
 router.patch('/:id/done',    canFollowUp,   markDone);
 

@@ -454,23 +454,15 @@ function updateLead(req, res, next) {
         }
       }
 
-      // ── Auto-close open follow-ups when lead is converted to appointment ──
-      // If the new status has converts_to_appointment = TRUE and no new follow-up
-      // was scheduled in the same request, close all pending events automatically.
+      // ── Auto-close open follow-ups on ANY status change ──────────────────
+      // If status changed and no new follow-up was scheduled in the same request,
+      // mark all pending events as done automatically.
       if (coreData.status && coreData.status !== prevLead?.status && !req.body.follow_up_date) {
-        const convCheck = await client.query(
-          `SELECT 1 FROM lead_statuses
-           WHERE name = $1 AND converts_to_appointment = TRUE AND is_active = TRUE
-           LIMIT 1`,
-          [coreData.status]
+        await client.query(
+          `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+           WHERE lead_id = $1 AND is_done = FALSE`,
+          [id]
         );
-        if (convCheck.rows.length > 0) {
-          await client.query(
-            `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
-             WHERE lead_id = $1 AND is_done = FALSE`,
-            [id]
-          );
-        }
       }
 
       // ── Log status change to activity timeline ─────────────────────────

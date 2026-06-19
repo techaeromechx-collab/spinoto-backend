@@ -282,6 +282,155 @@ function pendingCount(req, res, next) {
   });
 }
 
+// GET /api/lead-events/stats?user_id=X
+// GET /api/lead-events/stats?user_id=X&period=today|week|month|all
+// Overdue & Due Today are always current state (no period bound).
+// Upcoming & Completed are scoped to the selected period.
+// Avg Response Time is this-week vs last-week (fixed, not period-bound).
+function getStats(req, res, next) {
+  handle(req, res, next, async () => {
+    const { id: userId, is_super_admin, permissions } = req.user;
+    const isManager = !is_super_admin && permissions.has('VIEW_TEAM_LEADS');
+    const today = new Date().toISOString().slice(0, 10);
+
+    // ── Target user resolution ──────────────────────────────────────────
+    const requestedId = req.query.user_id;
+    let targetIds = null;
+
+    if (is_super_admin) {
+      if (!requestedId || requestedId === 'all') {
+        targetIds = null;
+      } else if (requestedId === 'me' || requestedId === String(userId)) {
+        targetIds = [userId];
+      } else {
+        const reqId = parseInt(requestedId, 10);
+        targetIds = isNaN(reqId) ? [userId] : [reqId];
+      }
+    } else if (isManager) {
+      const teamRes = await pool.query(
+        `SELECT id FROM users WHERE manager_id = $1 AND is_active = TRUE`, [userId]
+      );
+      const teamIds = [userId, ...teamRes.rows.map(r => r.id)];
+      if (!requestedId || requestedId === 'me' || requestedId === String(userId)) {
+        targetIds = [userId];
+      } else if (requestedId === 'all') {
+        targetIds = teamIds;
+      } else {
+        const reqId = parseInt(requestedId, 10);
+        targetIds = teamIds.includes(reqId) ? [reqId] : [userId];
+      }
+    } else {
+      targetIds = [userId];
+    }
+
+    // ── Period bounds (for Upcoming & Completed) ─────────────────────────
+    const period = req.query.period || 'week';
+    let periodStart = null;
+    let periodEnd   = null;
+
+    const d   = new Date();
+    const dow = d.getDay();
+    const mon = new Date(d); mon.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
+
+    if (period === 'today') {
+      periodStart = today;
+      periodEnd   = today;
+    } else if (period === 'week') {
+      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+      periodStart = mon.toISOString().slice(0, 10);
+      periodEnd   = sun.toISOString().slice(0, 10);
+    } else if (period === 'month') {
+      periodStart = `${today.slice(0, 7)}-01`;
+      const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      periodEnd = lastDay.toISOString().slice(0, 10);
+    }
+    // 'all' → periodStart = null, periodEnd = null
+
+    // ── This-week / last-week for avg response delta ──────────────────────
+    const lastMon = new Date(mon); lastMon.setDate(mon.getDate() - 7);
+    const thisWeekStart = mon.toISOString().slice(0, 10);
+    const lastWeekStart = lastMon.toISOString().slice(0, 10);
+
+    // ── Build query params ────────────────────────────────────────────────
+    // $1=today $2=periodStart $3=periodEnd $4=thisWeekStart $5=lastWeekStart
+    // optional $6=targetIds
+    const queryParams = [today, periodStart, periodEnd, thisWeekStart, lastWeekStart];
+    let targetExtra = '';
+    if (targetIds) {
+      queryParams.push(targetIds);
+      targetExtra = `AND (l.created_by = ANY($6) OR l.assigned_to = ANY($6))`;
+    }
+
+    const NOT_CONVERTED = `
+      AND l.status NOT IN (
+        SELECT name FROM lead_statuses
+        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
+          AND is_active = TRUE
+      )`;
+
+    const r = await pool.query(
+      `SELECT
+         -- Always current state (no period filter)
+         COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $1::date
+         )::int AS overdue,
+         COUNT(*) FILTER (WHERE e.is_done = FALSE
+           AND e.due_date = ($1::date - INTERVAL '1 day')::date
+         )::int AS overdue_new,
+         COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date = $1::date
+         )::int AS due_today,
+
+         -- Period-scoped: Upcoming (future pending within period end)
+         COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date > $1::date
+           AND ($3::text IS NULL OR e.due_date <= $3::date)
+         )::int AS upcoming,
+
+         -- Period-scoped: Completed (done_at within period bounds)
+         COUNT(*) FILTER (WHERE e.is_done = TRUE
+           AND ($2::text IS NULL OR e.done_at::date >= $2::date)
+           AND ($3::text IS NULL OR e.done_at::date <= $3::date)
+         )::int AS completed,
+
+         -- All-time for completion rate denominator
+         COUNT(*) FILTER (WHERE e.is_done = TRUE)::int AS completed_total,
+         COUNT(*)::int AS total,
+
+         -- Avg response: this week vs last week (always fixed)
+         ROUND(AVG(CASE WHEN e.is_done = TRUE AND e.done_at >= $4::date
+           THEN EXTRACT(EPOCH FROM (e.done_at - e.created_at)) / 86400.0 END)::numeric, 1
+         ) AS avg_response_days,
+         ROUND(AVG(CASE WHEN e.is_done = TRUE
+           AND e.done_at >= $5::date AND e.done_at < $4::date
+           THEN EXTRACT(EPOCH FROM (e.done_at - e.created_at)) / 86400.0 END)::numeric, 1
+         ) AS avg_response_last_week
+
+       FROM lead_events e
+       JOIN leads l ON l.id = e.lead_id
+       WHERE TRUE ${targetExtra} ${NOT_CONVERTED}`,
+      queryParams
+    );
+
+    const row = r.rows[0];
+    const total          = Number(row.total);
+    const completedTotal = Number(row.completed_total);
+    const thisWeekAvg    = row.avg_response_days      != null ? Number(row.avg_response_days)      : null;
+    const lastWeekAvg    = row.avg_response_last_week != null ? Number(row.avg_response_last_week) : null;
+
+    res.json({
+      overdue:            Number(row.overdue),
+      overdue_new:        Number(row.overdue_new),
+      due_today:          Number(row.due_today),
+      upcoming:           Number(row.upcoming),
+      completed:          Number(row.completed),
+      total,
+      completion_rate:    total > 0 ? Math.round((completedTotal / total) * 100) : 0,
+      avg_response_days:  thisWeekAvg,
+      avg_response_delta: (thisWeekAvg !== null && lastWeekAvg !== null)
+                            ? Number((thisWeekAvg - lastWeekAvg).toFixed(1))
+                            : null,
+    });
+  });
+}
+
 // PATCH /api/lead-events/:id/done
 function markDone(req, res, next) {
   handle(req, res, next, async () => {
@@ -329,6 +478,13 @@ function getCompliance(req, res, next) {
 
     const pOffset = visibilityParams.length;
 
+    const COMPLIANCE_NOT_CONVERTED = `
+      AND l.status NOT IN (
+        SELECT name FROM lead_statuses
+        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
+          AND is_active = TRUE
+      )`;
+
     // Overall summary
     const overall = await pool.query(
       `SELECT
@@ -338,7 +494,7 @@ function getCompliance(req, res, next) {
          COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $${pOffset + 1})::int                        AS missed
        FROM lead_events e
        JOIN leads l ON l.id = e.lead_id
-       WHERE TRUE ${visibilitySQL}`,
+       WHERE TRUE ${visibilitySQL} ${COMPLIANCE_NOT_CONVERTED}`,
       [...visibilityParams, new Date().toISOString().slice(0, 10)]
     );
 
@@ -355,7 +511,7 @@ function getCompliance(req, res, next) {
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users u ON u.id = COALESCE(l.assigned_to, l.created_by)
-         WHERE TRUE ${visibilitySQL}
+         WHERE TRUE ${visibilitySQL} ${COMPLIANCE_NOT_CONVERTED}
          GROUP BY u.id, u.name
          HAVING COUNT(*) FILTER (WHERE e.due_date <= $${pOffset + 1}) > 0
          ORDER BY total_due DESC
@@ -388,4 +544,4 @@ function getCompliance(req, res, next) {
   });
 }
 
-module.exports = { listEvents, pendingCount, markDone, getCompliance };
+module.exports = { listEvents, pendingCount, markDone, getCompliance, getStats };
