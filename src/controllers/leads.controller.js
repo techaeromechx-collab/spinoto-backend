@@ -834,7 +834,7 @@ function exportLeads(req, res, next) {
       l.name || '',
       l.mobile || '',
       l.whatsapp || '',
-      l.status || '',
+      l.status || 'New Lead',
       l.state_name || '',
       l.city_name || '',
       l.area_name || '',
