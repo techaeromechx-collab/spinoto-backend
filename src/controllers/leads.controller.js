@@ -773,7 +773,44 @@ function exportLeads(req, res, next) {
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const r = await pool.query(`${LEAD_SELECT} ${where} ORDER BY l.created_at DESC`, params);
+
+    // Export SELECT — extends LEAD_SELECT with service/category subqueries
+    const EXPORT_SELECT = `
+      SELECT
+        l.id, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
+        l.lead_source, l.notes, l.created_at,
+        s.name  AS state_name,
+        c.name  AS city_name,
+        a.name  AS area_name,
+        vt.name AS vehicle_type_name,
+        mk.name AS make_name,
+        md.name AS model_name,
+        bt.name AS body_type_name,
+        u.name  AS created_by_name,
+        au.name AS assigned_to_name,
+        (SELECT STRING_AGG(DISTINCT sc.name, ', ' ORDER BY sc.name)
+           FROM lead_services ls
+           JOIN services sv ON sv.id = ls.service_id
+           JOIN service_categories sc ON sc.id = sv.category_id
+           WHERE ls.lead_id = l.id
+        ) AS service_categories,
+        (SELECT STRING_AGG(DISTINCT sv.name, ', ' ORDER BY sv.name)
+           FROM lead_services ls
+           JOIN services sv ON sv.id = ls.service_id
+           WHERE ls.lead_id = l.id
+        ) AS service_names
+      FROM leads l
+      LEFT JOIN states        s  ON s.id  = l.state_id
+      LEFT JOIN cities        c  ON c.id  = l.city_id
+      LEFT JOIN areas         a  ON a.id  = l.area_id
+      LEFT JOIN vehicle_types vt ON vt.id = l.vehicle_type_id
+      LEFT JOIN vehicle_makes mk ON mk.id = l.make_id
+      LEFT JOIN vehicle_models md ON md.id = l.model_id
+      LEFT JOIN body_types    bt ON bt.id = l.body_type_id
+      LEFT JOIN users         u  ON u.id  = l.created_by
+      LEFT JOIN users         au ON au.id = l.assigned_to`;
+
+    const r = await pool.query(`${EXPORT_SELECT} ${where} ORDER BY l.created_at DESC`, params);
 
     // Build CSV
     const csvEscape = v => {
@@ -788,6 +825,7 @@ function exportLeads(req, res, next) {
       'State', 'City', 'Area',
       'Vehicle Type', 'Make', 'Model', 'Body Type',
       'Lead Source', 'Total Price',
+      'Service Category', 'Service Name', 'Notes',
       'Assigned To', 'Created By', 'Created At',
     ];
 
@@ -806,6 +844,9 @@ function exportLeads(req, res, next) {
       l.body_type_name || '',
       l.lead_source || '',
       l.total_price || '',
+      l.service_categories || '',
+      l.service_names || '',
+      l.notes || '',
       l.assigned_to_name || '',
       l.created_by_name || '',
       l.created_at ? new Date(l.created_at).toISOString().slice(0, 19).replace('T', ' ') : '',
