@@ -846,7 +846,7 @@ function exportLeads(req, res, next) {
       l.total_price || '',
       l.service_categories || '',
       l.service_names || '',
-      l.notes || '',
+      l.notes ? l.notes.replace(/\r?\n/g, ' ') : '',
       l.assigned_to_name || '',
       l.created_by_name || '',
       l.created_at ? new Date(l.created_at).toISOString().slice(0, 19).replace('T', ' ') : '',
