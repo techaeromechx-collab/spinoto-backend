@@ -233,6 +233,10 @@ async function getByUser(req, res, next) {
     const dw       = dateParams(from, to, params, 'l.created_at');
     const dateCond = dw ? `AND ${dw}` : '';
 
+    // Separate date filter for CI Total — based on invoice creation date, not lead date
+    const ciDw       = dateParams(from, to, params, 'ci2.created_at');
+    const ciDateCond = ciDw ? `AND ${ciDw}` : '';
+
     const r = await pool.query(`
       SELECT
         u.id                                                                        AS user_id,
@@ -245,7 +249,15 @@ async function getByUser(req, res, next) {
         COALESCE(SUM(l.total_price), 0)::numeric                                   AS total_revenue,
         COALESCE(SUM(a.total_price) FILTER (
           WHERE a.id IS NOT NULL AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('cancelled', 'no-show'))
-        ), 0)::numeric                                                              AS realized_revenue
+        ), 0)::numeric                                                              AS realized_revenue,
+        (
+          SELECT COALESCE(SUM(ci2.grand_total), 0)
+          FROM appointments a2
+          JOIN customer_invoices ci2 ON ci2.appointment_id = a2.id
+          WHERE a2.created_by = u.id
+            AND ci2.status != 'cancelled'
+            ${ciDateCond}
+        )::numeric                                                                  AS ci_total
       FROM users u
       LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
       LEFT JOIN appointments a ON a.lead_id = l.id
