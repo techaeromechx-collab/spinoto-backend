@@ -571,6 +571,16 @@ function getAppointment(req, res, next) {
   });
 }
 
+async function checkIsTerminal(id) {
+  const currentAppt = await pool.query(
+    `SELECT ast.slug FROM appointments a
+     LEFT JOIN appointment_statuses ast ON ast.id = a.status_id
+     WHERE a.id = $1`,
+    [id]
+  );
+  return currentAppt.rows[0] && ['closed', 'cancelled', 'no-show'].includes(currentAppt.rows[0].slug);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH /api/appointments/:id — Update
 // ─────────────────────────────────────────────────────────────────────────────
@@ -578,6 +588,52 @@ function updateAppointment(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
+
+    if (await checkIsTerminal(id)) {
+      return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
+    }
+
+    if (data.status_id !== undefined) {
+      const targetStatusRow = await pool.query(
+        'SELECT sort_order, name FROM appointment_statuses WHERE id = $1',
+        [data.status_id]
+      );
+      const targetSort = targetStatusRow.rows[0]?.sort_order;
+
+      if (targetSort !== undefined) {
+        const apptDetailsRow = await pool.query(`
+          SELECT 
+            (SELECT e.status FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_status,
+            (SELECT ci.id FROM customer_invoices ci JOIN estimates e ON e.id = ci.estimate_id WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_id,
+            (SELECT ci.status FROM customer_invoices ci JOIN estimates e ON e.id = ci.estimate_id WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status
+          FROM appointments a
+          WHERE a.id = $1
+        `, [id]);
+
+        const apptInfo = apptDetailsRow.rows[0];
+        if (apptInfo) {
+          const estExists = !!apptInfo.estimate_status;
+          const estApproved = estExists && ['approved', 'customer_approved', 'work_in_progress', 'work_completed'].includes(apptInfo.estimate_status);
+          const invExists = !!apptInfo.invoice_id;
+          const invApproved = invExists && ['approved', 'partially_paid', 'paid'].includes(apptInfo.invoice_status);
+
+          // Rule 1: If Estimate is approved, block moving to status before 'estimate-approved' (sort_order < 16)
+          if (estApproved && targetSort < 16) {
+            return res.status(400).json({ error: `Cannot move status back to '${targetStatusRow.rows[0].name}' because the estimate is already approved.` });
+          }
+
+          // Rule 2: If Invoice is generated, block moving to status before 'invoice-generated' (sort_order < 21)
+          if (invExists && targetSort < 21) {
+            return res.status(400).json({ error: `Cannot move status back to '${targetStatusRow.rows[0].name}' because the invoice has already been generated.` });
+          }
+
+          // Rule 3: If Invoice is approved, block moving to status before 'invoice-approved' (sort_order < 22)
+          if (invApproved && targetSort < 22) {
+            return res.status(400).json({ error: `Cannot move status back to '${targetStatusRow.rows[0].name}' because the invoice is already approved.` });
+          }
+        }
+      }
+    }
 
     const fields = [];
     const params = [];
@@ -755,6 +811,9 @@ const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 async function markVehiclePicked(req, res, next) {
   try {
     const id = parseInt(req.params.id, 10);
+    if (await checkIsTerminal(id)) {
+      return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
+    }
     const r  = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     if (!r.rows[0].pickup_required) {
@@ -770,6 +829,9 @@ async function markVehiclePicked(req, res, next) {
 async function markAtWorkshop(req, res, next) {
   try {
     const id = parseInt(req.params.id, 10);
+    if (await checkIsTerminal(id)) {
+      return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
+    }
     const r  = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     if (!r.rows[0].pickup_required) {

@@ -235,7 +235,7 @@ const EST_SELECT = `
     (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names,
 
     -- Hub
-    h.hub_name,
+    ('Spinoto ' || ar.name) AS hub_name,
 
     -- Reviewer
     rv.name  AS reviewed_by_name,
@@ -262,6 +262,7 @@ const EST_SELECT = `
   LEFT JOIN body_types     bt   ON bt.id   = a.body_type_id
   LEFT JOIN cc_categories  cc   ON cc.id   = a.cc_category_id
   LEFT JOIN hubs           h    ON h.id    = e.hub_id
+  LEFT JOIN areas          ar   ON ar.id   = h.area_id
   LEFT JOIN users          rv   ON rv.id   = e.reviewed_by
   LEFT JOIN users          u    ON u.id    = e.created_by
 `;

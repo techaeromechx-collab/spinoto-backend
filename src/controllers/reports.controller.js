@@ -356,7 +356,10 @@ async function getDashboardStats(req, res, next) {
 
       // Today's appointments — no user scoping (appointments page shows all)
       pool.query(
-        `SELECT COUNT(*)::int AS count FROM appointments a WHERE a.scheduled_date = $1::date`,
+        `SELECT COUNT(*)::int AS count 
+           FROM appointments a 
+          WHERE a.scheduled_date = $1::date
+            AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))`,
         [today]
       ),
 
@@ -405,6 +408,7 @@ async function getDashboardStats(req, res, next) {
          FROM hubs h
          LEFT JOIN appointments a ON a.hub_id = h.id
            AND a.scheduled_date >= $1::date
+           AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))
          WHERE h.deleted_at IS NULL AND h.is_active = TRUE
          GROUP BY h.id, h.hub_name
          ORDER BY appointment_count DESC
@@ -488,6 +492,7 @@ async function getDashboardStats(req, res, next) {
            ${isAll ? '' : 'JOIN leads l ON l.id = a.lead_id'}
           WHERE a.created_at >= $1::date
             AND a.lead_id IS NOT NULL
+            AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))
           ${isAll ? '' : `AND (l.created_by = ANY($2) OR l.assigned_to = ANY($2))`}`,
         isAll ? [monthStart] : [monthStart, userIds]
       ),
@@ -562,13 +567,17 @@ async function getConversionFunnel(req, res, next) {
   try {
     const { from, to } = req.query;
     function buildFunnelQ(table) {
+      const extraWhere = table === 'appointments'
+        ? " AND status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))"
+        : "";
+
       if (from && to) {
         return pool.query(
-          `SELECT COUNT(*) AS total FROM ${table} WHERE created_at >= $1::date AND created_at < ($2::date + interval '1 day')`,
+          `SELECT COUNT(*) AS total FROM ${table} WHERE created_at >= $1::date AND created_at < ($2::date + interval '1 day') ${extraWhere}`,
           [from, to]
         );
       }
-      return pool.query(`SELECT COUNT(*) AS total FROM ${table}`);
+      return pool.query(`SELECT COUNT(*) AS total FROM ${table} ${table === 'appointments' ? `WHERE status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))` : ''}`);
     }
     const [leads, appts, estimates, invoices] = await Promise.all([
       buildFunnelQ('leads'),
@@ -674,7 +683,11 @@ async function getTeamPerformance(req, res, next) {
          (SELECT COUNT(*)::int FROM leads l2
           WHERE (l2.created_by = u.id OR l2.assigned_to = u.id)
             AND l2.created_at::date >= $2
-            AND EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l2.id)) AS leads_converted,
+            AND EXISTS (
+              SELECT 1 FROM appointments a 
+              WHERE a.lead_id = l2.id
+                AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))
+            )) AS leads_converted,
 
          -- Total pending follow-ups on leads belonging to user
          (SELECT COUNT(*)::int FROM lead_events le
