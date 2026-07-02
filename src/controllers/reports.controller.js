@@ -49,44 +49,88 @@ async function getSummary(req, res, next) {
     function buildQuery(f, t) {
       const params = [];
       let scopeWhere = '';
-      if (userIds) { params.push(userIds); scopeWhere = `created_by = ANY($${params.length})`; }
-      const dw  = dateParams(f, t, params, 'created_at');
-      const hub = hubClause(hub_id, params);
+      if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
+      const dw  = dateParams(f, t, params, 'l.created_at');
+      const hub = hubClause(hub_id, params, 'l.created_by', 'l.assigned_to');
       const clauses = [scopeWhere, dw, hub].filter(Boolean);
       const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
       return { sql: `
         SELECT
-          COUNT(*)::int                                                                        AS total_leads,
-          COUNT(*) FILTER (
-            WHERE status IN (
+          COUNT(l.id)::int                                                                     AS total_leads,
+          COUNT(l.id) FILTER (
+            WHERE l.status IN (
               SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
             )
           )::int                                                                               AS converted_leads,
-          COALESCE(SUM(total_price), 0)::numeric                                              AS total_potential_revenue,
-          COALESCE(SUM(total_price) FILTER (
-            WHERE status IN (
-              SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE
-            )
+          COALESCE(SUM(l.total_price) FILTER (
+            WHERE l.status IS NULL OR ls.is_pipeline = TRUE
+          ), 0)::numeric                                                                       AS total_potential_revenue,
+          COALESCE(SUM(a.total_price) FILTER (
+            WHERE a.id IS NOT NULL AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('cancelled', 'no-show'))
           ), 0)::numeric                                                                       AS realized_revenue
-        FROM leads ${where}
+        FROM leads l
+        LEFT JOIN lead_statuses ls ON ls.name = l.status
+        LEFT JOIN appointments a ON a.lead_id = l.id
+        ${where}
       `, params };
     }
 
-    const curr = buildQuery(from, to);
-    const queries = [pool.query(curr.sql, curr.params)];
-
-    // Previous period comparison
-    if (prev_from && prev_to) {
-      const prev = buildQuery(prev_from, prev_to);
-      queries.push(pool.query(prev.sql, prev.params));
+    function buildInvoiceQuery(f, t) {
+      const params = [];
+      let scopeWhere = '';
+      if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
+      const dw  = dateParams(f, t, params, 'ci.created_at');
+      const hub = hubClause(hub_id, params, 'l.created_by', 'l.assigned_to');
+      const clauses = [scopeWhere, dw, hub, "ci.status != 'cancelled'"].filter(Boolean);
+      const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return { sql: `
+        SELECT
+          COALESCE(SUM(ci.grand_total), 0)::numeric AS customer_invoice_total,
+          COALESCE(SUM(ci.amount_paid), 0)::numeric AS customer_invoice_paid
+        FROM customer_invoices ci
+        LEFT JOIN appointments a ON a.id = ci.appointment_id
+        LEFT JOIN leads l ON l.id = a.lead_id
+        ${where}
+      `, params };
     }
 
-    const [currRes, prevRes] = await Promise.all(queries);
-    res.json({
-      ...currRes.rows[0],
+    const currL = buildQuery(from, to);
+    const currI = buildInvoiceQuery(from, to);
+
+    const promises = [
+      pool.query(currL.sql, currL.params),
+      pool.query(currI.sql, currI.params)
+    ];
+
+    if (prev_from && prev_to) {
+      const prevL = buildQuery(prev_from, prev_to);
+      const prevI = buildInvoiceQuery(prev_from, prev_to);
+      promises.push(pool.query(prevL.sql, prevL.params));
+      promises.push(pool.query(prevI.sql, prevI.params));
+    }
+
+    const results = await Promise.all(promises);
+
+    const currLRow = results[0].rows[0];
+    const currIRow = results[1].rows[0];
+
+    const summary = {
+      ...currLRow,
+      ...currIRow,
       scope,
-      prev: prevRes ? prevRes.rows[0] : null,
-    });
+      prev: null
+    };
+
+    if (prev_from && prev_to) {
+      const prevLRow = results[2].rows[0];
+      const prevIRow = results[3].rows[0];
+      summary.prev = {
+        ...prevLRow,
+        ...prevIRow
+      };
+    }
+
+    res.json(summary);
   } catch (err) { next(err); }
 }
 
@@ -128,20 +172,35 @@ async function getCategoryRevenue(req, res, next) {
     const params               = [];
 
     let scopeJoin = '';
-    if (userIds) { params.push(userIds); scopeJoin = `AND l.created_by = ANY($${params.length})`; }
+    if (userIds) {
+      params.push(userIds);
+      scopeJoin = `AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))`;
+    }
 
-    const dw       = dateParams(from, to, params, 'l.created_at');
+    const dw       = dateParams(from, to, params, 'ci.created_at');
     const hub      = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
-    const dateCond = [dw, hub].filter(Boolean).map(c => `AND ${c}`).join(' ');
 
     const r = await pool.query(`
       SELECT
         sc.name                             AS name,
-        COALESCE(SUM(ls.price), 0)::numeric AS value
+        COALESCE(SUM(
+          CASE 
+            WHEN ci.id IS NOT NULL 
+                 AND ci.status != 'cancelled'
+                 ${dw ? `AND ${dw}` : ''}
+                 ${hub ? `AND ${hub}` : ''}
+                 ${scopeJoin ? `${scopeJoin}` : ''}
+            THEN cii.total_inc_gst 
+            ELSE 0 
+          END
+        ), 0)::numeric AS value
       FROM service_categories sc
-      LEFT JOIN services      s  ON s.category_id  = sc.id
-      LEFT JOIN lead_services ls ON ls.service_id  = s.id
-      LEFT JOIN leads         l  ON l.id = ls.lead_id ${scopeJoin} ${dateCond}
+      LEFT JOIN services s ON s.category_id = sc.id
+      LEFT JOIN estimate_items ei ON ei.service_id = s.id
+      LEFT JOIN customer_invoice_items cii ON cii.estimate_item_id = ei.id
+      LEFT JOIN customer_invoices ci ON ci.id = cii.customer_invoice_id
+      LEFT JOIN appointments a ON a.id = ci.appointment_id
+      LEFT JOIN leads l ON l.id = a.lead_id
       GROUP BY sc.name
       ORDER BY value DESC
     `, params);
@@ -184,11 +243,12 @@ async function getByUser(req, res, next) {
           WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
         )::int                                                                      AS converted_leads,
         COALESCE(SUM(l.total_price), 0)::numeric                                   AS total_revenue,
-        COALESCE(SUM(l.total_price) FILTER (
-          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        COALESCE(SUM(a.total_price) FILTER (
+          WHERE a.id IS NOT NULL AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('cancelled', 'no-show'))
         ), 0)::numeric                                                              AS realized_revenue
       FROM users u
       LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
+      LEFT JOIN appointments a ON a.lead_id = l.id
       WHERE ${userWhere}
       GROUP BY u.id, u.name, u.email
       ORDER BY total_leads DESC NULLS LAST, u.name ASC
@@ -242,11 +302,12 @@ async function getUserDetail(req, res, next) {
         )::int                                                                         AS active_leads,
         COUNT(l.id) FILTER (WHERE l.status IS NULL)::int                               AS new_leads,
         COALESCE(SUM(l.total_price), 0)::numeric                                       AS pipeline_value,
-        COALESCE(SUM(l.total_price) FILTER (
-          WHERE l.status IN (SELECT name FROM lead_statuses WHERE converts_to_appointment = TRUE AND is_active = TRUE)
+        COALESCE(SUM(a.total_price) FILTER (
+          WHERE a.id IS NOT NULL AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('cancelled', 'no-show'))
         ), 0)::numeric                                                                 AS realized_revenue
       FROM users u
       LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
+      LEFT JOIN appointments a ON a.lead_id = l.id
       WHERE u.id = $1
       GROUP BY u.id, u.name, u.email, u.is_super_admin
     `, params);

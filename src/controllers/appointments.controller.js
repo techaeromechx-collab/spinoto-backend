@@ -261,7 +261,11 @@ const APPT_SELECT = `
        WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_id,
     (SELECT ci.status FROM customer_invoices ci
        JOIN estimates e ON e.id = ci.estimate_id
-       WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status
+       WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status,
+
+    -- Financial totals
+    (SELECT e.grand_total FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_total,
+    (SELECT ci.grand_total FROM customer_invoices ci WHERE ci.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_total
 
   FROM appointments a
   LEFT JOIN vehicle_types     vt  ON vt.id  = a.vehicle_type_id
