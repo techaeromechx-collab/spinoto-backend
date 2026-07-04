@@ -232,7 +232,7 @@ function listModels(req, res, next) {
     const r = await pool.query(
       `SELECT vm.id, vm.make_id, vm.body_type_id, bt.name AS body_type_name,
               vm.segment_id, sg.name AS segment_name,
-              vm.name, vm.engine_cc, vm.is_active
+              vm.name, vm.engine_cc, vm.cc_category_id, vm.is_active
        FROM vehicle_models vm
        LEFT JOIN body_types bt ON bt.id = vm.body_type_id
        LEFT JOIN segments   sg ON sg.id = vm.segment_id
