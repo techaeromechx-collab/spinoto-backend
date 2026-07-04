@@ -794,7 +794,7 @@ async function _getServices(apptId) {
     `SELECT
        aps.id, aps.price,
        s.id   AS service_id,   s.name  AS service_name,
-       s.customer_rate,        s.gst_percent,
+       s.customer_rate,        s.gst_percent, s.sac_code,
        sc.id  AS category_id,  sc.name AS category_name
      FROM appointment_services aps
      JOIN services s          ON s.id  = aps.service_id
