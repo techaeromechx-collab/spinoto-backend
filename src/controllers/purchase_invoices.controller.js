@@ -122,6 +122,13 @@ function listPurchaseInvoices(req, res, next) {
     }
     if (req.query.hub_id)  { params.push(Number(req.query.hub_id));  conditions.push(`pi.hub_id = $${params.length}`); }
     if (req.query.status)  { params.push(req.query.status);          conditions.push(`pi.status = $${params.length}`); }
+    if (req.query.vehicle_type) {
+      if (req.query.vehicle_type === '2W') {
+        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%2%')`);
+      } else if (req.query.vehicle_type === '4W') {
+        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%4%')`);
+      }
+    }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const [dataRes, countRes] = await Promise.all([

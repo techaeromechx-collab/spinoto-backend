@@ -294,6 +294,13 @@ function listEstimates(req, res, next) {
     if (appointmentId) { params.push(Number(appointmentId)); conditions.push(`e.appointment_id = $${params.length}`); }
     if (hubId)         { params.push(Number(hubId));         conditions.push(`e.hub_id = $${params.length}`); }
     if (status)        { params.push(status);                conditions.push(`e.status = $${params.length}`); }
+    if (req.query.vehicle_type) {
+      if (req.query.vehicle_type === '2W') {
+        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%2%')`);
+      } else if (req.query.vehicle_type === '4W') {
+        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%4%')`);
+      }
+    }
 
     // Free-text search across customer name, vehicle number, mobile and
     // estimate id (matches the search box placeholder on the Estimates page).
