@@ -24,7 +24,7 @@ const CI_SELECT = `
     ci.notes, ci.created_at, ci.updated_at,
     ci.discount_mode, ci.transaction_discount_type,
     ci.transaction_discount_value, ci.transaction_discount_amount,
-    ('Spinoto ' || ar.name) AS hub_name, h.gst_number AS hub_gst,
+    ('Spinoto ' || ar.name) AS hub_name, h.hub_name AS hub_full_name, h.gst_number AS hub_gst,
     (ci.grand_total - ci.amount_paid) AS balance,
     (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
@@ -446,7 +446,7 @@ function getVehicleHistory(req, res, next) {
         (ci.grand_total - ci.amount_paid) AS outstanding,
         ci.status AS status_name,
         ci.created_at,
-        ('Spinoto ' || ar.name) AS hub_name,
+        ('Spinoto ' || ar.name) AS hub_name, h.hub_name AS hub_full_name,
         COALESCE(json_agg(
           json_build_object(
             'description',   cii.description,
@@ -462,7 +462,7 @@ function getVehicleHistory(req, res, next) {
       LEFT JOIN customer_invoice_items cii ON cii.customer_invoice_id = ci.id
       WHERE UPPER(REPLACE(COALESCE(ci.vehicle_number, a.vehicle_number, ''), ' ', ''))
             = UPPER(REPLACE($1, ' ', ''))
-      GROUP BY ci.id, a.customer_name, a.mobile, a.vehicle_number, ar.name
+      GROUP BY ci.id, a.customer_name, a.mobile, a.vehicle_number, ar.name, h.hub_name
       ORDER BY ci.created_at DESC
       LIMIT 50
     `, [vnum]);

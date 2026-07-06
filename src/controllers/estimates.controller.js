@@ -236,6 +236,7 @@ const EST_SELECT = `
 
     -- Hub
     ('Spinoto ' || ar.name) AS hub_name,
+    h.hub_name AS hub_full_name,
 
     -- Reviewer
     rv.name  AS reviewed_by_name,
