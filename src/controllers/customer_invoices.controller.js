@@ -89,7 +89,7 @@ async function _recalcStatus(client, ciId) {
   const total   = parseFloat(grand_total);
 
   let status;
-  if (amtPaid >= total && total > 0) {
+  if (amtPaid >= total - 0.011 && total > 0) {
     status = 'paid';
   } else if (amtPaid > 0) {
     status = 'partially_paid';

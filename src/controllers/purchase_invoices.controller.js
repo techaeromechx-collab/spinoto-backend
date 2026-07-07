@@ -101,7 +101,7 @@ async function _recalcHubPaymentStatus(client, purchaseInvoiceId) {
   const { grand_total, paid } = r.rows[0];
   const amtPaid = parseFloat(paid);
   const total   = parseFloat(grand_total);
-  const status  = amtPaid <= 0 ? 'pending' : amtPaid >= total ? 'paid' : 'partially_paid';
+  const status  = amtPaid <= 0 ? 'pending' : amtPaid >= total - 0.011 ? 'paid' : 'partially_paid';
   await client.query(
     `UPDATE purchase_invoices SET amount_paid=$1, payment_status=$2, updated_at=NOW() WHERE id=$3`,
     [amtPaid.toFixed(2), status, purchaseInvoiceId]
