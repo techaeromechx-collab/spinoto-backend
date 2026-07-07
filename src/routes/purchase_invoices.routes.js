@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
-const { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment } = require('../controllers/purchase_invoices.controller');
+const { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
 const router = express.Router();
 
 const canView     = requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS', 'VIEW_INVOICE', 'VIEW_PURCHASE_INVOICE');   // hub users: VIEW_INVOICE (or no perms = open)
@@ -15,6 +15,7 @@ router.get('/',              canView,     listPurchaseInvoices);
 router.get('/payouts',       canView,     listPayouts);
 router.get('/hub-payments',      canView, listHubPayments);
 router.get('/tech-rate-summary', canView,    getTechRateSummary);
+router.get('/export-payouts',    canView,    exportPayouts);
 router.post('/bulk-payment',     canPayment, bulkPayment);
 router.post('/generate',     canGenerate, generatePurchaseInvoice);
 router.get('/:id',           canView,     getPurchaseInvoice);

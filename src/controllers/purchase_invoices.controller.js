@@ -1085,4 +1085,163 @@ function bulkPayment(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment };
+// ── Export Payouts as CSV ────────────────────────────────────────────────────
+function exportPayouts(req, res, next) {
+  handle(req, res, next, async () => {
+    const type = req.query.type || 'outstanding'; // outstanding | history
+    const hubId = req.query.hub_id ? Number(req.query.hub_id) : null;
+    const status = req.query.status || '';
+    const search = (req.query.search || '').trim().toLowerCase();
+    const from = req.query.from || '';
+    const to = req.query.to || '';
+
+    const csvEscape = v => {
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    if (type === 'outstanding') {
+      const conditions = ["pi.status = 'approved'", "pi.payment_status != 'paid'"];
+      const params = [];
+
+      if (hubId) {
+        params.push(hubId);
+        conditions.push(`pi.hub_id = $${params.length}`);
+      }
+      if (status) {
+        params.push(status);
+        conditions.push(`pi.payment_status = $${params.length}`);
+      }
+
+      const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const r = await pool.query(
+        `SELECT
+           pi.id, pi.grand_total, pi.amount_paid, pi.payment_status,
+           pi.payout_due_date, pi.created_at,
+           h.hub_name,
+           a.vehicle_number,
+           u.name AS created_by_name
+         FROM purchase_invoices pi
+         JOIN hubs h ON h.id = pi.hub_id
+         LEFT JOIN appointments a ON a.id = pi.appointment_id
+         LEFT JOIN users u ON u.id = pi.created_by
+         ${where}
+         ORDER BY pi.payout_due_date ASC NULLS LAST`,
+        params
+      );
+
+      let rows = r.rows;
+      if (search) {
+        rows = rows.filter(pi => 
+          `pi-${String(pi.id).padStart(6,'0')}`.includes(search) ||
+          (pi.vehicle_number || '').toLowerCase().includes(search)
+        );
+      }
+
+      const headers = [
+        'Invoice ID', 'Hub Name', 'Vehicle Number', 'Grand Total (INR)',
+        'Amount Paid (INR)', 'Balance Due (INR)', 'Payout Due Date',
+        'Payment Status', 'Created At'
+      ];
+
+      const csvRows = rows.map(pi => {
+        const balance = parseFloat(pi.grand_total) - parseFloat(pi.amount_paid || 0);
+        return [
+          `PI-${String(pi.id).padStart(6, '0')}`,
+          pi.hub_name || '',
+          pi.vehicle_number || '—',
+          pi.grand_total,
+          pi.amount_paid || '0.00',
+          balance.toFixed(2),
+          pi.payout_due_date ? new Date(pi.payout_due_date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—',
+          pi.payment_status || 'pending',
+          pi.created_at ? new Date(pi.created_at).toISOString().slice(0, 19).replace('T', ' ') : ''
+        ].map(csvEscape).join(',');
+      });
+
+      const csv = [headers.join(','), ...csvRows].join('\r\n');
+      const date = new Date().toISOString().slice(0, 10);
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="payouts_outstanding_${date}.csv"`);
+      res.send('\ufeff' + csv);
+
+    } else {
+      const conditions = [];
+      const params = [];
+
+      if (hubId) {
+        params.push(hubId);
+        conditions.push(`pi.hub_id = $${params.length}`);
+      }
+      if (from) {
+        params.push(from);
+        conditions.push(`hp.paid_at::date >= $${params.length}::date`);
+      }
+      if (to) {
+        params.push(to);
+        conditions.push(`hp.paid_at::date <= $${params.length}::date`);
+      }
+
+      const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const r = await pool.query(
+        `SELECT
+           hp.id, hp.amount, hp.method, hp.reference_no, hp.notes, hp.paid_at,
+           hp.purchase_invoice_id,
+           h.hub_name,
+           a.vehicle_number,
+           u.name AS created_by_name
+         FROM hub_payments hp
+         JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
+         JOIN hubs h ON h.id = pi.hub_id
+         LEFT JOIN appointments a ON a.id = pi.appointment_id
+         LEFT JOIN users u ON u.id = hp.created_by
+         ${where}
+         ORDER BY hp.paid_at DESC`,
+        params
+      );
+
+      let rows = r.rows;
+      if (search) {
+        rows = rows.filter(p => 
+          `pi-${String(p.purchase_invoice_id).padStart(6,'0')}`.includes(search) ||
+          (p.vehicle_number || '').toLowerCase().includes(search) ||
+          (p.hub_name || '').toLowerCase().includes(search) ||
+          (p.reference_no || '').toLowerCase().includes(search)
+        );
+      }
+
+      const headers = [
+        'Payment ID', 'Payment Date & Time', 'Invoice ID', 'Hub Name',
+        'Vehicle Number', 'Amount Paid (INR)', 'Payment Method',
+        'Reference Number', 'Recorded By', 'Notes'
+      ];
+
+      const csvRows = rows.map(p => [
+        p.id,
+        p.paid_at ? new Date(p.paid_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '',
+        `PI-${String(p.purchase_invoice_id).padStart(6, '0')}`,
+        p.hub_name || '',
+        p.vehicle_number || '—',
+        p.amount,
+        p.method || '',
+        p.reference_no || '—',
+        p.created_by_name || '—',
+        p.notes || ''
+      ].map(csvEscape).join(','));
+
+      const csv = [headers.join(','), ...csvRows].join('\r\n');
+      const date = new Date().toISOString().slice(0, 10);
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="payouts_payments_${date}.csv"`);
+      res.send('\ufeff' + csv);
+    }
+  });
+}
+
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };

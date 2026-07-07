@@ -1732,7 +1732,41 @@ async function importLeads(req, res, next) {
           });
         }
       } else {
-        parsedRows.push({ rowNum, mobile, name, whatsapp, leadSrc, notes, vehicleNote, statusName, stateId, cityId, areaId, vehicleTypeId, makeId, modelId, bodyTypeId, segmentId, assignedTo, serviceIds, categoryIds });
+        let action = 'insert';
+        let existingLeadId = null;
+        let isMergedInFile = false;
+
+        // 1. In-file duplicate check: check if an earlier row in the same batch has the same mobile and same vehicle_type
+        const matchInFile = parsedRows.find(
+          r => r.mobile === mobile && r.vehicleTypeId === vehicleTypeId
+        );
+        if (matchInFile) {
+          matchInFile.statusName = statusName || null;
+          isMergedInFile = true;
+        } else {
+          // 2. Database duplicate check: query existing leads with the same mobile
+          const dupRes = await client.query(
+            `SELECT l.id, l.vehicle_type_id,
+                    (EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) OR ls.converts_to_appointment = TRUE OR ls.is_locked = TRUE) AS is_closed
+               FROM leads l
+               LEFT JOIN lead_statuses ls ON LOWER(ls.name) = LOWER(l.status)
+              WHERE l.mobile = $1`,
+            [mobile]
+          );
+          if (dupRes.rows.length > 0) {
+            const matchInDb = dupRes.rows.find(el => el.vehicle_type_id === vehicleTypeId && !el.is_closed);
+            if (matchInDb) {
+              action = 'update_status';
+              existingLeadId = matchInDb.id;
+            }
+          }
+        }
+
+        if (isMergedInFile) {
+          // Skip inserting duplicate row, it is merged in-file
+        } else {
+          parsedRows.push({ rowNum, mobile, name, whatsapp, leadSrc, notes, vehicleNote, statusName, stateId, cityId, areaId, vehicleTypeId, makeId, modelId, bodyTypeId, segmentId, assignedTo, serviceIds, categoryIds, action, existingLeadId });
+        }
       }
     }
 
@@ -1750,48 +1784,71 @@ async function importLeads(req, res, next) {
       });
     }
 
-    // ── All rows valid — insert everything ────────────────────────────────────
+    // ── All rows valid — insert or update everything ─────────────────────────
     const createdBy = req.user?.id || null;
     let inserted = 0;
+    let updated  = 0;
 
     for (const r of parsedRows) {
-      const leadRes = await client.query(
-        `INSERT INTO leads
-           (name, mobile, whatsapp, state_id, city_id, area_id,
-            vehicle_type_id, make_id, model_id, body_type_id, segment_ids, lead_source, status, notes,
-            assigned_to, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-         RETURNING id`,
-        [
-          r.name, r.mobile, r.whatsapp,
-          r.stateId, r.cityId, r.areaId,
-          r.vehicleTypeId, r.makeId, r.modelId, r.bodyTypeId,
-          r.segmentId ? [r.segmentId] : [],
-          r.leadSrc,
-          r.statusName || null,
-          // Merge vehicleNote into notes so the lead detail shows the unresolved vehicle info
-          r.vehicleNote
-            ? [r.notes, r.vehicleNote].filter(Boolean).join('\n')
-            : (r.notes || null),
-          r.assignedTo, createdBy,
-        ]
-      );
-      const leadId = leadRes.rows[0].id;
+      if (r.action === 'update_status') {
+        // Update status of existing lead
+        await client.query(
+          `UPDATE leads
+              SET status = $1
+            WHERE id = $2`,
+          [r.statusName || null, r.existingLeadId]
+        );
 
-      for (const svcId of r.serviceIds) {
-        const pr = await client.query(`SELECT price FROM pricing WHERE service_id = $1 LIMIT 1`, [svcId]);
+        // Mark pending follow-ups as done
         await client.query(
-          `INSERT INTO lead_services (lead_id, service_id, price) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-          [leadId, svcId, pr.rows[0]?.price || 0]
+          `UPDATE lead_events
+              SET is_done = TRUE,
+                  done_at = NOW()
+            WHERE lead_id = $1
+              AND is_done = FALSE`,
+          [r.existingLeadId]
         );
-      }
-      for (const catId of r.categoryIds) {
-        await client.query(
-          `INSERT INTO lead_categories (lead_id, category_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-          [leadId, catId]
+
+        updated++;
+      } else {
+        // Insert new lead
+        const leadRes = await client.query(
+          `INSERT INTO leads
+             (name, mobile, whatsapp, state_id, city_id, area_id,
+              vehicle_type_id, make_id, model_id, body_type_id, segment_ids, lead_source, status, notes,
+              assigned_to, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           RETURNING id`,
+          [
+            r.name, r.mobile, r.whatsapp,
+            r.stateId, r.cityId, r.areaId,
+            r.vehicleTypeId, r.makeId, r.modelId, r.bodyTypeId,
+            r.segmentId ? [r.segmentId] : [],
+            r.leadSrc,
+            r.statusName || null,
+            r.vehicleNote
+              ? [r.notes, r.vehicleNote].filter(Boolean).join('\n')
+              : (r.notes || null),
+            r.assignedTo, createdBy,
+          ]
         );
+        const leadId = leadRes.rows[0].id;
+
+        for (const svcId of r.serviceIds) {
+          const pr = await client.query(`SELECT price FROM pricing WHERE service_id = $1 LIMIT 1`, [svcId]);
+          await client.query(
+            `INSERT INTO lead_services (lead_id, service_id, price) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+            [leadId, svcId, pr.rows[0]?.price || 0]
+          );
+        }
+        for (const catId of r.categoryIds) {
+          await client.query(
+            `INSERT INTO lead_categories (lead_id, category_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+            [leadId, catId]
+          );
+        }
+        inserted++;
       }
-      inserted++;
     }
 
     await client.query('COMMIT');
@@ -1802,9 +1859,9 @@ async function importLeads(req, res, next) {
 
     return res.json({
       success:      true,
-      message:      `Upload complete: ${inserted} lead(s) imported.`,
+      message:      `Upload complete: ${inserted} lead(s) imported, ${updated} lead(s) updated.`,
       inserted,
-      updated:      0,
+      updated,
       unchanged:    0,
       skippedBlanks,
       warnings:     colWarnings,
