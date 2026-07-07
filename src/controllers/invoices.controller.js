@@ -13,6 +13,7 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
 const { logActivity } = require('../services/activityLog.service');
+const { getRoundingFunction } = require('../utils/math');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -128,15 +129,17 @@ function createInvoice(req, res, next) {
       statusId = defRow.rows[0]?.id || null;
     }
 
+    const roundFn = getRoundingFunction(new Date());
+
     const subtotal      = data.services.reduce((sum, s) => sum + Number(s.unit_price) * Number(s.qty ?? 1), 0);
     const discountType  = data.discount_type || 'flat';
     const discountInput = Number(data.discount || 0);
     const gstRate       = Number(data.gst_rate || 0);
     const discountAmt   = discountType === 'percent'
-      ? Math.round((subtotal * discountInput / 100) * 100) / 100
+      ? roundFn(subtotal * discountInput / 100)
       : discountInput;
     const afterDiscount = Math.max(0, subtotal - discountAmt);
-    const gstAmount     = Math.round((afterDiscount * gstRate / 100) * 100) / 100;
+    const gstAmount     = roundFn(afterDiscount * gstRate / 100);
     const total         = afterDiscount + gstAmount;
 
     const client = await pool.connect();
@@ -288,9 +291,10 @@ function updateInvoice(req, res, next) {
     const needsRecalc = data.discount !== undefined || data.discount_type !== undefined || data.gst_rate !== undefined;
     if (needsRecalc) {
       // Fetch current row to get values we might not be changing
-      const cur = await pool.query(`SELECT subtotal, discount, discount_type, gst_rate FROM invoices WHERE id = $1`, [id]);
+      const cur = await pool.query(`SELECT subtotal, discount, discount_type, gst_rate, created_at FROM invoices WHERE id = $1`, [id]);
       if (!cur.rows[0]) return res.status(404).json({ error: 'Invoice not found' });
       const c = cur.rows[0];
+      const roundFn = getRoundingFunction(c.created_at);
 
       const discountType  = data.discount_type ?? c.discount_type ?? 'flat';
       const discountInput = data.discount      !== undefined ? Number(data.discount) : Number(c.discount);
@@ -298,10 +302,10 @@ function updateInvoice(req, res, next) {
       const subtotal      = Number(c.subtotal);
 
       const discountAmt   = discountType === 'percent'
-        ? Math.round((subtotal * discountInput / 100) * 100) / 100
+        ? roundFn(subtotal * discountInput / 100)
         : discountInput;
       const afterDiscount = Math.max(0, subtotal - discountAmt);
-      const gstAmount     = Math.round((afterDiscount * gstRate / 100) * 100) / 100;
+      const gstAmount     = roundFn(afterDiscount * gstRate / 100);
       const total         = afterDiscount + gstAmount;
 
       params.push(discountAmt);   fields.push(`discount      = $${params.length}`);

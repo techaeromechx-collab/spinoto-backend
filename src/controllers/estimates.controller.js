@@ -17,6 +17,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { getRoundingFunction } = require('../utils/math');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -82,31 +83,31 @@ function handle(req, res, next, fn) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function computeItem(data) {
+function computeItem(data, roundFn = parseFloat) {
   const qty    = Number(data.quantity)      || 1;
   const rate   = Number(data.customer_rate) || 0; // ex-GST (stored at 4dp precision)
   const gstPct = Number(data.gst_percent)   || 0;
 
   // Step 1: total inc-GST before discount
-  const totalBeforeDisc = parseFloat((rate * qty * (1 + gstPct / 100)).toFixed(2));
+  const totalBeforeDisc = roundFn(rate * qty * (1 + gstPct / 100));
 
   // Step 1b: derive the discount amount SERVER-SIDE from type + value.
   // Never trust a client-supplied discount_amount — it could zero out a line.
   let discountAmt = 0;
   const dValue = Number(data.discount_value) || 0;
   if (data.discount_type === 'percent' && dValue > 0) {
-    discountAmt = parseFloat((totalBeforeDisc * dValue / 100).toFixed(2));
+    discountAmt = roundFn(totalBeforeDisc * dValue / 100);
   } else if (data.discount_type === 'flat' && dValue > 0) {
     discountAmt = Math.min(dValue, totalBeforeDisc);
   }
   // Step 2: apply line-item discount
-  const totalIncGst = parseFloat((Math.max(0, totalBeforeDisc - discountAmt)).toFixed(2));
+  const totalIncGst = roundFn(Math.max(0, totalBeforeDisc - discountAmt));
   // Step 3: back-calculate ex-GST from the discounted total (correct for Indian GST)
   const exGstTotal  = gstPct > 0
-    ? parseFloat((totalIncGst / (1 + gstPct / 100)).toFixed(2))
+    ? roundFn(totalIncGst / (1 + gstPct / 100))
     : totalIncGst;
   // Step 4: GST = total − exGST (NOT exGST × rate — prevents cumulative ₹0.01 drift)
-  const gstAmount   = parseFloat((totalIncGst - exGstTotal).toFixed(2));
+  const gstAmount   = roundFn(totalIncGst - exGstTotal);
   return { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt };
 }
 
@@ -122,13 +123,14 @@ async function recalcTotals(client, estimateId) {
 
   const { subtotal_ex_gst, total_gst, grand_total_before } = sumRes.rows[0];
 
-  // Step 2: fetch discount mode for this estimate
+  // Step 2: fetch discount mode and created_at for this estimate
   const modeRes = await client.query(
-    `SELECT discount_mode, transaction_discount_type, transaction_discount_value
+    `SELECT discount_mode, transaction_discount_type, transaction_discount_value, created_at
      FROM estimates WHERE id = $1`,
     [estimateId]
   );
-  const { discount_mode, transaction_discount_type, transaction_discount_value } = modeRes.rows[0] || {};
+  const { discount_mode, transaction_discount_type, transaction_discount_value, created_at } = modeRes.rows[0] || {};
+  const roundFn = getRoundingFunction(created_at);
 
   // Step 3: apply transaction-level discount if applicable
   let transactionDiscountAmount = 0;
@@ -137,11 +139,11 @@ async function recalcTotals(client, estimateId) {
   if (discount_mode === 'transaction' && parseFloat(transaction_discount_value) > 0) {
     const val = parseFloat(transaction_discount_value);
     if (transaction_discount_type === 'percent') {
-      transactionDiscountAmount = parseFloat((grandTotal * val / 100).toFixed(2));
+      transactionDiscountAmount = roundFn(grandTotal * val / 100);
     } else if (transaction_discount_type === 'flat') {
       transactionDiscountAmount = Math.min(val, grandTotal);
     }
-    grandTotal = parseFloat((grandTotal - transactionDiscountAmount).toFixed(2));
+    grandTotal = roundFn(grandTotal - transactionDiscountAmount);
   }
 
   await client.query(`
@@ -416,13 +418,14 @@ function createEstimate(req, res, next) {
       );
 
       const estimateId = ins.rows[0].id;
+      const roundFn = getRoundingFunction(new Date());
 
       const forceZeroDiscount = ['transaction', 'none'].includes(data.discount_mode);
       for (const item of data.items) {
         const itemForCalc = forceZeroDiscount
           ? { ...item, discount_type: null, discount_value: 0, discount_amount: 0 }
           : item;
-        const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc);
+        const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc, roundFn);
         const svcId  = item.item_type === 'service' ? (item.service_id || item.item_id || null) : null;
         const partId = item.item_type === 'part'    ? (item.part_id    || item.item_id || null) : null;
         await client.query(
@@ -485,10 +488,11 @@ function updateEstimate(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
 
-    const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
+    const cur = await pool.query(`SELECT id, status, created_at FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
-    const { status } = cur.rows[0];
+    const { status, created_at } = cur.rows[0];
+    const roundFn = getRoundingFunction(created_at);
     // Status restriction removed — estimates can be edited at any status.
     // Invoice sync is handled separately after save.
 
@@ -581,7 +585,7 @@ function updateEstimate(req, res, next) {
           const itemForCalc = forceZeroDiscount
             ? { ...item, discount_type: null, discount_value: 0, discount_amount: 0 }
             : item;
-          const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc);
+          const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc, roundFn);
           const svcId  = item.item_type === 'service' ? (item.service_id || item.item_id || null) : null;
           const partId = item.item_type === 'part'    ? (item.part_id    || item.item_id || null) : null;
           const insertedRow = await client.query(

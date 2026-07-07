@@ -2,6 +2,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { getRoundingFunction } = require('../utils/math');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -217,6 +218,8 @@ function generatePurchaseInvoice(req, res, next) {
       }
     }
 
+    const roundFn = getRoundingFunction(new Date());
+
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const items = itemsRow.rows.map(item => {
       const qty    = Number(item.quantity);
@@ -227,12 +230,12 @@ function generatePurchaseInvoice(req, res, next) {
       // 2. Then apply this item's proportional share of the transaction discount
       const itemIncGst = Number(item.total_inc_gst ?? 0);
       const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
-        ? parseFloat((itemIncGst / totalIncGstSum * txDiscountTotal).toFixed(4))
+        ? roundFn(itemIncGst / totalIncGstSum * txDiscountTotal, 4)
         : 0;
-      const postDiscIncGst = parseFloat((itemIncGst - itemTxDiscount).toFixed(4));
+      const postDiscIncGst = roundFn(itemIncGst - itemTxDiscount, 4);
 
       // custRate = post-discount ex-GST per unit
-      const custRate = parseFloat((postDiscIncGst / qty / (1 + gstPct / 100)).toFixed(4));
+      const custRate = roundFn(postDiscIncGst / qty / (1 + gstPct / 100), 4);
 
       let appliedRatePct; // the % stored per-item for audit trail
       let hubRate;
@@ -240,21 +243,21 @@ function generatePurchaseInvoice(req, res, next) {
       if (useCommission) {
         // Commission mode: hub earns (100 - commission)% of customer rate
         appliedRatePct = commissionPct;
-        hubRate        = parseFloat((custRate * (1 - commissionPct / 100)).toFixed(4));
+        hubRate        = roundFn(custRate * (1 - commissionPct / 100), 4);
       } else {
         // Tech rate mode: tech_rate% is deducted from customer rate (platform fee)
         // Hub earns: customer_rate - (customer_rate × tech_rate%)
         const isService    = item.item_type === 'service';
         const techRate     = isService ? (techRateService ?? 0) : (techRateParts ?? 0);
         appliedRatePct     = techRate;
-        const techDeduct   = parseFloat((custRate * (techRate / 100)).toFixed(4));
-        hubRate            = parseFloat((custRate - techDeduct).toFixed(4));
+        const techDeduct   = roundFn(custRate * (techRate / 100), 4);
+        hubRate            = roundFn(custRate - techDeduct, 4);
       }
 
-      const hubAmount    = parseFloat((hubRate * qty).toFixed(2));
-      const techDeductAmt = parseFloat((custRate * qty).toFixed(2)) - hubAmount; // deduction for display
-      const gstAmount    = parseFloat((hubAmount * gstPct / 100).toFixed(2));
-      const totalPayable = parseFloat((hubAmount + gstAmount).toFixed(2));
+      const hubAmount    = roundFn(hubRate * qty);
+      const techDeductAmt = roundFn(custRate * qty) - hubAmount; // deduction for display
+      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
       totalGst      += gstAmount;
@@ -325,7 +328,7 @@ function approvePurchaseInvoice(req, res, next) {
 
     const r = await pool.query(
       `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id, pi.rate_mode,
-              h.payout_terms, h.payout_cycle_days
+              pi.created_at, h.payout_terms, h.payout_cycle_days
        FROM purchase_invoices pi
        JOIN hubs h ON h.id = pi.hub_id
        WHERE pi.id = $1`,
@@ -333,6 +336,7 @@ function approvePurchaseInvoice(req, res, next) {
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = r.rows[0];
+    const roundFn = getRoundingFunction(pi.created_at);
     if (pi.status !== 'pending_approval') {
       return res.status(400).json({ error: `Invoice is already ${pi.status}` });
     }
@@ -369,11 +373,11 @@ function approvePurchaseInvoice(req, res, next) {
           const takeRate = rateMap[item.id];
 
           // Same formula as existing recalculate: hub_rate = customer_rate - (customer_rate × take_rate%)
-          const techDeduct = parseFloat((custRate * (takeRate / 100)).toFixed(4));
-          const hubRate    = parseFloat((custRate - techDeduct).toFixed(4));
-          const hubAmount  = parseFloat((hubRate * qty).toFixed(2));
-          const gstAmt     = parseFloat((hubAmount * gstPct / 100).toFixed(2));
-          const total      = parseFloat((hubAmount + gstAmt).toFixed(2));
+          const techDeduct = roundFn(custRate * (takeRate / 100), 4);
+          const hubRate    = roundFn(custRate - techDeduct, 4);
+          const hubAmount  = roundFn(hubRate * qty);
+          const gstAmt     = roundFn(hubAmount * gstPct / 100);
+          const total      = roundFn(hubAmount + gstAmt);
 
           subtotalExGst += hubAmount;
           totalGst      += gstAmt;
@@ -419,12 +423,12 @@ function approvePurchaseInvoice(req, res, next) {
       // If split: create 3 equal installments (1/3 each, spaced evenly)
       if (payout_schedule === 'split') {
         const total      = parseFloat(pi.grand_total);
-        const perInstall = parseFloat((total / 3).toFixed(2));
+        const perInstall = roundFn(total / 3);
         // Adjust last installment for rounding difference
         const installments = [
           { no: 1, amount: perInstall, days: Math.round(cycleDays * 0.33) },
           { no: 2, amount: perInstall, days: Math.round(cycleDays * 0.66) },
-          { no: 3, amount: parseFloat((total - perInstall * 2).toFixed(2)), days: cycleDays },
+          { no: 3, amount: roundFn(total - perInstall * 2), days: cycleDays },
         ];
         for (const inst of installments) {
           const d = new Date();
@@ -540,7 +544,7 @@ function recalculatePurchaseInvoice(req, res, next) {
 
     // Fetch the invoice
     const piRow = await pool.query(
-      `SELECT pi.id, pi.rate_mode, pi.hub_id FROM purchase_invoices pi WHERE pi.id = $1`, [id]
+      `SELECT pi.id, pi.rate_mode, pi.hub_id, pi.created_at FROM purchase_invoices pi WHERE pi.id = $1`, [id]
     );
     if (!piRow.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = piRow.rows[0];
@@ -563,6 +567,8 @@ function recalculatePurchaseInvoice(req, res, next) {
       [id]
     );
 
+    const roundFn = getRoundingFunction(pi.created_at);
+
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const updatedItems = itemsRow.rows.map(item => {
       const qty      = Number(item.quantity);
@@ -571,12 +577,12 @@ function recalculatePurchaseInvoice(req, res, next) {
 
       const isService  = item.item_type === 'service';
       const techRate   = isService ? techRateService : techRateParts;
-      const techDeduct = parseFloat((custRate * (techRate / 100)).toFixed(4));
-      const hubRate    = parseFloat((custRate - techDeduct).toFixed(4));
+      const techDeduct = roundFn(custRate * (techRate / 100), 4);
+      const hubRate    = roundFn(custRate - techDeduct, 4);
 
-      const hubAmount    = parseFloat((hubRate * qty).toFixed(2));
-      const gstAmount    = parseFloat((hubAmount * gstPct / 100).toFixed(2));
-      const totalPayable = parseFloat((hubAmount + gstAmount).toFixed(2));
+      const hubAmount    = roundFn(hubRate * qty);
+      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
       totalGst      += gstAmount;
@@ -688,10 +694,11 @@ function updatePurchaseInvoice(req, res, next) {
     }).parse(req.body || {});
 
     const r = await pool.query(
-      `SELECT status, payment_status, amount_paid FROM purchase_invoices WHERE id = $1`, [id]
+      `SELECT status, payment_status, amount_paid, created_at FROM purchase_invoices WHERE id = $1`, [id]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = r.rows[0];
+    const roundFn = getRoundingFunction(pi.created_at);
     if (pi.payment_status === 'paid' || parseFloat(pi.amount_paid) > 0) {
       return res.status(400).json({ error: 'Cannot edit — payment has already been recorded.' });
     }
@@ -714,11 +721,11 @@ function updatePurchaseInvoice(req, res, next) {
         const gstPct   = Number(item.gst_percent);
         const takeRate = rateMap[item.id] != null ? rateMap[item.id] : 0;
 
-        const techDeduct = parseFloat((custRate * (takeRate / 100)).toFixed(4));
-        const hubRate    = parseFloat((custRate - techDeduct).toFixed(4));
-        const hubAmount  = parseFloat((hubRate * qty).toFixed(2));
-        const gstAmt     = parseFloat((hubAmount * gstPct / 100).toFixed(2));
-        const total      = parseFloat((hubAmount + gstAmt).toFixed(2));
+        const techDeduct = roundFn(custRate * (takeRate / 100), 4);
+        const hubRate    = roundFn(custRate - techDeduct, 4);
+        const hubAmount  = roundFn(hubRate * qty);
+        const gstAmt     = roundFn(hubAmount * gstPct / 100);
+        const total      = roundFn(hubAmount + gstAmt);
 
         subtotalExGst += hubAmount;
         totalGst      += gstAmt;
@@ -762,7 +769,7 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
 
     const piRow = await pool.query(
       `SELECT pi.id, pi.estimate_id, pi.hub_id, pi.rate_mode, pi.commission_percent,
-              pi.payment_status
+              pi.payment_status, pi.created_at
        FROM purchase_invoices pi WHERE pi.id = $1`,
       [id]
     );
@@ -803,6 +810,8 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
       return res.status(400).json({ error: 'No completed approved items found in estimate.' });
     }
 
+    const roundFn = getRoundingFunction(pi.created_at);
+
     // Transaction discount
     const txDiscountMode  = est.discount_mode || 'none';
     const txDiscountType  = est.transaction_discount_type || 'percent';
@@ -811,7 +820,7 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
     let txDiscountTotal = 0;
     if (txDiscountMode === 'transaction' && txDiscountValue > 0 && totalIncGstSum > 0) {
       txDiscountTotal = txDiscountType === 'percent'
-        ? parseFloat((totalIncGstSum * txDiscountValue / 100).toFixed(2))
+        ? roundFn(totalIncGstSum * txDiscountValue / 100)
         : Math.min(txDiscountValue, totalIncGstSum);
     }
 
@@ -822,26 +831,26 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
 
       const itemIncGst     = Number(item.total_inc_gst ?? 0);
       const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
-        ? parseFloat((itemIncGst / totalIncGstSum * txDiscountTotal).toFixed(4))
+        ? roundFn(itemIncGst / totalIncGstSum * txDiscountTotal, 4)
         : 0;
-      const postDiscIncGst = parseFloat((itemIncGst - itemTxDiscount).toFixed(4));
-      const custRate       = parseFloat((postDiscIncGst / qty / (1 + gstPct / 100)).toFixed(4));
+      const postDiscIncGst = roundFn(itemIncGst - itemTxDiscount, 4);
+      const custRate       = roundFn(postDiscIncGst / qty / (1 + gstPct / 100), 4);
 
       let appliedRatePct, hubRate;
       if (useCommission) {
         appliedRatePct = commissionPct;
-        hubRate        = parseFloat((custRate * (1 - commissionPct / 100)).toFixed(4));
+        hubRate        = roundFn(custRate * (1 - commissionPct / 100), 4);
       } else {
         const isService  = item.item_type === 'service';
         const techRate   = isService ? (techRateService ?? 0) : (techRateParts ?? 0);
         appliedRatePct   = techRate;
-        const techDeduct = parseFloat((custRate * (techRate / 100)).toFixed(4));
-        hubRate          = parseFloat((custRate - techDeduct).toFixed(4));
+        const techDeduct = roundFn(custRate * (techRate / 100), 4);
+        hubRate          = roundFn(custRate - techDeduct, 4);
       }
 
-      const hubAmount    = parseFloat((hubRate * qty).toFixed(2));
-      const gstAmount    = parseFloat((hubAmount * gstPct / 100).toFixed(2));
-      const totalPayable = parseFloat((hubAmount + gstAmount).toFixed(2));
+      const hubAmount    = roundFn(hubRate * qty);
+      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
       totalGst      += gstAmount;

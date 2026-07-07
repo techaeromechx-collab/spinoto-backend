@@ -2,6 +2,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { getRoundingFunction } = require('../utils/math');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -309,11 +310,13 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     // Use the estimate items' STORED amounts — these already have line-item
     // discounts and GST baked in, so CI totals always match the estimate.
     // (Recomputing from rate × qty here would silently drop line discounts.)
+    const roundFn = getRoundingFunction(new Date());
+
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const ciItems = itemsRow.rows.map(item => {
       const totalIncGst = parseFloat(item.total_inc_gst) || 0;
       const gstAmt      = parseFloat(item.gst_amount)    || 0;
-      const amtExGst    = parseFloat((totalIncGst - gstAmt).toFixed(2));
+      const amtExGst    = roundFn(totalIncGst - gstAmt);
       subtotalExGst += amtExGst;
       totalGst      += gstAmt;
       grandTotal    += totalIncGst;
@@ -328,11 +331,11 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
 
     if (discountMode === 'transaction' && txDiscountValue > 0) {
       if (txDiscountType === 'percent') {
-        txDiscountAmount = parseFloat((grandTotal * txDiscountValue / 100).toFixed(2));
+        txDiscountAmount = roundFn(grandTotal * txDiscountValue / 100);
       } else if (txDiscountType === 'flat') {
         txDiscountAmount = Math.min(txDiscountValue, grandTotal);
       }
-      grandTotal = parseFloat((grandTotal - txDiscountAmount).toFixed(2));
+      grandTotal = roundFn(grandTotal - txDiscountAmount);
     }
 
     const client = await pool.connect();
@@ -488,7 +491,7 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
     const id = idParam.parse(req.params.id);
 
     const ciRow = await pool.query(
-      `SELECT id, estimate_id, status FROM customer_invoices WHERE id = $1`, [id]
+      `SELECT id, estimate_id, status, created_at FROM customer_invoices WHERE id = $1`, [id]
     );
     if (!ciRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
     const ci = ciRow.rows[0];
@@ -516,13 +519,15 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
       return res.status(400).json({ error: 'No completed & customer-approved items found in estimate.' });
     }
 
+    const roundFn = getRoundingFunction(ci.created_at);
+
     // Use the estimate items' STORED amounts — discounts + GST already baked
     // in, so CI totals always match the estimate (see generate handler).
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const ciItems = itemsRow.rows.map(item => {
       const totalIncGst = parseFloat(item.total_inc_gst) || 0;
       const gstAmt      = parseFloat(item.gst_amount)    || 0;
-      const amtExGst    = parseFloat((totalIncGst - gstAmt).toFixed(2));
+      const amtExGst    = roundFn(totalIncGst - gstAmt);
       subtotalExGst += amtExGst;
       totalGst      += gstAmt;
       grandTotal    += totalIncGst;
@@ -536,11 +541,11 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
     let txDiscountAmount  = 0;
     if (discountMode === 'transaction' && txDiscountValue > 0) {
       if (txDiscountType === 'percent') {
-        txDiscountAmount = parseFloat((grandTotal * txDiscountValue / 100).toFixed(2));
+        txDiscountAmount = roundFn(grandTotal * txDiscountValue / 100);
       } else if (txDiscountType === 'flat') {
         txDiscountAmount = Math.min(txDiscountValue, grandTotal);
       }
-      grandTotal = parseFloat((grandTotal - txDiscountAmount).toFixed(2));
+      grandTotal = roundFn(grandTotal - txDiscountAmount);
     }
 
     const client = await pool.connect();
