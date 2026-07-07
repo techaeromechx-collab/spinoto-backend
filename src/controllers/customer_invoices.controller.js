@@ -164,7 +164,7 @@ function addPayment(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = z.object({
       amount:       z.coerce.number().positive(),
-      method:       z.enum(['cash','upi','card','bank_transfer','other']).default('cash'),
+      method:       z.enum(['cash','upi','card','bank_transfer','other','app_payment']).default('cash'),
       reference_no: z.string().trim().max(100).optional().nullable(),
       paid_at:      z.string().optional().nullable(),
       notes:        z.string().trim().max(500).optional().nullable(),

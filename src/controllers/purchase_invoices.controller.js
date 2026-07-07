@@ -467,7 +467,7 @@ function addHubPayment(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = z.object({
       amount:       z.coerce.number().positive(),
-      method:       z.enum(['cash','upi','card','bank_transfer','other']).default('bank_transfer'),
+      method:       z.enum(['cash','upi','card','bank_transfer','other','app_payment']).default('bank_transfer'),
       reference_no: z.string().trim().max(100).optional().nullable(),
       paid_at:      z.string().optional().nullable(),
       notes:        z.string().trim().max(500).optional().nullable(),
