@@ -451,12 +451,13 @@ function createAppointment(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 function listAppointments(req, res, next) {
   handle(req, res, next, async () => {
-    const search      = (req.query.search     || '').trim();
-    const statusId    = req.query.status_id   || '';
-    const hubId       = req.query.hub_id      || '';
-    const vehicleType = req.query.vehicle_type_id || '';
-    const dateFrom    = req.query.date_from   || '';
-    const dateTo      = req.query.date_to     || '';
+    const search       = (req.query.search     || '').trim();
+    const statusId     = req.query.status_id   || '';
+    const hubId        = req.query.hub_id      || '';
+    const vehicleType  = req.query.vehicle_type_id || '';
+    const dateFrom     = req.query.date_from   || '';
+    const dateTo       = req.query.date_to     || '';
+    const createdById  = req.query.created_by_id || '';
     const page  = Math.max(1, parseInt(req.query.page  || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
     const offset = (page - 1) * limit;
@@ -503,6 +504,10 @@ function listAppointments(req, res, next) {
     if (dateTo) {
       params.push(dateTo);
       conditions.push(`a.scheduled_date <= $${params.length}`);
+    }
+    if (createdById) {
+      params.push(Number(createdById));
+      conditions.push(`a.created_by = $${params.length}`);
     }
 
     // Snapshot BEFORE the status filter — per-status tab counts must ignore
