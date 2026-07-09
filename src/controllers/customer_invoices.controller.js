@@ -25,12 +25,15 @@ const CI_SELECT = `
     ci.notes, ci.created_at, ci.updated_at,
     ci.discount_mode, ci.transaction_discount_type,
     ci.transaction_discount_value, ci.transaction_discount_amount,
+    ci.is_b2b, ci.b2b_company_name, ci.b2b_gst_number, ci.b2b_address,
     ('Spinoto ' || ar.name) AS hub_name, h.hub_name AS hub_full_name, h.gst_number AS hub_gst,
     (ci.grand_total - ci.amount_paid) AS balance,
     (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
 
-    -- Vehicle details from linked appointment
+    -- Vehicle details — from the linked appointment when present, otherwise
+    -- (standalone estimate, no appointment) from the linked estimate's own
+    -- vehicle columns.
     vt.name   AS vehicle_type_name,
     vm.name   AS make_name,
     vmod.name AS model_name,
@@ -39,17 +42,18 @@ const CI_SELECT = `
     cc.min_cc,
     cc.max_cc,
     vmod.engine_cc,
-    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names
+    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(COALESCE(a.segment_ids, est_ctx.segment_ids))) AS segment_names
 
   FROM customer_invoices ci
   LEFT JOIN hubs           h    ON h.id    = ci.hub_id
   LEFT JOIN areas          ar   ON ar.id   = h.area_id
   LEFT JOIN appointments   a    ON a.id    = ci.appointment_id
-  LEFT JOIN vehicle_types  vt   ON vt.id   = a.vehicle_type_id
-  LEFT JOIN vehicle_makes  vm   ON vm.id   = a.make_id
-  LEFT JOIN vehicle_models vmod ON vmod.id = a.model_id
-  LEFT JOIN body_types     bt   ON bt.id   = a.body_type_id
-  LEFT JOIN cc_categories  cc   ON cc.id   = a.cc_category_id
+  LEFT JOIN estimates      est_ctx ON est_ctx.id = ci.estimate_id
+  LEFT JOIN vehicle_types  vt   ON vt.id   = COALESCE(a.vehicle_type_id, est_ctx.vehicle_type_id)
+  LEFT JOIN vehicle_makes  vm   ON vm.id   = COALESCE(a.make_id, est_ctx.make_id)
+  LEFT JOIN vehicle_models vmod ON vmod.id = COALESCE(a.model_id, est_ctx.model_id)
+  LEFT JOIN body_types     bt   ON bt.id   = COALESCE(a.body_type_id, est_ctx.body_type_id)
+  LEFT JOIN cc_categories  cc   ON cc.id   = COALESCE(a.cc_category_id, est_ctx.cc_category_id)
 `;
 
 async function _getItems(ciId) {
@@ -140,10 +144,19 @@ function listCustomerInvoices(req, res, next) {
     }
     if (req.query.status) { params.push(req.query.status);         conditions.push(`ci.status = $${params.length}`); }
     if (req.query.vehicle_type) {
+      // Match either via the linked appointment's vehicle type, or (for CIs
+      // whose estimate was standalone, no appointment) the linked estimate's
+      // own vehicle_type_id column.
       if (req.query.vehicle_type === '2W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = ci.appointment_id AND vt.name ILIKE '%2%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = ci.appointment_id AND vt.name ILIKE '%2%')
+          OR EXISTS (SELECT 1 FROM estimates e JOIN vehicle_types vt ON vt.id = e.vehicle_type_id WHERE e.id = ci.estimate_id AND vt.name ILIKE '%2%')
+        )`);
       } else if (req.query.vehicle_type === '4W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = ci.appointment_id AND vt.name ILIKE '%4%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = ci.appointment_id AND vt.name ILIKE '%4%')
+          OR EXISTS (SELECT 1 FROM estimates e JOIN vehicle_types vt ON vt.id = e.vehicle_type_id WHERE e.id = ci.estimate_id AND vt.name ILIKE '%4%')
+        )`);
       }
     }
 
@@ -257,7 +270,9 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     const estRow = await pool.query(
       `SELECT e.id, e.status, e.appointment_id, e.hub_id,
               e.discount_mode, e.transaction_discount_type,
-              e.transaction_discount_value, e.transaction_discount_amount
+              e.transaction_discount_value, e.transaction_discount_amount,
+              e.is_b2b, e.b2b_company_name, e.b2b_gst_number, e.b2b_address,
+              e.customer_name, e.mobile, e.vehicle_number
        FROM estimates e WHERE e.id = $1`,
       [estimate_id]
     );
@@ -297,12 +312,17 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       });
     }
 
-    // Pull appointment details for the CI header
-    const apptRow = await pool.query(
-      `SELECT customer_name, mobile, vehicle_number FROM appointments WHERE id = $1`,
-      [est.appointment_id]
-    );
-    const appt = apptRow.rows[0] || {};
+    // Pull appointment details for the CI header — falls back to the
+    // estimate's own standalone customer/vehicle columns when there is no
+    // linked appointment.
+    let appt = { customer_name: est.customer_name, mobile: est.mobile, vehicle_number: est.vehicle_number };
+    if (est.appointment_id) {
+      const apptRow = await pool.query(
+        `SELECT customer_name, mobile, vehicle_number FROM appointments WHERE id = $1`,
+        [est.appointment_id]
+      );
+      appt = apptRow.rows[0] || appt;
+    }
 
     // Fetch completed + customer-approved items from the estimate
     const itemsRow = await pool.query(
@@ -372,14 +392,19 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
             customer_name, mobile, vehicle_number,
             subtotal_ex_gst, total_gst, grand_total,
             discount_mode, transaction_discount_type,
-            transaction_discount_value, transaction_discount_amount)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+            transaction_discount_value, transaction_discount_amount,
+            is_b2b, b2b_company_name, b2b_gst_number, b2b_address)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
           subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
           discountMode, txDiscountType,
           txDiscountValue, txDiscountAmount.toFixed(2),
+          est.is_b2b || false,
+          est.is_b2b ? (est.b2b_company_name || null) : null,
+          est.is_b2b ? (est.b2b_gst_number   || null) : null,
+          est.is_b2b ? (est.b2b_address      || null) : null,
         ]
       );
       const ciId = ciRow.rows[0].id;

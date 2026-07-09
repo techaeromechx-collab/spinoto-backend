@@ -25,29 +25,34 @@ const PI_SELECT = `
     pi.amount_paid,
     pi.payment_status,
     h.hub_name, h.gst_number AS hub_gst,
-    a.customer_name, a.mobile, a.vehicle_number,
+    -- Customer / vehicle context — from the linked appointment when present,
+    -- otherwise from the linked estimate's own standalone columns.
+    COALESCE(a.customer_name, est_ctx.customer_name)   AS customer_name,
+    COALESCE(a.mobile, est_ctx.mobile)                 AS mobile,
+    COALESCE(a.vehicle_number, est_ctx.vehicle_number) AS vehicle_number,
     u.name  AS created_by_name,
     ab.name AS approved_by_name,
     (SELECT id FROM customer_invoices ci WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id LIMIT 1) AS customer_invoice_id,
     (SELECT COUNT(*)::int FROM purchase_invoice_items pii WHERE pii.purchase_invoice_id = pi.id) AS item_count,
 
-    -- Vehicle details from linked appointment
+    -- Vehicle details
     vt.name   AS vehicle_type_name,
     vm.name   AS make_name,
     vmod.name AS model_name,
     bt.name   AS body_type_name,
     cc.name   AS cc_category_name,
     vmod.engine_cc,
-    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names
+    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(COALESCE(a.segment_ids, est_ctx.segment_ids))) AS segment_names
 
   FROM purchase_invoices pi
   JOIN hubs h ON h.id = pi.hub_id
   LEFT JOIN appointments   a    ON a.id    = pi.appointment_id
-  LEFT JOIN vehicle_types  vt   ON vt.id   = a.vehicle_type_id
-  LEFT JOIN vehicle_makes  vm   ON vm.id   = a.make_id
-  LEFT JOIN vehicle_models vmod ON vmod.id = a.model_id
-  LEFT JOIN body_types     bt   ON bt.id   = a.body_type_id
-  LEFT JOIN cc_categories  cc   ON cc.id   = a.cc_category_id
+  LEFT JOIN estimates      est_ctx ON est_ctx.id = pi.estimate_id
+  LEFT JOIN vehicle_types  vt   ON vt.id   = COALESCE(a.vehicle_type_id, est_ctx.vehicle_type_id)
+  LEFT JOIN vehicle_makes  vm   ON vm.id   = COALESCE(a.make_id, est_ctx.make_id)
+  LEFT JOIN vehicle_models vmod ON vmod.id = COALESCE(a.model_id, est_ctx.model_id)
+  LEFT JOIN body_types     bt   ON bt.id   = COALESCE(a.body_type_id, est_ctx.body_type_id)
+  LEFT JOIN cc_categories  cc   ON cc.id   = COALESCE(a.cc_category_id, est_ctx.cc_category_id)
   LEFT JOIN users u  ON u.id  = pi.created_by
   LEFT JOIN users ab ON ab.id = pi.approved_by
 `;
@@ -119,7 +124,7 @@ function listPurchaseInvoices(req, res, next) {
     if (req.query.search) {
       params.push(`%${req.query.search}%`);
       const n = params.length;
-      conditions.push(`(a.customer_name ILIKE $${n} OR a.mobile ILIKE $${n} OR a.vehicle_number ILIKE $${n})`);
+      conditions.push(`(COALESCE(a.customer_name, est_ctx.customer_name) ILIKE $${n} OR COALESCE(a.mobile, est_ctx.mobile) ILIKE $${n} OR COALESCE(a.vehicle_number, est_ctx.vehicle_number) ILIKE $${n})`);
     }
     if (req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
@@ -133,17 +138,26 @@ function listPurchaseInvoices(req, res, next) {
     }
     if (req.query.status)  { params.push(req.query.status);          conditions.push(`pi.status = $${params.length}`); }
     if (req.query.vehicle_type) {
+      // Match either via the linked appointment's vehicle type, or (for
+      // standalone estimates with no appointment) the estimate's own
+      // vehicle_type_id column.
       if (req.query.vehicle_type === '2W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%2%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%2%')
+          OR EXISTS (SELECT 1 FROM estimates e JOIN vehicle_types vt ON vt.id = e.vehicle_type_id WHERE e.id = pi.estimate_id AND vt.name ILIKE '%2%')
+        )`);
       } else if (req.query.vehicle_type === '4W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%4%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = pi.appointment_id AND vt.name ILIKE '%4%')
+          OR EXISTS (SELECT 1 FROM estimates e JOIN vehicle_types vt ON vt.id = e.vehicle_type_id WHERE e.id = pi.estimate_id AND vt.name ILIKE '%4%')
+        )`);
       }
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const [dataRes, countRes] = await Promise.all([
       pool.query(`${PI_SELECT} ${where} ORDER BY pi.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
-      pool.query(`SELECT COUNT(*) FROM purchase_invoices pi LEFT JOIN appointments a ON a.id = pi.appointment_id ${where}`, params),
+      pool.query(`SELECT COUNT(*) FROM purchase_invoices pi LEFT JOIN appointments a ON a.id = pi.appointment_id LEFT JOIN estimates est_ctx ON est_ctx.id = pi.estimate_id ${where}`, params),
     ]);
     res.json({ items: dataRes.rows, total: parseInt(countRes.rows[0].count, 10), page, limit });
   });
@@ -931,7 +945,8 @@ function listPayouts(req, res, next) {
          pi.id, pi.hub_id, pi.grand_total, pi.amount_paid, pi.payment_status,
          pi.payout_due_date, pi.payout_schedule, pi.approved_at,
          h.hub_name, h.payout_terms,
-         a.customer_name, a.vehicle_number,
+         COALESCE(a.customer_name, e.customer_name)   AS customer_name,
+         COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
          CASE
            WHEN pi.payout_due_date IS NULL                                                         THEN 'upcoming'
            WHEN pi.payout_due_date <  $1::date                                                     THEN 'overdue'
@@ -943,6 +958,7 @@ function listPayouts(req, res, next) {
        FROM purchase_invoices pi
        JOIN hubs h ON h.id = pi.hub_id
        LEFT JOIN appointments a ON a.id = pi.appointment_id
+       LEFT JOIN estimates e ON e.id = pi.estimate_id
        WHERE pi.status = 'approved' AND pi.payment_status != 'paid'
        ORDER BY pi.payout_due_date ASC NULLS LAST`,
       [today]
@@ -1003,12 +1019,14 @@ function listHubPayments(req, res, next) {
          pi.grand_total AS pi_grand_total,
          pi.amount_paid AS pi_amount_paid,
          h.id AS hub_id, h.hub_name,
-         a.vehicle_number, a.customer_name,
+         COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
+         COALESCE(a.customer_name, e.customer_name)   AS customer_name,
          u.name AS created_by_name
        FROM hub_payments hp
        JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
        JOIN hubs h ON h.id = pi.hub_id
        LEFT JOIN appointments a ON a.id = pi.appointment_id
+       LEFT JOIN estimates e ON e.id = pi.estimate_id
        LEFT JOIN users u ON u.id = hp.created_by
        ${where}
        ORDER BY hp.paid_at DESC`,
@@ -1140,11 +1158,12 @@ function exportPayouts(req, res, next) {
            pi.id, pi.grand_total, pi.amount_paid, pi.payment_status,
            pi.payout_due_date, pi.created_at,
            h.hub_name,
-           a.vehicle_number,
+           COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
            u.name AS created_by_name
          FROM purchase_invoices pi
          JOIN hubs h ON h.id = pi.hub_id
          LEFT JOIN appointments a ON a.id = pi.appointment_id
+         LEFT JOIN estimates e ON e.id = pi.estimate_id
          LEFT JOIN users u ON u.id = pi.created_by
          ${where}
          ORDER BY pi.payout_due_date ASC NULLS LAST`,
@@ -1211,12 +1230,13 @@ function exportPayouts(req, res, next) {
            hp.id, hp.amount, hp.method, hp.reference_no, hp.notes, hp.paid_at,
            hp.purchase_invoice_id,
            h.hub_name,
-           a.vehicle_number,
+           COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
            u.name AS created_by_name
          FROM hub_payments hp
          JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
          JOIN hubs h ON h.id = pi.hub_id
          LEFT JOIN appointments a ON a.id = pi.appointment_id
+         LEFT JOIN estimates e ON e.id = pi.estimate_id
          LEFT JOIN users u ON u.id = hp.created_by
          ${where}
          ORDER BY hp.paid_at DESC`,

@@ -13,6 +13,7 @@
  */
 
 const { pool } = require('../config/db');
+const { isValidGSTIN } = require('../utils/gst');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -42,7 +43,11 @@ function listCustomers(req, res, next) {
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Union appointments + invoices so invoice-only customers appear in the list (#8).
+    // Union appointments + invoices + standalone estimates + customer
+    // profiles/vehicles so invoice-only customers (#8), customers who only
+    // have a standalone estimate, and customers created via the "New
+    // Customer" wizard but abandoned before an estimate was ever saved, all
+    // still appear.
     // Use FIRST_VALUE (ordered by created_at ASC) for customer_name to avoid arbitrary MAX (#11).
     const sql = `
       WITH src AS (
@@ -65,19 +70,60 @@ function listCustomers(req, res, next) {
                updated_at,
                'invoice'     AS src_type
         FROM invoices
+        UNION ALL
+        SELECT mobile,
+               whatsapp,
+               customer_name,
+               NULL          AS amount,
+               NULL          AS inv_total,
+               created_at    AS activity_date,
+               updated_at,
+               'estimate'    AS src_type
+        FROM estimates
+        WHERE appointment_id IS NULL AND mobile IS NOT NULL
+        UNION ALL
+        -- A customer_profiles row is created the moment step 1 of the "New
+        -- Customer" wizard is saved — this is what makes the customer show
+        -- up immediately, even if the estimate is never saved.
+        SELECT mobile,
+               whatsapp,
+               display_name  AS customer_name,
+               NULL          AS amount,
+               NULL          AS inv_total,
+               created_at    AS activity_date,
+               updated_at,
+               'profile'     AS src_type
+        FROM customer_profiles
+        WHERE NOT COALESCE(is_deleted, FALSE)
+        UNION ALL
+        -- Same idea for a vehicle saved in step 2 with no profile/appointment
+        -- row yet (defensive — normally the profile row above already covers it).
+        SELECT mobile,
+               NULL          AS whatsapp,
+               NULL          AS customer_name,
+               NULL          AS amount,
+               NULL          AS inv_total,
+               created_at    AS activity_date,
+               created_at    AS updated_at,
+               'vehicle'     AS src_type
+        FROM customer_vehicles
       ),
       agg AS (
         SELECT
           src.mobile,
           -- Earliest non-null whatsapp for this mobile (#11 fix: deterministic pick)
-          (SELECT whatsapp FROM appointments
-            WHERE mobile = src.mobile AND whatsapp IS NOT NULL
-            ORDER BY created_at ASC LIMIT 1)            AS whatsapp,
+          (SELECT whatsapp FROM (
+              SELECT whatsapp, created_at FROM appointments WHERE mobile = src.mobile AND whatsapp IS NOT NULL
+              UNION ALL
+              SELECT whatsapp, created_at FROM estimates WHERE mobile = src.mobile AND appointment_id IS NULL AND whatsapp IS NOT NULL
+            ) wa ORDER BY created_at ASC LIMIT 1)        AS whatsapp,
           -- Earliest non-null name — deterministic, not lexicographic MAX (#11)
           (SELECT customer_name FROM (
               SELECT customer_name, created_at FROM appointments WHERE mobile = src.mobile AND customer_name IS NOT NULL
               UNION ALL
               SELECT customer_name, created_at FROM invoices     WHERE mobile = src.mobile AND customer_name IS NOT NULL
+              UNION ALL
+              SELECT customer_name, created_at FROM estimates    WHERE mobile = src.mobile AND appointment_id IS NULL AND customer_name IS NOT NULL
             ) named ORDER BY created_at ASC LIMIT 1)    AS customer_name,
           COUNT(DISTINCT CASE WHEN src.src_type='appointment' THEN src.activity_date END)::int
                                                          AS total_appointments,
@@ -114,6 +160,12 @@ function listCustomers(req, res, next) {
         SELECT mobile, customer_name FROM appointments
         UNION ALL
         SELECT mobile, customer_name FROM invoices
+        UNION ALL
+        SELECT mobile, customer_name FROM estimates WHERE appointment_id IS NULL AND mobile IS NOT NULL
+        UNION ALL
+        SELECT mobile, display_name AS customer_name FROM customer_profiles WHERE NOT COALESCE(is_deleted, FALSE)
+        UNION ALL
+        SELECT mobile, NULL AS customer_name FROM customer_vehicles
       ) src
       LEFT JOIN customer_profiles cp ON cp.mobile = src.mobile
       WHERE NOT COALESCE(cp.is_deleted, FALSE)
@@ -141,7 +193,7 @@ function getCustomer(req, res, next) {
   handle(req, res, next, async () => {
     const mobile = req.params.mobile;
 
-    const [apptsRes, invoicesRes] = await Promise.all([
+    const [apptsRes, invoicesRes, standaloneEstRes] = await Promise.all([
       pool.query(`
         SELECT
           a.id, a.lead_id, a.customer_name, a.mobile, a.whatsapp,
@@ -190,6 +242,9 @@ function getCustomer(req, res, next) {
           ci.created_at,
           ci.status,
           ci.estimate_id,
+          ci.is_b2b,
+          ci.b2b_company_name,
+          ci.b2b_gst_number,
           h.hub_name,
           COALESCE(
             (SELECT json_agg(json_build_object(
@@ -207,6 +262,31 @@ function getCustomer(req, res, next) {
         LIMIT 30
       `, [mobile]),
 
+      // Standalone estimates — no appointment exists yet (or ever will), so
+      // this is the only place these customers' vehicle/estimate context
+      // lives until a Customer Invoice is eventually generated.
+      pool.query(`
+        SELECT
+          e.id, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
+          e.customer_name, e.mobile, e.whatsapp, e.vehicle_number,
+          h.hub_name,
+          vt.name AS vehicle_type_name,
+          mk.name AS make_name,
+          md.name AS model_name,
+          bt.name AS body_type_name,
+          cc.name AS cc_category_name
+        FROM estimates e
+        LEFT JOIN hubs           h  ON h.id  = e.hub_id
+        LEFT JOIN vehicle_types  vt ON vt.id = e.vehicle_type_id
+        LEFT JOIN vehicle_makes  mk ON mk.id = e.make_id
+        LEFT JOIN vehicle_models md ON md.id = e.model_id
+        LEFT JOIN body_types     bt ON bt.id = e.body_type_id
+        LEFT JOIN cc_categories  cc ON cc.id = e.cc_category_id
+        WHERE e.mobile = $1 AND e.appointment_id IS NULL
+        ORDER BY e.created_at DESC
+        LIMIT 30
+      `, [mobile]),
+
     ]);
 
     // customer_profiles is optional (table may not exist yet if migration hasn't run)
@@ -216,7 +296,9 @@ function getCustomer(req, res, next) {
         `SELECT cp.display_name, cp.whatsapp, cp.email, cp.notes,
                 cp.state_id, s.name AS state_name,
                 cp.city_id,  c.name AS city_name,
-                cp.area_id,  a.name AS area_name
+                cp.area_id,  a.name AS area_name,
+                cp.default_is_b2b, cp.default_b2b_company_name,
+                cp.default_b2b_gst_number, cp.default_b2b_address
            FROM customer_profiles cp
            LEFT JOIN states s ON s.id = cp.state_id
            LEFT JOIN cities c ON c.id = cp.city_id
@@ -250,25 +332,35 @@ function getCustomer(req, res, next) {
     } catch (_) { /* table not yet created — gracefully return empty */ }
 
     // Fix #7: return 404 only when there is truly no trace of this mobile —
-    // customer_vehicles alone is enough to keep the profile alive.
-    if (apptsRes.rows.length === 0 && invoicesRes.rows.length === 0 && custVehRes.rows.length === 0) {
+    // customer_vehicles alone is enough to keep the profile alive. A
+    // standalone estimate (no appointment), or just a saved customer_profiles
+    // row (e.g. step 1 of "New Customer" was saved but nothing further),
+    // also count as a trace now.
+    if (
+      apptsRes.rows.length === 0 && invoicesRes.rows.length === 0 &&
+      custVehRes.rows.length === 0 && standaloneEstRes.rows.length === 0 &&
+      !profile
+    ) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const appts    = apptsRes.rows;
-    const invoices = invoicesRes.rows;
-    const custVehs = custVehRes.rows;
+    const appts     = apptsRes.rows;
+    const invoices  = invoicesRes.rows;
+    const custVehs  = custVehRes.rows;
+    const estimates = standaloneEstRes.rows;
 
     // Fix #11: use earliest-created name, not arbitrary MAX; profile.display_name takes precedence
     const derivedName = (() => {
       const candidates = [
         ...appts.map(a => ({ name: a.customer_name, ts: a.created_at })),
         ...invoices.map(i => ({ name: i.customer_name, ts: i.created_at })),
+        ...estimates.map(e => ({ name: e.customer_name, ts: e.created_at })),
       ].filter(c => c.name).sort((a, b) => new Date(a.ts) - new Date(b.ts));
       return candidates[0]?.name || null;
     })();
     const name     = profile?.display_name || derivedName;
-    const whatsapp = profile?.whatsapp     || appts.find(a => a.whatsapp)?.whatsapp || null;
+    const whatsapp = profile?.whatsapp || appts.find(a => a.whatsapp)?.whatsapp
+      || estimates.find(e => e.whatsapp)?.whatsapp || null;
 
     // Fix #18: totalSpend uses actual invoiced totals, not appointment estimates
     const totalSpend       = invoices.reduce((s, i) => s + Number(i.total       || 0), 0);
@@ -355,12 +447,43 @@ function getCustomer(req, res, next) {
       }
     }
 
+    // 4. Merge standalone-estimate-derived vehicles (if not seen yet) —
+    // these carry the same *_name fields as an appointment would.
+    for (const e of estimates) {
+      if (!e.vehicle_number) continue;
+      const key = e.vehicle_number.toUpperCase().replace(/\s/g, '');
+      if (!vehicleMap.has(key)) {
+        vehicleMap.set(key, {
+          cv_id:             null,
+          vehicle_number:    e.vehicle_number,
+          vehicle_type_name: e.vehicle_type_name,
+          make_name:         e.make_name,
+          model_name:        e.model_name,
+          body_type_name:    e.body_type_name || null,
+          color:             null, year: null, notes: null,
+          visit_count:       1,
+          last_seen:         e.created_at ? new Date(e.created_at).toISOString().slice(0, 10) : null,
+          source:            'estimate',
+        });
+      } else {
+        const entry = vehicleMap.get(key);
+        entry.visit_count++;
+        if (!entry.vehicle_type_name) entry.vehicle_type_name = e.vehicle_type_name;
+        if (!entry.make_name)         entry.make_name         = e.make_name;
+        if (!entry.model_name)        entry.model_name        = e.model_name;
+      }
+    }
+
     return res.json({
       item: {
         mobile,
         whatsapp,
         email:               profile?.email         || null,
         profile_notes:       profile?.notes         || null,
+        default_is_b2b:              profile?.default_is_b2b             || false,
+        default_b2b_company_name:    profile?.default_b2b_company_name   || null,
+        default_b2b_gst_number:      profile?.default_b2b_gst_number     || null,
+        default_b2b_address:         profile?.default_b2b_address        || null,
         customer_name:       name,
         total_appointments:  appts.length,
         total_spend:         totalSpend,
@@ -371,6 +494,9 @@ function getCustomer(req, res, next) {
         vehicles:            [...vehicleMap.values()],
         appointments:        appts,
         invoices,
+        // Standalone estimates (no appointment) — surfaced separately so the
+        // customer detail page can show them even before any invoice exists.
+        estimates,
       },
     });
   });
@@ -589,20 +715,46 @@ function deleteCustomerVehicle(req, res, next) {
 function updateCustomer(req, res, next) {
   handle(req, res, next, async () => {
     const mobile = req.params.mobile;
-    const { display_name, whatsapp, email, notes, state_id, city_id, area_id } = req.body;
+    const {
+      display_name, whatsapp, email, notes, state_id, city_id, area_id,
+      is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
+    } = req.body;
+
+    // Validate B2B fields the same way estimates do — required + checksum-valid
+    // GSTIN whenever is_b2b is being turned on.
+    const isB2b = !!is_b2b;
+    if (isB2b) {
+      if (!b2b_company_name || !b2b_company_name.trim()) {
+        return res.status(400).json({ error: 'Company name is required for a B2B customer.' });
+      }
+      if (!b2b_address || !b2b_address.trim()) {
+        return res.status(400).json({ error: 'Address is required for a B2B customer.' });
+      }
+      if (!b2b_gst_number || !isValidGSTIN(b2b_gst_number)) {
+        return res.status(400).json({ error: 'A valid 15-character GSTIN is required for a B2B customer.' });
+      }
+    }
 
     await pool.query(`
-      INSERT INTO customer_profiles (mobile, display_name, whatsapp, email, notes, state_id, city_id, area_id, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      INSERT INTO customer_profiles (
+        mobile, display_name, whatsapp, email, notes, state_id, city_id, area_id,
+        default_is_b2b, default_b2b_company_name, default_b2b_gst_number, default_b2b_address,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
       ON CONFLICT (mobile) DO UPDATE SET
-        display_name = EXCLUDED.display_name,
-        whatsapp     = EXCLUDED.whatsapp,
-        email        = EXCLUDED.email,
-        notes        = EXCLUDED.notes,
-        state_id     = EXCLUDED.state_id,
-        city_id      = EXCLUDED.city_id,
-        area_id      = EXCLUDED.area_id,
-        updated_at   = NOW()
+        display_name             = EXCLUDED.display_name,
+        whatsapp                 = EXCLUDED.whatsapp,
+        email                    = EXCLUDED.email,
+        notes                    = EXCLUDED.notes,
+        state_id                 = EXCLUDED.state_id,
+        city_id                  = EXCLUDED.city_id,
+        area_id                  = EXCLUDED.area_id,
+        default_is_b2b           = EXCLUDED.default_is_b2b,
+        default_b2b_company_name = EXCLUDED.default_b2b_company_name,
+        default_b2b_gst_number   = EXCLUDED.default_b2b_gst_number,
+        default_b2b_address      = EXCLUDED.default_b2b_address,
+        updated_at                = NOW()
     `, [
       mobile,
       display_name?.trim() || null,
@@ -612,6 +764,10 @@ function updateCustomer(req, res, next) {
       state_id             || null,
       city_id              || null,
       area_id              || null,
+      isB2b,
+      isB2b ? b2b_company_name.trim()          : null,
+      isB2b ? b2b_gst_number.trim().toUpperCase() : null,
+      isB2b ? b2b_address.trim()               : null,
     ]);
 
     res.json({ ok: true });

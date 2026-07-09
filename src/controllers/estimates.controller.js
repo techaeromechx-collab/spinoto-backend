@@ -18,6 +18,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { isValidGSTIN } = require('../utils/gst');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -39,14 +40,64 @@ const itemSchema = z.object({
   discount_source: z.enum(['master', 'manual']).optional().nullable(),
 });
 
+// Shared B2B fields, validated the same way on create and update: when
+// is_b2b is true, company name / GST number / address are all required and
+// the GST number must be a structurally + checksum-valid GSTIN.
+const b2bFieldsRefine = (data, ctx) => {
+  if (!data.is_b2b) return;
+  if (!data.b2b_company_name || !data.b2b_company_name.trim()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_company_name'], message: 'Company name is required for a B2B invoice.' });
+  }
+  if (!data.b2b_address || !data.b2b_address.trim()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_address'], message: 'Address is required for a B2B invoice.' });
+  }
+  if (!data.b2b_gst_number || !isValidGSTIN(data.b2b_gst_number)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_gst_number'], message: 'A valid 15-character GSTIN is required for a B2B invoice.' });
+  }
+};
+
+// Reused from appointments.controller.js's mobile validator, so standalone
+// estimates enforce the same format rule as appointment creation.
+const mobileRegex = /^\+?[\d\s\-]{7,20}$/;
+
 const createSchema = z.object({
-  appointment_id:            z.coerce.number().int().positive(),
+  // Optional now — an estimate can either link to an existing appointment
+  // OR carry its own standalone customer/vehicle context (see below).
+  appointment_id:            z.coerce.number().int().positive().optional().nullable(),
   hub_id:                    z.coerce.number().int().positive().optional().nullable(),
   notes:                     z.string().trim().max(3000).optional().nullable(),
   items:                     z.array(itemSchema).optional().default([]),
   discount_mode:             z.enum(['none', 'line_item', 'transaction']).default('none'),
   transaction_discount_type: z.enum(['percent', 'flat']).optional().nullable(),
   transaction_discount_value: z.coerce.number().nonnegative().optional().default(0),
+  is_b2b:                    z.boolean().optional().default(false),
+  b2b_company_name:          z.string().trim().max(200).optional().nullable(),
+  b2b_gst_number:            z.string().trim().max(15).transform(v => v ? v.toUpperCase() : v).optional().nullable(),
+  b2b_address:               z.string().trim().max(2000).optional().nullable(),
+  save_b2b_to_profile:       z.boolean().optional().default(false),
+
+  // Standalone customer + vehicle context — required when appointment_id is
+  // absent (mirrors the appointments table's own column shape).
+  customer_name:             z.string().trim().max(160).optional().nullable(),
+  mobile:                    z.string().trim().max(20).regex(mobileRegex, 'Mobile must be 7–20 digits and may include +, spaces, or dashes').optional().nullable(),
+  whatsapp:                  z.string().trim().max(20).optional().nullable(),
+  vehicle_number:            z.string().trim().max(30).optional().nullable(),
+  vehicle_type_id:           z.coerce.number().int().positive().optional().nullable(),
+  make_id:                   z.coerce.number().int().positive().optional().nullable(),
+  model_id:                  z.coerce.number().int().positive().optional().nullable(),
+  body_type_id:              z.coerce.number().int().positive().optional().nullable(),
+  segment_ids:               z.array(z.coerce.number().int().positive()).optional().default([]),
+  cc_category_id:            z.coerce.number().int().positive().optional().nullable(),
+}).superRefine((data, ctx) => {
+  b2bFieldsRefine(data, ctx);
+  if (!data.appointment_id) {
+    if (!data.mobile || !data.mobile.trim()) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mobile'], message: 'Mobile number is required when no appointment is linked.' });
+    }
+    if (!data.vehicle_type_id) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['vehicle_type_id'], message: 'Vehicle type is required when no appointment is linked.' });
+    }
+  }
 });
 
 const updateSchema = z.object({
@@ -55,6 +106,16 @@ const updateSchema = z.object({
   discount_mode:             z.enum(['none', 'line_item', 'transaction']).optional(),
   transaction_discount_type: z.enum(['percent', 'flat']).optional().nullable(),
   transaction_discount_value: z.coerce.number().nonnegative().optional(),
+  is_b2b:                    z.boolean().optional(),
+  b2b_company_name:          z.string().trim().max(200).optional().nullable(),
+  b2b_gst_number:            z.string().trim().max(15).transform(v => v ? v.toUpperCase() : v).optional().nullable(),
+  b2b_address:               z.string().trim().max(2000).optional().nullable(),
+  save_b2b_to_profile:       z.boolean().optional().default(false),
+}).superRefine((data, ctx) => {
+  // Update payloads may omit is_b2b entirely (partial save). Only run the
+  // B2B requiredness check when is_b2b is explicitly part of this request.
+  if (data.is_b2b === undefined) return;
+  b2bFieldsRefine(data, ctx);
 });
 
 const customerApprovalSchema = z.object({
@@ -163,6 +224,25 @@ async function recalcTotals(client, estimateId) {
   ]);
 }
 
+// Saves the given B2B billing details as this customer's autofill default,
+// keyed by mobile (customer_profiles is a convenience cache — the estimate's
+// own b2b_* columns remain the source of truth for that specific invoice).
+async function _saveB2bProfileDefault(client, mobile, { companyName, gstNumber, address }) {
+  if (!mobile) return;
+  await client.query(
+    `INSERT INTO customer_profiles
+       (mobile, default_is_b2b, default_b2b_company_name, default_b2b_gst_number, default_b2b_address, updated_at)
+     VALUES ($1, TRUE, $2, $3, $4, NOW())
+     ON CONFLICT (mobile) DO UPDATE SET
+       default_is_b2b           = TRUE,
+       default_b2b_company_name = EXCLUDED.default_b2b_company_name,
+       default_b2b_gst_number   = EXCLUDED.default_b2b_gst_number,
+       default_b2b_address      = EXCLUDED.default_b2b_address,
+       updated_at                = NOW()`,
+    [mobile, companyName || null, gstNumber || null, address || null]
+  );
+}
+
 async function _getItems(estimateId) {
   const r = await pool.query(
     `SELECT
@@ -218,12 +298,27 @@ const EST_SELECT = `
     e.transaction_discount_type,
     e.transaction_discount_value,
     e.transaction_discount_amount,
+    e.is_b2b,
+    e.b2b_company_name,
+    e.b2b_gst_number,
+    e.b2b_address,
 
-    -- Appointment info
-    a.customer_name,
-    a.mobile,
-    a.vehicle_number,
+    -- Customer / vehicle context — from the linked appointment when present,
+    -- otherwise from the estimate's own standalone columns.
+    COALESCE(a.customer_name, e.customer_name)   AS customer_name,
+    COALESCE(a.mobile, e.mobile)                 AS mobile,
+    COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
     a.scheduled_date,
+
+    -- Raw vehicle dimension ids (for re-deriving pricing context client-side
+    -- when editing a standalone estimate — appointment mode already gets
+    -- these from the /api/appointments list instead).
+    COALESCE(a.vehicle_type_id, e.vehicle_type_id) AS vehicle_type_id,
+    COALESCE(a.make_id, e.make_id)                 AS make_id,
+    COALESCE(a.model_id, e.model_id)               AS model_id,
+    COALESCE(a.body_type_id, e.body_type_id)       AS body_type_id,
+    COALESCE(a.cc_category_id, e.cc_category_id)   AS cc_category_id,
+    COALESCE(a.segment_ids, e.segment_ids)         AS segment_ids,
 
     -- Vehicle details
     vt.name  AS vehicle_type_name,
@@ -234,7 +329,7 @@ const EST_SELECT = `
     cc.min_cc,
     cc.max_cc,
     vmod.engine_cc,
-    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(a.segment_ids)) AS segment_names,
+    (SELECT string_agg(sg.name, ', ') FROM segments sg WHERE sg.id = ANY(COALESCE(a.segment_ids, e.segment_ids))) AS segment_names,
 
     -- Hub
     ('Spinoto ' || ar.name) AS hub_name,
@@ -259,11 +354,11 @@ const EST_SELECT = `
 
   FROM estimates e
   LEFT JOIN appointments  a    ON a.id    = e.appointment_id
-  LEFT JOIN vehicle_types vt   ON vt.id   = a.vehicle_type_id
-  LEFT JOIN vehicle_makes vm   ON vm.id   = a.make_id
-  LEFT JOIN vehicle_models vmod ON vmod.id = a.model_id
-  LEFT JOIN body_types     bt   ON bt.id   = a.body_type_id
-  LEFT JOIN cc_categories  cc   ON cc.id   = a.cc_category_id
+  LEFT JOIN vehicle_types vt   ON vt.id   = COALESCE(a.vehicle_type_id, e.vehicle_type_id)
+  LEFT JOIN vehicle_makes vm   ON vm.id   = COALESCE(a.make_id, e.make_id)
+  LEFT JOIN vehicle_models vmod ON vmod.id = COALESCE(a.model_id, e.model_id)
+  LEFT JOIN body_types     bt   ON bt.id   = COALESCE(a.body_type_id, e.body_type_id)
+  LEFT JOIN cc_categories  cc   ON cc.id   = COALESCE(a.cc_category_id, e.cc_category_id)
   LEFT JOIN hubs           h    ON h.id    = e.hub_id
   LEFT JOIN areas          ar   ON ar.id   = h.area_id
   LEFT JOIN users          rv   ON rv.id   = e.reviewed_by
@@ -307,20 +402,30 @@ function listEstimates(req, res, next) {
     }
     if (status)        { params.push(status);                conditions.push(`e.status = $${params.length}`); }
     if (req.query.vehicle_type) {
+      // Match either via the linked appointment's vehicle type, or (for
+      // standalone estimates with no appointment) the estimate's own
+      // vehicle_type_id column.
       if (req.query.vehicle_type === '2W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%2%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%2%')
+          OR EXISTS (SELECT 1 FROM vehicle_types vt WHERE vt.id = e.vehicle_type_id AND vt.name ILIKE '%2%')
+        )`);
       } else if (req.query.vehicle_type === '4W') {
-        conditions.push(`EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%4%')`);
+        conditions.push(`(
+          EXISTS (SELECT 1 FROM appointments a JOIN vehicle_types vt ON vt.id = a.vehicle_type_id WHERE a.id = e.appointment_id AND vt.name ILIKE '%4%')
+          OR EXISTS (SELECT 1 FROM vehicle_types vt WHERE vt.id = e.vehicle_type_id AND vt.name ILIKE '%4%')
+        )`);
       }
     }
 
     // Free-text search across customer name, vehicle number, mobile and
     // estimate id (matches the search box placeholder on the Estimates page).
+    // Falls back to the estimate's own columns for standalone estimates.
     if (req.query.search && req.query.search.trim()) {
       params.push(`%${req.query.search.trim()}%`);
       const n = params.length;
       conditions.push(
-        `(a.customer_name ILIKE $${n} OR a.vehicle_number ILIKE $${n} OR a.mobile ILIKE $${n} OR CAST(e.id AS TEXT) ILIKE $${n})`
+        `(COALESCE(a.customer_name, e.customer_name) ILIKE $${n} OR COALESCE(a.vehicle_number, e.vehicle_number) ILIKE $${n} OR COALESCE(a.mobile, e.mobile) ILIKE $${n} OR CAST(e.id AS TEXT) ILIKE $${n})`
       );
     }
 
@@ -371,63 +476,102 @@ function getEstimate(req, res, next) {
 function createEstimate(req, res, next) {
   handle(req, res, next, async () => {
     const data = createSchema.parse(req.body);
+    const isStandalone = !data.appointment_id;
 
-    // Validate appointment exists
-    const apptCheck = await pool.query(
-      `SELECT id FROM appointments WHERE id = $1`,
-      [data.appointment_id]
-    );
-    if (!apptCheck.rows[0]) {
-      return res.status(400).json({ error: `Appointment #${data.appointment_id} not found.` });
-    }
+    // Mobile used for the "save B2B details to profile" lookup — either the
+    // linked appointment's mobile, or the standalone estimate's own mobile.
+    let profileMobile = data.mobile || null;
 
-    // Guard: only one estimate per appointment
-    const dupCheck = await pool.query(
-      `SELECT id, status FROM estimates WHERE appointment_id = $1 LIMIT 1`,
-      [data.appointment_id]
-    );
-    if (dupCheck.rows[0]) {
-      return res.status(409).json({
-        error: `An estimate already exists for appointment #${data.appointment_id} (estimate #${dupCheck.rows[0].id}, status: ${dupCheck.rows[0].status}).`,
-        existing_estimate_id: dupCheck.rows[0].id,
-      });
+    if (!isStandalone) {
+      // Validate appointment exists
+      const apptCheck = await pool.query(
+        `SELECT id, mobile FROM appointments WHERE id = $1`,
+        [data.appointment_id]
+      );
+      if (!apptCheck.rows[0]) {
+        return res.status(400).json({ error: `Appointment #${data.appointment_id} not found.` });
+      }
+      profileMobile = apptCheck.rows[0].mobile;
+
+      // Guard: only one estimate per appointment
+      const dupCheck = await pool.query(
+        `SELECT id, status FROM estimates WHERE appointment_id = $1 LIMIT 1`,
+        [data.appointment_id]
+      );
+      if (dupCheck.rows[0]) {
+        return res.status(409).json({
+          error: `An estimate already exists for appointment #${data.appointment_id} (estimate #${dupCheck.rows[0].id}, status: ${dupCheck.rows[0].status}).`,
+          existing_estimate_id: dupCheck.rows[0].id,
+        });
+      }
     }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // Serialize concurrent creates for the same appointment, then re-check
-      // the one-estimate-per-appointment guard INSIDE the transaction —
-      // the pre-check above is not atomic on its own.
-      await client.query(`SELECT pg_advisory_xact_lock(1, $1)`, [data.appointment_id]);
-      const dupInTx = await client.query(
-        `SELECT id FROM estimates WHERE appointment_id = $1 LIMIT 1`,
-        [data.appointment_id]
-      );
-      if (dupInTx.rows[0]) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: `An estimate already exists for appointment #${data.appointment_id}.`,
-          existing_estimate_id: dupInTx.rows[0].id,
-        });
+      if (!isStandalone) {
+        // Serialize concurrent creates for the same appointment, then re-check
+        // the one-estimate-per-appointment guard INSIDE the transaction —
+        // the pre-check above is not atomic on its own.
+        await client.query(`SELECT pg_advisory_xact_lock(1, $1)`, [data.appointment_id]);
+        const dupInTx = await client.query(
+          `SELECT id FROM estimates WHERE appointment_id = $1 LIMIT 1`,
+          [data.appointment_id]
+        );
+        if (dupInTx.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: `An estimate already exists for appointment #${data.appointment_id}.`,
+            existing_estimate_id: dupInTx.rows[0].id,
+          });
+        }
       }
 
       const ins = await client.query(
         `INSERT INTO estimates
            (appointment_id, hub_id, status, notes, created_by,
-            discount_mode, transaction_discount_type, transaction_discount_value)
-         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7)
+            discount_mode, transaction_discount_type, transaction_discount_value,
+            is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
+            customer_name, mobile, whatsapp, vehicle_number,
+            vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id)
+         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
          RETURNING id`,
         [
-          data.appointment_id, data.hub_id, data.notes || null, req.user.id,
+          data.appointment_id || null, data.hub_id, data.notes || null, req.user.id,
           data.discount_mode, // schema defaults to 'none'
           data.transaction_discount_type || null,
           data.transaction_discount_value || 0,
+          data.is_b2b || false,
+          data.is_b2b ? (data.b2b_company_name || null) : null,
+          data.is_b2b ? (data.b2b_gst_number   || null) : null,
+          data.is_b2b ? (data.b2b_address      || null) : null,
+          // Standalone customer/vehicle columns — left null when an
+          // appointment is linked (the appointment remains the source of truth).
+          isStandalone ? (data.customer_name   || null) : null,
+          isStandalone ? (data.mobile          || null) : null,
+          isStandalone ? (data.whatsapp        || null) : null,
+          isStandalone ? (data.vehicle_number  || null) : null,
+          isStandalone ? (data.vehicle_type_id || null) : null,
+          isStandalone ? (data.make_id         || null) : null,
+          isStandalone ? (data.model_id        || null) : null,
+          isStandalone ? (data.body_type_id    || null) : null,
+          isStandalone ? (data.segment_ids     || [])   : [],
+          isStandalone ? (data.cc_category_id  || null) : null,
         ]
       );
 
       const estimateId = ins.rows[0].id;
+
+      if (data.is_b2b && data.save_b2b_to_profile) {
+        await _saveB2bProfileDefault(client, profileMobile, {
+          companyName: data.b2b_company_name,
+          gstNumber:   data.b2b_gst_number,
+          address:     data.b2b_address,
+        });
+      }
+
       const roundFn = getRoundingFunction(new Date());
 
       const forceZeroDiscount = ['transaction', 'none'].includes(data.discount_mode);
@@ -498,10 +642,10 @@ function updateEstimate(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
 
-    const cur = await pool.query(`SELECT id, status, created_at FROM estimates WHERE id = $1`, [id]);
+    const cur = await pool.query(`SELECT id, status, created_at, appointment_id, mobile FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
-    const { status, created_at } = cur.rows[0];
+    const { status, created_at, appointment_id, mobile: standaloneMobile } = cur.rows[0];
     const roundFn = getRoundingFunction(created_at);
     // Status restriction removed — estimates can be edited at any status.
     // Invoice sync is handled separately after save.
@@ -511,7 +655,11 @@ function updateEstimate(req, res, next) {
       data.items === undefined &&
       data.discount_mode === undefined &&
       data.transaction_discount_type === undefined &&
-      data.transaction_discount_value === undefined
+      data.transaction_discount_value === undefined &&
+      data.is_b2b === undefined &&
+      data.b2b_company_name === undefined &&
+      data.b2b_gst_number === undefined &&
+      data.b2b_address === undefined
     ) {
       return res.status(400).json({ error: 'Nothing to update' });
     }
@@ -537,6 +685,33 @@ function updateEstimate(req, res, next) {
       if (data.transaction_discount_value !== undefined) {
         setFields.push(`transaction_discount_value = $${n++}`); setVals.push(data.transaction_discount_value);
       }
+
+      // B2B fields — resolved as a group against the current row so a
+      // partial payload (e.g. just correcting the GST number) doesn't wipe
+      // out the company name / address. Turning is_b2b off always clears
+      // all three sub-fields.
+      const b2bTouched = data.is_b2b !== undefined
+        || data.b2b_company_name !== undefined
+        || data.b2b_gst_number   !== undefined
+        || data.b2b_address      !== undefined;
+      let nextIsB2b = null, nextCompanyName = null, nextGstNumber = null, nextAddress = null;
+      if (b2bTouched) {
+        const curB2b = await client.query(
+          `SELECT is_b2b, b2b_company_name, b2b_gst_number, b2b_address FROM estimates WHERE id = $1`,
+          [id]
+        );
+        const cur = curB2b.rows[0] || {};
+        nextIsB2b = data.is_b2b !== undefined ? data.is_b2b : (cur.is_b2b || false);
+        nextCompanyName = nextIsB2b ? (data.b2b_company_name !== undefined ? data.b2b_company_name : cur.b2b_company_name) : null;
+        nextGstNumber   = nextIsB2b ? (data.b2b_gst_number   !== undefined ? data.b2b_gst_number   : cur.b2b_gst_number)   : null;
+        nextAddress     = nextIsB2b ? (data.b2b_address      !== undefined ? data.b2b_address      : cur.b2b_address)     : null;
+
+        setFields.push(`is_b2b = $${n++}`);            setVals.push(nextIsB2b);
+        setFields.push(`b2b_company_name = $${n++}`);  setVals.push(nextCompanyName);
+        setFields.push(`b2b_gst_number = $${n++}`);    setVals.push(nextGstNumber);
+        setFields.push(`b2b_address = $${n++}`);       setVals.push(nextAddress);
+      }
+
       if (setFields.length > 0) {
         setFields.push(`updated_at = NOW()`);
         setVals.push(id);
@@ -544,6 +719,34 @@ function updateEstimate(req, res, next) {
           `UPDATE estimates SET ${setFields.join(', ')} WHERE id = $${n}`,
           setVals
         );
+      }
+
+      // Auto-sync B2B billing details to the linked Customer Invoice, if one
+      // exists and hasn't been paid/cancelled yet. This is a plain field copy
+      // (no pricing/recalc involved) — separate from the manual
+      // sync-from-estimate flow, which only re-derives line items/totals.
+      if (b2bTouched) {
+        await client.query(
+          `UPDATE customer_invoices
+           SET is_b2b = $1, b2b_company_name = $2, b2b_gst_number = $3, b2b_address = $4, updated_at = NOW()
+           WHERE estimate_id = $5 AND status NOT IN ('paid','cancelled')`,
+          [nextIsB2b, nextCompanyName, nextGstNumber, nextAddress, id]
+        );
+
+        if (nextIsB2b && data.save_b2b_to_profile) {
+          // Linked appointment's mobile takes priority; falls back to the
+          // estimate's own mobile column for standalone estimates.
+          let mobileForProfile = standaloneMobile || null;
+          if (appointment_id) {
+            const apptRow = await client.query(`SELECT mobile FROM appointments WHERE id = $1`, [appointment_id]);
+            mobileForProfile = apptRow.rows[0]?.mobile || mobileForProfile;
+          }
+          await _saveB2bProfileDefault(client, mobileForProfile, {
+            companyName: nextCompanyName,
+            gstNumber:   nextGstNumber,
+            address:     nextAddress,
+          });
+        }
       }
 
       if (data.items !== undefined) {
