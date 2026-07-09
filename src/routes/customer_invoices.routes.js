@@ -5,6 +5,7 @@ const {
   listCustomerInvoices, getCustomerInvoice,
   addPayment, deletePayment,
   approveCustomerInvoice,
+  updateCustomerInvoiceNotes,
   generateCustomerInvoiceFromEstimate,
   syncCustomerInvoiceFromEstimate,
   getVehicleHistory,
@@ -22,6 +23,7 @@ router.get('/',                        canView,    listCustomerInvoices);
 router.post('/from-estimate',          canCreate,  generateCustomerInvoiceFromEstimate);
 router.get('/vehicle-history/:vnum',   canView,    getVehicleHistory);
 router.get('/:id',                     canView,    getCustomerInvoice);
+router.patch('/:id',                   canEdit,    updateCustomerInvoiceNotes);
 router.post('/:id/approve',            canEdit,    approveCustomerInvoice);
 router.post('/:id/sync-from-estimate', canEdit,    syncCustomerInvoiceFromEstimate);
 router.post('/:id/payments',           canPayment, addPayment);

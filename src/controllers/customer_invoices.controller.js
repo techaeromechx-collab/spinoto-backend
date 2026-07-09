@@ -272,7 +272,7 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
               e.discount_mode, e.transaction_discount_type,
               e.transaction_discount_value, e.transaction_discount_amount,
               e.is_b2b, e.b2b_company_name, e.b2b_gst_number, e.b2b_address,
-              e.customer_name, e.mobile, e.vehicle_number
+              e.customer_name, e.mobile, e.vehicle_number, e.notes
        FROM estimates e WHERE e.id = $1`,
       [estimate_id]
     );
@@ -393,8 +393,9 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
             subtotal_ex_gst, total_gst, grand_total,
             discount_mode, transaction_discount_type,
             transaction_discount_value, transaction_discount_amount,
-            is_b2b, b2b_company_name, b2b_gst_number, b2b_address)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+            is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
+            notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
@@ -405,6 +406,10 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           est.is_b2b ? (est.b2b_company_name || null) : null,
           est.is_b2b ? (est.b2b_gst_number   || null) : null,
           est.is_b2b ? (est.b2b_address      || null) : null,
+          // Carried over from the estimate at generation time — a one-time
+          // copy, not kept in sync afterward (same pattern as customer_name/
+          // mobile/vehicle_number above).
+          est.notes || null,
         ]
       );
       const ciId = ciRow.rows[0].id;
@@ -463,6 +468,36 @@ function approveCustomerInvoice(req, res, next) {
 
     // Auto-advance appointment status
     await advanceAppointmentStatus(r.rows[0].appointment_id, 'invoice-approved');
+
+    const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
+    full.rows[0].items    = await _getItems(id);
+    full.rows[0].payments = await _getPayments(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/customer-invoices/:id — edit the CI's own notes directly.
+// Independent of the estimate's notes (which are only copied over once, at
+// generation time) — editable at any status, since notes are informational
+// only and don't affect totals/payments.
+// ─────────────────────────────────────────────────────────────────────────────
+const updateNotesSchema = z.object({
+  notes: z.string().trim().max(3000).optional().nullable(),
+});
+
+function updateCustomerInvoiceNotes(req, res, next) {
+  handle(req, res, next, async () => {
+    const id   = idParam.parse(req.params.id);
+    const data = updateNotesSchema.parse(req.body);
+
+    const cur = await pool.query(`SELECT id FROM customer_invoices WHERE id = $1`, [id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+
+    await pool.query(
+      `UPDATE customer_invoices SET notes = $1, updated_at = NOW() WHERE id = $2`,
+      [data.notes || null, id]
+    );
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     full.rows[0].items    = await _getItems(id);
@@ -638,4 +673,4 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
   });
 }
 
-module.exports = { listCustomerInvoices, getCustomerInvoice, addPayment, deletePayment, approveCustomerInvoice, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };
+module.exports = { listCustomerInvoices, getCustomerInvoice, addPayment, deletePayment, approveCustomerInvoice, updateCustomerInvoiceNotes, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };
