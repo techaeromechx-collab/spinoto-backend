@@ -121,7 +121,16 @@ function listPurchaseInvoices(req, res, next) {
       const n = params.length;
       conditions.push(`(a.customer_name ILIKE $${n} OR a.mobile ILIKE $${n} OR a.vehicle_number ILIKE $${n})`);
     }
-    if (req.query.hub_id)  { params.push(Number(req.query.hub_id));  conditions.push(`pi.hub_id = $${params.length}`); }
+    if (req.query.hub_ids) {
+      const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
+      if (ids.length > 0) {
+        params.push(ids);
+        conditions.push(`pi.hub_id = ANY($${params.length}::int[])`);
+      }
+    } else if (req.query.hub_id) {
+      params.push(Number(req.query.hub_id));
+      conditions.push(`pi.hub_id = $${params.length}`);
+    }
     if (req.query.status)  { params.push(req.query.status);          conditions.push(`pi.status = $${params.length}`); }
     if (req.query.vehicle_type) {
       if (req.query.vehicle_type === '2W') {

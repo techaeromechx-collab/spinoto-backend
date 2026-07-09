@@ -277,6 +277,7 @@ function listEstimates(req, res, next) {
   handle(req, res, next, async () => {
     const appointmentId = req.query.appointment_id || '';
     const hubId         = req.query.hub_id         || '';
+    const hubIds        = req.query.hub_ids        || '';
     const status        = req.query.status         || '';
     const page  = Math.max(1, parseInt(req.query.page  || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
@@ -294,7 +295,16 @@ function listEstimates(req, res, next) {
     }
 
     if (appointmentId) { params.push(Number(appointmentId)); conditions.push(`e.appointment_id = $${params.length}`); }
-    if (hubId)         { params.push(Number(hubId));         conditions.push(`e.hub_id = $${params.length}`); }
+    if (hubIds) {
+      const ids = hubIds.split(',').map(Number).filter(n => !isNaN(n));
+      if (ids.length > 0) {
+        params.push(ids);
+        conditions.push(`e.hub_id = ANY($${params.length}::int[])`);
+      }
+    } else if (hubId) {
+      params.push(Number(hubId));
+      conditions.push(`e.hub_id = $${params.length}`);
+    }
     if (status)        { params.push(status);                conditions.push(`e.status = $${params.length}`); }
     if (req.query.vehicle_type) {
       if (req.query.vehicle_type === '2W') {
