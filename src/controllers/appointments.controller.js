@@ -62,8 +62,8 @@ async function checkHubSchedule(hubId, scheduledDate, scheduledTime) {
       return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${ampm}`;
     };
 
-    const apptMins  = toMins(scheduledTime);
-    const openMins  = toMins(hub.open_time);
+    const apptMins = toMins(scheduledTime);
+    const openMins = toMins(hub.open_time);
     const closeMins = toMins(hub.close_time);
 
     if (apptMins < openMins || apptMins >= closeMins) {
@@ -83,43 +83,45 @@ async function checkHubSchedule(hubId, scheduledDate, scheduledTime) {
 const idParam = z.coerce.number().int().positive();
 
 const createSchema = z.object({
-  lead_id:         z.coerce.number().int().positive().optional().nullable(),
-  assigned_to:     z.coerce.number().int().positive().optional().nullable(),
-  customer_name:   z.string().trim().max(160).optional().nullable(),
+  lead_id: z.coerce.number().int().positive().optional().nullable(),
+  assigned_to: z.coerce.number().int().positive().optional().nullable(),
+  customer_name: z.string().trim().max(160).optional().nullable(),
   // Fix #21: validate mobile format (digits, spaces, dashes, +; 7-15 chars after stripping)
-  mobile:          z.string().trim().min(1).max(20).regex(
+  mobile: z.string().trim().min(1).max(20).regex(
     /^\+?[\d\s\-]{7,20}$/,
     'Mobile must be 7–20 digits and may include +, spaces, or dashes'
   ),
-  whatsapp:        z.string().trim().max(20).optional().nullable(),
-  vehicle_number:  z.string().trim().max(30).optional().nullable(),
+  whatsapp: z.string().trim().max(20).optional().nullable(),
+  vehicle_number: z.string().trim().max(30).optional().nullable(),
   vehicle_type_id: z.coerce.number().int().positive().optional().nullable(),
-  make_id:         z.coerce.number().int().positive().optional().nullable(),
-  model_id:        z.coerce.number().int().positive().optional().nullable(),
-  body_type_id:    z.coerce.number().int().positive().optional().nullable(),
-  segment_ids:     z.array(z.number().int()).optional().default([]),
-  cc_category_id:  z.coerce.number().int().positive().optional().nullable(),
-  hub_id:          z.coerce.number().int().positive().optional().nullable(),
-  scheduled_date:  z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD'),
-  scheduled_time:  z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Time must be HH:MM').optional().nullable(),
-  status_id:       z.coerce.number().int().positive().optional().nullable(),
-  notes:           z.string().trim().max(3000).optional().nullable(),
-  pickup_required:      z.boolean().optional().default(false),
+  make_id: z.coerce.number().int().positive().optional().nullable(),
+  model_id: z.coerce.number().int().positive().optional().nullable(),
+  body_type_id: z.coerce.number().int().positive().optional().nullable(),
+  segment_ids: z.array(z.number().int()).optional().default([]),
+  cc_category_id: z.coerce.number().int().positive().optional().nullable(),
+  hub_id: z.coerce.number().int().positive().optional().nullable(),
+  scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD'),
+  scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Time must be HH:MM').optional().nullable(),
+  status_id: z.coerce.number().int().positive().optional().nullable(),
+  notes: z.string().trim().max(3000).optional().nullable(),
+  pickup_required: z.boolean().optional().default(false),
   pickup_address_line1: z.string().trim().max(200).optional().nullable(),
   pickup_address_line2: z.string().trim().max(200).optional().nullable(),
-  pickup_city:          z.string().trim().max(100).optional().nullable(),
-  pickup_pincode:       z.string().trim().max(10).optional().nullable(),
-  pickup_maps_link:     z.string().trim().max(500).optional().nullable(),
-  drop_required:        z.boolean().optional().default(false),
-  drop_address_line1:   z.string().trim().max(200).optional().nullable(),
-  drop_address_line2:   z.string().trim().max(200).optional().nullable(),
-  drop_city:            z.string().trim().max(100).optional().nullable(),
-  drop_pincode:         z.string().trim().max(10).optional().nullable(),
-  drop_maps_link:       z.string().trim().max(500).optional().nullable(),
+  pickup_city: z.string().trim().max(100).optional().nullable(),
+  pickup_pincode: z.string().trim().max(10).optional().nullable(),
+  pickup_maps_link: z.string().trim().max(500).optional().nullable(),
+  pickup_scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Pickup date must be YYYY-MM-DD').optional().nullable(),
+  pickup_scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Pickup time must be HH:MM').optional().nullable(),
+  drop_required: z.boolean().optional().default(false),
+  drop_address_line1: z.string().trim().max(200).optional().nullable(),
+  drop_address_line2: z.string().trim().max(200).optional().nullable(),
+  drop_city: z.string().trim().max(100).optional().nullable(),
+  drop_pincode: z.string().trim().max(10).optional().nullable(),
+  drop_maps_link: z.string().trim().max(500).optional().nullable(),
   services: z.array(z.object({
-    service_id:  z.coerce.number().int().positive(),
+    service_id: z.coerce.number().int().positive(),
     category_id: z.coerce.number().int().positive().optional().nullable(),
-    price:       z.coerce.number().nonnegative(),
+    price: z.coerce.number().nonnegative(),
   })).optional().default([]),
 }).refine(d => !d.pickup_required || (d.pickup_address_line1 && d.pickup_address_line1.trim().length > 0), {
   message: 'Pickup address (line 1) is required when pickup is enabled',
@@ -130,45 +132,47 @@ const createSchema = z.object({
 });
 
 const updateSchema = z.object({
-  status_id:           z.coerce.number().int().positive().optional().nullable(),
-  scheduled_date:      z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  scheduled_time:      z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional().nullable(),
-  notes:               z.string().trim().max(3000).optional().nullable(),
-  hub_id:              z.coerce.number().int().positive().optional().nullable(),
-  vehicle_number:      z.string().trim().max(30).optional().nullable(),
+  status_id: z.coerce.number().int().positive().optional().nullable(),
+  scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional().nullable(),
+  notes: z.string().trim().max(3000).optional().nullable(),
+  hub_id: z.coerce.number().int().positive().optional().nullable(),
+  vehicle_number: z.string().trim().max(30).optional().nullable(),
   cancellation_reason: z.string().trim().max(500).optional().nullable(),
-  pickup_required:      z.boolean().optional(),
+  pickup_required: z.boolean().optional(),
   pickup_address_line1: z.string().trim().max(200).optional().nullable(),
   pickup_address_line2: z.string().trim().max(200).optional().nullable(),
-  pickup_city:          z.string().trim().max(100).optional().nullable(),
-  pickup_pincode:       z.string().trim().max(10).optional().nullable(),
-  pickup_maps_link:     z.string().trim().max(500).optional().nullable(),
-  pickup_timestamp:     z.string().datetime().optional().nullable(),
-  drop_required:        z.boolean().optional(),
-  drop_address_line1:   z.string().trim().max(200).optional().nullable(),
-  drop_address_line2:   z.string().trim().max(200).optional().nullable(),
-  drop_city:            z.string().trim().max(100).optional().nullable(),
-  drop_pincode:         z.string().trim().max(10).optional().nullable(),
-  drop_maps_link:       z.string().trim().max(500).optional().nullable(),
-  reschedule_reason:    z.string().trim().max(200).optional().nullable(),
-  reschedule_notes:     z.string().trim().max(1000).optional().nullable(),
+  pickup_city: z.string().trim().max(100).optional().nullable(),
+  pickup_pincode: z.string().trim().max(10).optional().nullable(),
+  pickup_maps_link: z.string().trim().max(500).optional().nullable(),
+  pickup_timestamp: z.string().datetime().optional().nullable(),
+  pickup_scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  pickup_scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional().nullable(),
+  drop_required: z.boolean().optional(),
+  drop_address_line1: z.string().trim().max(200).optional().nullable(),
+  drop_address_line2: z.string().trim().max(200).optional().nullable(),
+  drop_city: z.string().trim().max(100).optional().nullable(),
+  drop_pincode: z.string().trim().max(10).optional().nullable(),
+  drop_maps_link: z.string().trim().max(500).optional().nullable(),
+  reschedule_reason: z.string().trim().max(200).optional().nullable(),
+  reschedule_notes: z.string().trim().max(1000).optional().nullable(),
   // These are set by the server on reschedule — not accepted from client
   // original_scheduled_date, original_scheduled_time, rescheduled_by, rescheduled_at
   // Customer & vehicle fields for full edit
-  customer_name:       z.string().trim().max(200).optional().nullable(),
-  mobile:              z.string().trim().max(20).optional().nullable(),
-  whatsapp:            z.string().trim().max(20).optional().nullable(),
-  vehicle_type_id:     z.coerce.number().int().positive().optional().nullable(),
-  make_id:             z.coerce.number().int().positive().optional().nullable(),
-  model_id:            z.coerce.number().int().positive().optional().nullable(),
-  body_type_id:        z.coerce.number().int().positive().optional().nullable(),
-  cc_category_id:      z.coerce.number().int().positive().optional().nullable(),
-  segment_ids:         z.array(z.coerce.number().int().positive()).optional(),
+  customer_name: z.string().trim().max(200).optional().nullable(),
+  mobile: z.string().trim().max(20).optional().nullable(),
+  whatsapp: z.string().trim().max(20).optional().nullable(),
+  vehicle_type_id: z.coerce.number().int().positive().optional().nullable(),
+  make_id: z.coerce.number().int().positive().optional().nullable(),
+  model_id: z.coerce.number().int().positive().optional().nullable(),
+  body_type_id: z.coerce.number().int().positive().optional().nullable(),
+  cc_category_id: z.coerce.number().int().positive().optional().nullable(),
+  segment_ids: z.array(z.coerce.number().int().positive()).optional(),
   // Fix #9: allow updating service line items
   services: z.array(z.object({
-    service_id:  z.coerce.number().int().positive(),
+    service_id: z.coerce.number().int().positive(),
     category_id: z.coerce.number().int().positive().optional().nullable(),
-    price:       z.coerce.number().nonnegative(),
+    price: z.coerce.number().nonnegative(),
   })).optional(),
 });
 
@@ -208,6 +212,8 @@ const APPT_SELECT = `
     a.pickup_pincode,
     a.pickup_maps_link,
     a.pickup_timestamp,
+    TO_CHAR(a.pickup_scheduled_date, 'YYYY-MM-DD') AS pickup_scheduled_date,
+    a.pickup_scheduled_time,
     a.drop_required,
     a.drop_address_line1,
     a.drop_address_line2,
@@ -337,46 +343,50 @@ function createAppointment(req, res, next) {
           hub_id, scheduled_date, scheduled_time,
           status_id, total_price, notes,
           pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode, pickup_maps_link,
+          pickup_scheduled_date, pickup_scheduled_time,
           drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode, drop_maps_link,
           assigned_to, created_by
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
           $18,$19,$20,$21,$22,$23,
-          $24,$25,$26,$27,$28,$29,
-          $30,$31
+          $24,$25,
+          $26,$27,$28,$29,$30,$31,
+          $32,$33
         ) RETURNING id`,
         [
-          data.lead_id        || null,           // $1
-          data.customer_name  || null,           // $2
+          data.lead_id || null,           // $1
+          data.customer_name || null,           // $2
           data.mobile,                           // $3
-          data.whatsapp       || null,           // $4
+          data.whatsapp || null,           // $4
           data.vehicle_number || null,           // $5
           data.vehicle_type_id || null,          // $6
-          data.make_id         || null,          // $7
-          data.model_id        || null,          // $8
-          data.body_type_id    || null,          // $9
+          data.make_id || null,          // $7
+          data.model_id || null,          // $8
+          data.body_type_id || null,          // $9
           data.segment_ids,                      // $10
-          data.cc_category_id  || null,          // $11
-          data.hub_id          || null,          // $12
+          data.cc_category_id || null,          // $11
+          data.hub_id || null,          // $12
           data.scheduled_date,                   // $13
-          data.scheduled_time  || null,          // $14
+          data.scheduled_time || null,          // $14
           statusId,                              // $15
           totalPrice,                            // $16
-          data.notes           || null,          // $17
+          data.notes || null,          // $17
           data.pickup_required ?? false,         // $18
           data.pickup_address_line1 || null,     // $19
           data.pickup_address_line2 || null,     // $20
-          data.pickup_city          || null,     // $21
-          data.pickup_pincode       || null,     // $22
-          data.pickup_maps_link     || null,     // $23
-          data.drop_required   ?? false,         // $24
-          data.drop_address_line1   || null,     // $25
-          data.drop_address_line2   || null,     // $26
-          data.drop_city            || null,     // $27
-          data.drop_pincode         || null,     // $28
-          data.drop_maps_link       || null,     // $29
-          assignedTo,                            // $30
-          req.user.id,                           // $31
+          data.pickup_city || null,     // $21
+          data.pickup_pincode || null,     // $22
+          data.pickup_maps_link || null,     // $23
+          data.pickup_scheduled_date || null,    // $24
+          data.pickup_scheduled_time || null,    // $25
+          data.drop_required ?? false,         // $26
+          data.drop_address_line1 || null,     // $27
+          data.drop_address_line2 || null,     // $28
+          data.drop_city || null,     // $29
+          data.drop_pincode || null,     // $30
+          data.drop_maps_link || null,     // $31
+          assignedTo,                            // $32
+          req.user.id,                           // $33
         ]
       );
 
@@ -451,19 +461,19 @@ function createAppointment(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 function listAppointments(req, res, next) {
   handle(req, res, next, async () => {
-    const search       = (req.query.search     || '').trim();
-    const statusId     = req.query.status_id   || '';
-    const hubId        = req.query.hub_id      || '';
-    const vehicleType  = req.query.vehicle_type_id || '';
-    const dateFrom     = req.query.date_from   || '';
-    const dateTo       = req.query.date_to     || '';
-    const createdById  = req.query.created_by_id || '';
-    const page  = Math.max(1, parseInt(req.query.page  || '1', 10));
+    const search = (req.query.search || '').trim();
+    const statusId = req.query.status_id || '';
+    const hubId = req.query.hub_id || '';
+    const vehicleType = req.query.vehicle_type_id || '';
+    const dateFrom = req.query.date_from || '';
+    const dateTo = req.query.date_to || '';
+    const createdById = req.query.created_by_id || '';
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
     const offset = (page - 1) * limit;
 
     const conditions = [];
-    const params     = [];
+    const params = [];
 
     // ── User scoping ──────────────────────────────────────────────────────────
     // Super admins and users with VIEW_APPOINTMENT see all.
@@ -513,14 +523,14 @@ function listAppointments(req, res, next) {
     // Snapshot BEFORE the status filter — per-status tab counts must ignore
     // the active status filter so the numbers stay stable when a tab is picked.
     const countConditions = [...conditions];
-    const countParams     = [...params];
+    const countParams = [...params];
 
     if (statusId) {
       params.push(Number(statusId));
       conditions.push(`a.status_id = $${params.length}`);
     }
 
-    const where      = conditions.length      ? `WHERE ${conditions.join(' AND ')}`      : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const countWhere = countConditions.length ? `WHERE ${countConditions.join(' AND ')}` : '';
 
     const [dataRes, countRes, statusCountsRes] = await Promise.all([
@@ -595,7 +605,7 @@ async function checkIsTerminal(id) {
 // ─────────────────────────────────────────────────────────────────────────────
 function updateAppointment(req, res, next) {
   handle(req, res, next, async () => {
-    const id   = idParam.parse(req.params.id);
+    const id = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
 
     if (await checkIsTerminal(id)) {
@@ -647,38 +657,40 @@ function updateAppointment(req, res, next) {
     const fields = [];
     const params = [];
 
-    if (data.status_id           !== undefined) { params.push(data.status_id);           fields.push(`status_id           = $${params.length}`); }
-    if (data.scheduled_date      !== undefined) { params.push(data.scheduled_date);      fields.push(`scheduled_date      = $${params.length}`); }
-    if (data.scheduled_time      !== undefined) { params.push(data.scheduled_time);      fields.push(`scheduled_time      = $${params.length}`); }
-    if (data.notes               !== undefined) { params.push(data.notes);               fields.push(`notes               = $${params.length}`); }
-    if (data.hub_id              !== undefined) { params.push(data.hub_id);              fields.push(`hub_id              = $${params.length}`); }
-    if (data.vehicle_number      !== undefined) { params.push(data.vehicle_number);      fields.push(`vehicle_number      = $${params.length}`); }
+    if (data.status_id !== undefined) { params.push(data.status_id); fields.push(`status_id           = $${params.length}`); }
+    if (data.scheduled_date !== undefined) { params.push(data.scheduled_date); fields.push(`scheduled_date      = $${params.length}`); }
+    if (data.scheduled_time !== undefined) { params.push(data.scheduled_time); fields.push(`scheduled_time      = $${params.length}`); }
+    if (data.notes !== undefined) { params.push(data.notes); fields.push(`notes               = $${params.length}`); }
+    if (data.hub_id !== undefined) { params.push(data.hub_id); fields.push(`hub_id              = $${params.length}`); }
+    if (data.vehicle_number !== undefined) { params.push(data.vehicle_number); fields.push(`vehicle_number      = $${params.length}`); }
     if (data.cancellation_reason !== undefined) { params.push(data.cancellation_reason); fields.push(`cancellation_reason = $${params.length}`); }
-    if (data.pickup_required      !== undefined) { params.push(data.pickup_required);      fields.push(`pickup_required      = $${params.length}`); }
+    if (data.pickup_required !== undefined) { params.push(data.pickup_required); fields.push(`pickup_required      = $${params.length}`); }
     if (data.pickup_address_line1 !== undefined) { params.push(data.pickup_address_line1); fields.push(`pickup_address_line1 = $${params.length}`); }
     if (data.pickup_address_line2 !== undefined) { params.push(data.pickup_address_line2); fields.push(`pickup_address_line2 = $${params.length}`); }
-    if (data.pickup_city          !== undefined) { params.push(data.pickup_city);          fields.push(`pickup_city          = $${params.length}`); }
-    if (data.pickup_pincode       !== undefined) { params.push(data.pickup_pincode);       fields.push(`pickup_pincode       = $${params.length}`); }
-    if (data.pickup_maps_link     !== undefined) { params.push(data.pickup_maps_link);     fields.push(`pickup_maps_link     = $${params.length}`); }
-    if (data.pickup_timestamp     !== undefined) { params.push(data.pickup_timestamp);     fields.push(`pickup_timestamp     = $${params.length}`); }
-    if (data.drop_required        !== undefined) { params.push(data.drop_required);        fields.push(`drop_required        = $${params.length}`); }
-    if (data.drop_address_line1   !== undefined) { params.push(data.drop_address_line1);   fields.push(`drop_address_line1   = $${params.length}`); }
-    if (data.drop_address_line2   !== undefined) { params.push(data.drop_address_line2);   fields.push(`drop_address_line2   = $${params.length}`); }
-    if (data.drop_city            !== undefined) { params.push(data.drop_city);            fields.push(`drop_city            = $${params.length}`); }
-    if (data.drop_pincode         !== undefined) { params.push(data.drop_pincode);         fields.push(`drop_pincode         = $${params.length}`); }
-    if (data.drop_maps_link       !== undefined) { params.push(data.drop_maps_link);       fields.push(`drop_maps_link       = $${params.length}`); }
-    if (data.reschedule_reason    !== undefined) { params.push(data.reschedule_reason);    fields.push(`reschedule_reason    = $${params.length}`); }
-    if (data.reschedule_notes     !== undefined) { params.push(data.reschedule_notes);     fields.push(`reschedule_notes     = $${params.length}`); }
+    if (data.pickup_city !== undefined) { params.push(data.pickup_city); fields.push(`pickup_city          = $${params.length}`); }
+    if (data.pickup_pincode !== undefined) { params.push(data.pickup_pincode); fields.push(`pickup_pincode       = $${params.length}`); }
+    if (data.pickup_maps_link !== undefined) { params.push(data.pickup_maps_link); fields.push(`pickup_maps_link     = $${params.length}`); }
+    if (data.pickup_timestamp !== undefined) { params.push(data.pickup_timestamp); fields.push(`pickup_timestamp     = $${params.length}`); }
+    if (data.pickup_scheduled_date !== undefined) { params.push(data.pickup_scheduled_date); fields.push(`pickup_scheduled_date = $${params.length}`); }
+    if (data.pickup_scheduled_time !== undefined) { params.push(data.pickup_scheduled_time); fields.push(`pickup_scheduled_time = $${params.length}`); }
+    if (data.drop_required !== undefined) { params.push(data.drop_required); fields.push(`drop_required        = $${params.length}`); }
+    if (data.drop_address_line1 !== undefined) { params.push(data.drop_address_line1); fields.push(`drop_address_line1   = $${params.length}`); }
+    if (data.drop_address_line2 !== undefined) { params.push(data.drop_address_line2); fields.push(`drop_address_line2   = $${params.length}`); }
+    if (data.drop_city !== undefined) { params.push(data.drop_city); fields.push(`drop_city            = $${params.length}`); }
+    if (data.drop_pincode !== undefined) { params.push(data.drop_pincode); fields.push(`drop_pincode         = $${params.length}`); }
+    if (data.drop_maps_link !== undefined) { params.push(data.drop_maps_link); fields.push(`drop_maps_link       = $${params.length}`); }
+    if (data.reschedule_reason !== undefined) { params.push(data.reschedule_reason); fields.push(`reschedule_reason    = $${params.length}`); }
+    if (data.reschedule_notes !== undefined) { params.push(data.reschedule_notes); fields.push(`reschedule_notes     = $${params.length}`); }
     // Customer & vehicle fields
-    if (data.customer_name   !== undefined) { params.push(data.customer_name);   fields.push(`customer_name   = $${params.length}`); }
-    if (data.mobile          !== undefined) { params.push(data.mobile);          fields.push(`mobile          = $${params.length}`); }
-    if (data.whatsapp        !== undefined) { params.push(data.whatsapp);        fields.push(`whatsapp        = $${params.length}`); }
+    if (data.customer_name !== undefined) { params.push(data.customer_name); fields.push(`customer_name   = $${params.length}`); }
+    if (data.mobile !== undefined) { params.push(data.mobile); fields.push(`mobile          = $${params.length}`); }
+    if (data.whatsapp !== undefined) { params.push(data.whatsapp); fields.push(`whatsapp        = $${params.length}`); }
     if (data.vehicle_type_id !== undefined) { params.push(data.vehicle_type_id); fields.push(`vehicle_type_id = $${params.length}`); }
-    if (data.make_id         !== undefined) { params.push(data.make_id);         fields.push(`make_id         = $${params.length}`); }
-    if (data.model_id        !== undefined) { params.push(data.model_id);        fields.push(`model_id        = $${params.length}`); }
-    if (data.body_type_id    !== undefined) { params.push(data.body_type_id);    fields.push(`body_type_id    = $${params.length}`); }
-    if (data.cc_category_id  !== undefined) { params.push(data.cc_category_id);  fields.push(`cc_category_id  = $${params.length}`); }
-    if (data.segment_ids     !== undefined) { params.push(data.segment_ids);     fields.push(`segment_ids     = $${params.length}`); }
+    if (data.make_id !== undefined) { params.push(data.make_id); fields.push(`make_id         = $${params.length}`); }
+    if (data.model_id !== undefined) { params.push(data.model_id); fields.push(`model_id        = $${params.length}`); }
+    if (data.body_type_id !== undefined) { params.push(data.body_type_id); fields.push(`body_type_id    = $${params.length}`); }
+    if (data.cc_category_id !== undefined) { params.push(data.cc_category_id); fields.push(`cc_category_id  = $${params.length}`); }
+    if (data.segment_ids !== undefined) { params.push(data.segment_ids); fields.push(`segment_ids     = $${params.length}`); }
 
     // When date/time is changing, capture the original values + who rescheduled + when
     const isRescheduling = data.scheduled_date !== undefined || data.scheduled_time !== undefined;
@@ -691,21 +703,29 @@ function updateAppointment(req, res, next) {
           ? new Date(orig.rows[0].scheduled_date).toISOString().slice(0, 10)
           : null;
         const origTime = orig.rows[0].scheduled_time || null;
-        params.push(origDate);      fields.push(`original_scheduled_date = $${params.length}`);
-        params.push(origTime);      fields.push(`original_scheduled_time = $${params.length}`);
-        params.push(req.user.id);   fields.push(`rescheduled_by          = $${params.length}`);
-        params.push(new Date());    fields.push(`rescheduled_at          = $${params.length}`);
+        params.push(origDate); fields.push(`original_scheduled_date = $${params.length}`);
+        params.push(origTime); fields.push(`original_scheduled_time = $${params.length}`);
+        params.push(req.user.id); fields.push(`rescheduled_by          = $${params.length}`);
+        params.push(new Date()); fields.push(`rescheduled_at          = $${params.length}`);
       }
     }
 
     // Auto-set status to "rescheduled" when date or time is changed (and caller didn't explicitly set a status)
     if (isRescheduling && data.status_id === undefined) {
-      const rescRow = await pool.query(
-        `SELECT id FROM appointment_statuses WHERE slug = 'rescheduled' LIMIT 1`
+      const currentAppt = await pool.query(
+        `SELECT s.slug FROM appointments a
+         LEFT JOIN appointment_statuses s ON s.id = a.status_id
+         WHERE a.id = $1`, [id]
       );
-      if (rescRow.rows[0]) {
-        params.push(rescRow.rows[0].id);
-        fields.push(`status_id = $${params.length}`);
+      const currentSlug = currentAppt.rows[0]?.slug;
+      if (!currentSlug || ['scheduled', 'rescheduled'].includes(currentSlug)) {
+        const rescRow = await pool.query(
+          `SELECT id FROM appointment_statuses WHERE slug = 'rescheduled' LIMIT 1`
+        );
+        if (rescRow.rows[0]) {
+          params.push(rescRow.rows[0].id);
+          fields.push(`status_id = $${params.length}`);
+        }
       }
     }
 
@@ -723,11 +743,11 @@ function updateAppointment(req, res, next) {
         [id]
       );
       if (cur.rows[0]) {
-        const effectiveHub  = data.hub_id          ?? cur.rows[0].hub_id;
-        const effectiveDate = data.scheduled_date  ?? (cur.rows[0].scheduled_date
+        const effectiveHub = data.hub_id ?? cur.rows[0].hub_id;
+        const effectiveDate = data.scheduled_date ?? (cur.rows[0].scheduled_date
           ? new Date(cur.rows[0].scheduled_date).toISOString().slice(0, 10)
           : null);
-        const effectiveTime = data.scheduled_time  ?? cur.rows[0].scheduled_time;
+        const effectiveTime = data.scheduled_time ?? cur.rows[0].scheduled_time;
 
         const hubErr = await checkHubSchedule(effectiveHub, effectiveDate, effectiveTime);
         if (hubErr) return res.status(hubErr.status).json({ error: hubErr.error, code: hubErr.code });
@@ -823,7 +843,7 @@ async function markVehiclePicked(req, res, next) {
     if (await checkIsTerminal(id)) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
     }
-    const r  = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
+    const r = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     if (!r.rows[0].pickup_required) {
       return res.status(400).json({ error: 'This appointment does not have pickup enabled' });
@@ -841,7 +861,7 @@ async function markAtWorkshop(req, res, next) {
     if (await checkIsTerminal(id)) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
     }
-    const r  = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
+    const r = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     if (!r.rows[0].pickup_required) {
       return res.status(400).json({ error: 'This appointment does not have pickup enabled' });

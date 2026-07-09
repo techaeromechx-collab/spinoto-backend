@@ -1253,4 +1253,64 @@ function exportPayouts(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };
+async function rejectPurchaseInvoiceApproval(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+
+    const r = await pool.query(
+      `SELECT pi.status,
+              (SELECT COUNT(*)::int FROM hub_payments WHERE purchase_invoice_id = pi.id) AS payment_count
+       FROM purchase_invoices pi
+       WHERE pi.id = $1`,
+      [id]
+    );
+
+    if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    const pi = r.rows[0];
+
+    if (pi.status !== 'approved') {
+      return res.status(400).json({ error: `Only approved purchase invoices can have their approvals rejected. Current status: '${pi.status}'.` });
+    }
+
+    if (pi.payment_count > 0) {
+      return res.status(400).json({ error: 'Cannot reject approval of a purchase invoice that has payments registered against it.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      await client.query(
+        `DELETE FROM pi_payment_schedule WHERE purchase_invoice_id = $1`,
+        [id]
+      );
+
+      await client.query(
+        `UPDATE purchase_invoices
+         SET status = 'pending_approval',
+             approved_by = NULL,
+             approved_at = NULL,
+             payout_due_date = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+         [id]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    full.rows[0].items         = await _getItems(id);
+    full.rows[0].hub_payments  = await _getHubPayments(id);
+    full.rows[0].schedule      = await _getPaymentSchedule(id);
+
+    res.json({ item: full.rows[0] });
+  });
+}
+
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };

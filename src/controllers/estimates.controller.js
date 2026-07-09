@@ -798,9 +798,10 @@ function customerApproval(req, res, next) {
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
-    if (cur.rows[0].status !== 'sent_to_customer') {
+    const allowedStatuses = ['sent_to_customer', 'partially_approved', 'fully_approved', 'work_in_progress'];
+    if (!allowedStatuses.includes(cur.rows[0].status)) {
       return res.status(409).json({
-        error: `Customer approvals can only be recorded when status is 'sent_to_customer'. Current status: '${cur.rows[0].status}'.`,
+        error: `Customer approvals can only be recorded when status is one of: ${allowedStatuses.join(', ')}. Current status: '${cur.rows[0].status}'.`,
       });
     }
 
@@ -837,8 +838,11 @@ function customerApproval(req, res, next) {
 
       const { total, approved_count, rejected_count } = itemStats.rows[0];
 
+      const currentStatus = cur.rows[0].status;
       let newStatus;
-      if (approved_count === total) {
+      if (['work_in_progress', 'work_completed'].includes(currentStatus)) {
+        newStatus = currentStatus;
+      } else if (approved_count === total) {
         newStatus = 'fully_approved';
       } else if (approved_count > 0) {
         newStatus = 'partially_approved';
