@@ -6,24 +6,64 @@
 //
 // Rule: a PI's payout has no due date until its linked CI is fully paid. The
 // moment the CI reaches 'paid' (amount_paid >= grand_total), the due date
-// becomes the next Tuesday on/after that payment's date. If a payment is
+// becomes the next Tuesday on/after that payment's date — but only if that
+// Tuesday is at least 2 days away. If the payment falls the day before
+// Tuesday (Monday) or on Tuesday itself, that's too tight a turnaround, so
+// it skips ahead to the following week's Tuesday instead. If a payment is
 // later deleted and the CI drops back below 'paid', the due date is cleared
 // again — it always reflects the CI's *current* paid state, not history.
 //
-// Call syncPayoutDueDate() any time either side of the PI↔CI pair changes:
-//   - purchase_invoices.controller.js  → right after a PI is approved
-//     (handles the CI-already-paid-before-approval edge case)
-//   - customer_invoices.controller.js  → after every CI payment add/delete
-//     (via _recalcStatus)
+// All date math below works in IST (UTC+5:30) calendar days, using only
+// UTC-field Date methods throughout — never local-time methods (getDay(),
+// setDate(), a bare toISOString() after local mutation) mixed together.
+// That mix is a classic bug: on a server running in a positive-UTC-offset
+// timezone (IST included), local midnight of day X is UTC time on day X-1,
+// so toISOString() silently returns the wrong calendar day. Confirmed this
+// was happening here (every computed date was one day early) and fixed it.
 
-// Returns YYYY-MM-DD for the next Tuesday on/after `date`. If `date` already
-// falls on a Tuesday, that same day is returned (0-day roll).
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // UTC+5:30, India has no DST
+
+// Converts any timestamp/date input into a Date whose UTC fields
+// (getUTCFullYear/getUTCMonth/getUTCDate/getUTCDay) represent IST wall-clock
+// calendar values — independent of the server process's own local timezone.
+function toIstFields(input) {
+  return new Date(new Date(input).getTime() + IST_OFFSET_MS);
+}
+
+// Formats a Date's UTC fields as YYYY-MM-DD. Only call this on a Date coming
+// from toIstFields() (or built with Date.UTC()) — never on a plain local Date.
+function ymd(d) {
+  const y   = d.getUTCFullYear();
+  const m   = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Returns YYYY-MM-DD for the payout due date given a payment date/timestamp:
+// the next Tuesday (IST calendar) on/after it, unless that Tuesday is less
+// than 2 days away (payment on Monday, or on Tuesday itself) — in which case
+// it rolls forward to the Tuesday of the following week instead.
+//
+//   Mon 5 Jan → Tue 6 Jan is only 1 day away        → too close → Tue 13 Jan
+//   Tue 6 Jan → Tue 6 Jan is 0 days away (same day)  → too close → Tue 13 Jan
+//   Wed 7 Jan → Tue 13 Jan is 6 days away            → far enough → Tue 13 Jan
 function nextTuesday(date) {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  const day = d.getDay(); // 0=Sun .. 6=Sat, Tuesday=2
-  d.setDate(d.getDate() + ((2 - day + 7) % 7));
-  return d.toISOString().split('T')[0];
+  const d = toIstFields(date);
+  const day = d.getUTCDay(); // 0=Sun .. 6=Sat, Tuesday=2 (IST day-of-week)
+  let diff = (2 - day + 7) % 7; // days until the nearest Tuesday (0-6)
+  if (diff < 2) diff += 7;      // too close (same day or next day) — push a week out
+  d.setUTCDate(d.getUTCDate() + diff);
+  return ymd(d);
+}
+
+// Adds `days` to a YYYY-MM-DD string as pure calendar-date arithmetic — the
+// string has no time-of-day or timezone to begin with, so this never touches
+// local time at all.
+function addDays(dateStr, days) {
+  const [y, m, day] = dateStr.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1, day));
+  d.setUTCDate(d.getUTCDate() + days);
+  return ymd(d);
 }
 
 // Resolves the PI↔CI pair from whichever id is known, then sets/clears
@@ -72,12 +112,7 @@ async function syncPayoutDueDate(client, { purchaseInvoiceId = null, customerInv
     );
     let lastDueDate = null;
     for (let i = 0; i < schedRes.rows.length; i++) {
-      let dueDate = null;
-      if (anchor) {
-        const d = new Date(anchor + 'T00:00:00');
-        d.setDate(d.getDate() + i * 7);
-        dueDate = d.toISOString().split('T')[0];
-      }
+      const dueDate = anchor ? addDays(anchor, i * 7) : null;
       lastDueDate = dueDate;
       await client.query(
         `UPDATE pi_payment_schedule SET due_date=$1, updated_at=NOW() WHERE id=$2`,

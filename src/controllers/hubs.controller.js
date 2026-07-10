@@ -6,6 +6,7 @@
 
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { baseHubCode, resolveUniqueCode } = require('../utils/hubCode');
 
 // ─── Validators ────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,7 @@ function hubVcToSvcVc(hubVc) {
 const HUB_SELECT = `
   SELECT
     h.id,
+    h.hub_code,
     h.hub_name,
     h.company_name,
     h.person_name,
@@ -163,6 +165,7 @@ const HUB_SELECT = `
 const HUB_SELECT_LIST = `
   SELECT
     h.id,
+    h.hub_code,
     h.hub_name,
     h.company_name,
     h.person_name,
@@ -317,10 +320,16 @@ function createHub(req, res, next) {
     const hasGst    = data.has_gst ?? false;
     const gstNumber = hasGst ? (data.gst_number || null) : null;
 
+    // Human-readable hub code — generated once, frozen forever. See
+    // utils/hubCode.js for the initials/padding/collision-resolution rule.
+    const existingCodesRes = await pool.query(`SELECT hub_code FROM hubs WHERE hub_code IS NOT NULL`);
+    const existingCodes = new Set(existingCodesRes.rows.map(r => r.hub_code));
+    const hubCode = resolveUniqueCode(baseHubCode(data.hub_name), existingCodes);
+
     // New hubs always start pending + inactive — must be verified before activation
     const r = await pool.query(
       `INSERT INTO hubs
-         (hub_name, person_name, contact_number, owner_name, owner_mobile,
+         (hub_name, hub_code, person_name, contact_number, owner_name, owner_mobile,
           state_id, city_id, area_id, rm_user_id, vehicle_class,
           is_active, notes, open_time, close_time, working_days,
           has_gst, gst_number, tech_rate_service, tech_rate_parts,
@@ -328,10 +337,10 @@ function createHub(req, res, next) {
           bank_account_number, bank_ifsc, bank_name, account_holder_name,
           vehicle_capacity, workshop_area_sqft, no_of_mechanics,
           company_name, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
        RETURNING id`,
       [
-        data.hub_name, data.person_name, data.contact_number,
+        data.hub_name, hubCode, data.person_name, data.contact_number,
         data.owner_name   || null, data.owner_mobile  || null,
         data.state_id, data.city_id, data.area_id, data.rm_user_id,
         data.vehicle_class, false, data.notes || null, // is_active always false on creation — must verify first

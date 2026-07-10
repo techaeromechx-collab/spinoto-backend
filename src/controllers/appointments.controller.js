@@ -14,6 +14,7 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
 const { logActivity } = require('../services/activityLog.service');
+const { generateAppointmentCode } = require('../utils/appointmentCode');
 
 // ─── Hub schedule validator ───────────────────────────────────────────────────
 // Returns { status, code, error } if the scheduled slot violates hub hours/days,
@@ -194,6 +195,7 @@ function handle(req, res, next, fn) {
 const APPT_SELECT = `
   SELECT
     a.id,
+    a.appointment_code,
     a.lead_id,
     a.customer_name,
     a.mobile,
@@ -399,6 +401,19 @@ function createAppointment(req, res, next) {
            VALUES ($1, $2, $3, $4)`,
           [apptId, svc.service_id, svc.category_id || null, svc.price]
         );
+      }
+
+      // Human-readable appointment code — only possible once a hub is known.
+      // Generated once here (or later in updateAppointment, if no hub is set
+      // yet at creation time) and frozen forever after that — see
+      // utils/appointmentCode.js.
+      if (data.hub_id) {
+        const hubRow = await client.query(`SELECT hub_code FROM hubs WHERE id = $1`, [data.hub_id]);
+        const hubCode = hubRow.rows[0]?.hub_code;
+        if (hubCode) {
+          const code = await generateAppointmentCode(client, { hubId: data.hub_id, hubCode });
+          await client.query(`UPDATE appointments SET appointment_code = $1 WHERE id = $2`, [code, apptId]);
+        }
       }
 
       // Auto-update lead status + log activity when appointment is created from a lead
@@ -782,6 +797,25 @@ function updateAppointment(req, res, next) {
         if (!exists.rows[0]) {
           await client.query('ROLLBACK');
           return res.status(404).json({ error: 'Appointment not found' });
+        }
+      }
+
+      // If a hub is being set on this appointment and it never got an
+      // appointment_code (it had no hub at creation time), generate one now
+      // — anchored to today's date, not the appointment's original creation
+      // date. Once set, this never runs again for this appointment, even if
+      // the hub is later changed again — see utils/appointmentCode.js.
+      if (data.hub_id !== undefined && data.hub_id) {
+        const cur = await client.query(
+          `SELECT appointment_code FROM appointments WHERE id = $1`, [id]
+        );
+        if (cur.rows[0] && !cur.rows[0].appointment_code) {
+          const hubRow = await client.query(`SELECT hub_code FROM hubs WHERE id = $1`, [data.hub_id]);
+          const hubCode = hubRow.rows[0]?.hub_code;
+          if (hubCode) {
+            const code = await generateAppointmentCode(client, { hubId: data.hub_id, hubCode });
+            await client.query(`UPDATE appointments SET appointment_code = $1 WHERE id = $2`, [code, id]);
+          }
         }
       }
 
