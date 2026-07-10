@@ -3,6 +3,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -106,6 +107,12 @@ async function _recalcStatus(client, ciId) {
     `UPDATE customer_invoices SET amount_paid=$1, status=$2, updated_at=NOW() WHERE id=$3`,
     [amtPaid.toFixed(2), status, ciId]
   );
+
+  // Hub payout due date is anchored to this CI's payment, not PI approval —
+  // resync on every payment add/delete. Handles both directions: reaching
+  // 'paid' sets the due date (next Tuesday after last payment), dropping back
+  // below 'paid' clears it again. See utils/payoutSchedule.js.
+  await syncPayoutDueDate(client, { customerInvoiceId: ciId });
 
   return { status, appointment_id };
 }

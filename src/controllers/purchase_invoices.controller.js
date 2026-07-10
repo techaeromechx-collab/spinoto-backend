@@ -3,6 +3,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -87,12 +88,6 @@ async function _getPaymentSchedule(purchaseInvoiceId) {
     [purchaseInvoiceId]
   );
   return r.rows;
-}
-
-// Returns cycle days from hub payout terms
-function _payoutCycleDays(terms, customDays) {
-  const map = { weekly: 7, fortnightly: 14, net_30: 30, net_60: 60, net_90: 90, net_180: 180, net_365: 365 };
-  return map[terms] || customDays || 30;
 }
 
 async function _recalcHubPaymentStatus(client, purchaseInvoiceId) {
@@ -351,9 +346,8 @@ function approvePurchaseInvoice(req, res, next) {
 
     const r = await pool.query(
       `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id, pi.rate_mode,
-              pi.created_at, h.payout_terms, h.payout_cycle_days
+              pi.created_at
        FROM purchase_invoices pi
-       JOIN hubs h ON h.id = pi.hub_id
        WHERE pi.id = $1`,
       [id]
     );
@@ -364,12 +358,10 @@ function approvePurchaseInvoice(req, res, next) {
       return res.status(400).json({ error: `Invoice is already ${pi.status}` });
     }
 
-    // Calculate payout due date from hub's payout terms
-    const cycleDays = _payoutCycleDays(pi.payout_terms, pi.payout_cycle_days);
-    // payout_due_date = today + cycleDays
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + cycleDays);
-    const dueDateStr = dueDate.toISOString().split('T')[0];
+    // payout_due_date is NOT set here anymore — it's driven by the linked CI's
+    // payment (next Tuesday after the customer pays in full), not approval
+    // date. Stays NULL until syncPayoutDueDate() fills it in below or later
+    // from customer_invoices._recalcStatus(). See utils/payoutSchedule.js.
 
     const client = await pool.connect();
     try {
@@ -438,32 +430,36 @@ function approvePurchaseInvoice(req, res, next) {
       await client.query(
         `UPDATE purchase_invoices
          SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW(),
-             payout_due_date=$2, payout_schedule=$3
-         WHERE id=$4`,
-        [req.user?.id || null, dueDateStr, payout_schedule, id]
+             payout_due_date=NULL, payout_schedule=$2
+         WHERE id=$3`,
+        [req.user?.id || null, payout_schedule, id]
       );
 
-      // If split: create 3 equal installments (1/3 each, spaced evenly)
+      // If split: create 3 equal installments (1/3 each). due_date starts
+      // NULL — filled in once the linked CI is fully paid (see below).
       if (payout_schedule === 'split') {
         const total      = parseFloat(pi.grand_total);
         const perInstall = roundFn(total / 3);
         // Adjust last installment for rounding difference
         const installments = [
-          { no: 1, amount: perInstall, days: Math.round(cycleDays * 0.33) },
-          { no: 2, amount: perInstall, days: Math.round(cycleDays * 0.66) },
-          { no: 3, amount: roundFn(total - perInstall * 2), days: cycleDays },
+          { no: 1, amount: perInstall },
+          { no: 2, amount: perInstall },
+          { no: 3, amount: roundFn(total - perInstall * 2) },
         ];
         for (const inst of installments) {
-          const d = new Date();
-          d.setDate(d.getDate() + inst.days);
           await client.query(
             `INSERT INTO pi_payment_schedule
                (purchase_invoice_id, installment_no, amount_due, due_date)
-             VALUES ($1, $2, $3, $4)`,
-            [id, inst.no, inst.amount, d.toISOString().split('T')[0]]
+             VALUES ($1, $2, $3, NULL)`,
+            [id, inst.no, inst.amount]
           );
         }
       }
+
+      // Covers the case where the customer already fully paid the CI before
+      // this PI got approved — sets the due date immediately instead of
+      // waiting for a CI payment event that already happened.
+      await syncPayoutDueDate(client, { purchaseInvoiceId: id });
 
       await client.query('COMMIT');
     } catch (err) {
@@ -947,8 +943,11 @@ function listPayouts(req, res, next) {
          h.hub_name, h.payout_terms,
          COALESCE(a.customer_name, e.customer_name)   AS customer_name,
          COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
+         (SELECT ci.id FROM customer_invoices ci
+          WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id
+          LIMIT 1) AS customer_invoice_id,
          CASE
-           WHEN pi.payout_due_date IS NULL                                                         THEN 'upcoming'
+           WHEN pi.payout_due_date IS NULL                                                         THEN 'awaiting_payment'
            WHEN pi.payout_due_date <  $1::date                                                     THEN 'overdue'
            WHEN pi.payout_due_date =  $1::date                                                     THEN 'due_today'
            WHEN pi.payout_due_date <= ($1::date + INTERVAL '7 days')                               THEN 'due_this_week'
@@ -980,10 +979,10 @@ function listPayouts(req, res, next) {
     }
 
     // Bucket the results
-    const buckets = { overdue: [], due_today: [], due_this_week: [], due_this_month: [], upcoming: [] };
+    const buckets = { overdue: [], due_today: [], due_this_week: [], due_this_month: [], upcoming: [], awaiting_payment: [] };
     for (const pi of r.rows) {
       if (pi.payout_schedule === 'split') pi.schedule = scheduleMap[pi.id] || [];
-      const bucket = pi.urgency || 'upcoming';
+      const bucket = pi.urgency || 'awaiting_payment';
       if (buckets[bucket]) buckets[bucket].push(pi);
     }
 

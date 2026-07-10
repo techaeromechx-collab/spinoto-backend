@@ -18,7 +18,6 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
-const { isValidGSTIN } = require('../utils/gst');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -41,8 +40,10 @@ const itemSchema = z.object({
 });
 
 // Shared B2B fields, validated the same way on create and update: when
-// is_b2b is true, company name / GST number / address are all required and
-// the GST number must be a structurally + checksum-valid GSTIN.
+// is_b2b is true, company name / GST number / address are all required.
+// GST number just needs to be present — format/checksum (GSTIN) validation
+// was intentionally removed per user request; any text up to 15 chars is
+// accepted (15-char cap is a DB column limit, not a format check).
 const b2bFieldsRefine = (data, ctx) => {
   if (!data.is_b2b) return;
   if (!data.b2b_company_name || !data.b2b_company_name.trim()) {
@@ -51,8 +52,8 @@ const b2bFieldsRefine = (data, ctx) => {
   if (!data.b2b_address || !data.b2b_address.trim()) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_address'], message: 'Address is required for a B2B invoice.' });
   }
-  if (!data.b2b_gst_number || !isValidGSTIN(data.b2b_gst_number)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_gst_number'], message: 'A valid 15-character GSTIN is required for a B2B invoice.' });
+  if (!data.b2b_gst_number || !data.b2b_gst_number.trim()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['b2b_gst_number'], message: 'GST number is required for a B2B invoice.' });
   }
 };
 

@@ -13,7 +13,6 @@
  */
 
 const { pool } = require('../config/db');
-const { isValidGSTIN } = require('../utils/gst');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -720,8 +719,9 @@ function updateCustomer(req, res, next) {
       is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
     } = req.body;
 
-    // Validate B2B fields the same way estimates do — required + checksum-valid
-    // GSTIN whenever is_b2b is being turned on.
+    // Validate B2B fields the same way estimates do — required whenever is_b2b
+    // is being turned on. GST number format/checksum validation was
+    // intentionally removed per user request; any non-empty value is accepted.
     const isB2b = !!is_b2b;
     if (isB2b) {
       if (!b2b_company_name || !b2b_company_name.trim()) {
@@ -730,8 +730,8 @@ function updateCustomer(req, res, next) {
       if (!b2b_address || !b2b_address.trim()) {
         return res.status(400).json({ error: 'Address is required for a B2B customer.' });
       }
-      if (!b2b_gst_number || !isValidGSTIN(b2b_gst_number)) {
-        return res.status(400).json({ error: 'A valid 15-character GSTIN is required for a B2B customer.' });
+      if (!b2b_gst_number || !b2b_gst_number.trim()) {
+        return res.status(400).json({ error: 'GST number is required for a B2B customer.' });
       }
     }
 
