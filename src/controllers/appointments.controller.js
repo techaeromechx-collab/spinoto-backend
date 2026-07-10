@@ -464,6 +464,7 @@ function listAppointments(req, res, next) {
     const search = (req.query.search || '').trim();
     const statusId = req.query.status_id || '';
     const hubId = req.query.hub_id || '';
+    const hubIds = req.query.hub_ids || '';
     const vehicleType = req.query.vehicle_type_id || '';
     const dateFrom = req.query.date_from || '';
     const dateTo = req.query.date_to || '';
@@ -499,7 +500,13 @@ function listAppointments(req, res, next) {
           OR LOWER(COALESCE(a.vehicle_number,'')) LIKE $${n})`
       );
     }
-    if (hubId) {
+    if (hubIds) {
+      const ids = hubIds.split(',').map(Number).filter(n => !isNaN(n));
+      if (ids.length > 0) {
+        params.push(ids);
+        conditions.push(`a.hub_id = ANY($${params.length}::int[])`);
+      }
+    } else if (hubId) {
       params.push(Number(hubId));
       conditions.push(`a.hub_id = $${params.length}`);
     }
