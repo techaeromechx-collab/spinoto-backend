@@ -1,7 +1,7 @@
 'use strict';
 
-// Appointment code format: {hub_code}_APT_{MM}-{YY}_{00001}
-//   e.g. QAH_APT_07-26_00001
+// Appointment code format: {hub_code}_APT_{MMYY}_{001}
+//   e.g. QAH_APT_0726_001
 //
 // The trailing number resets to 1 at the start of every calendar month, and
 // is tracked independently per hub (hub_appointment_sequences table) — two
@@ -43,8 +43,8 @@ async function nextSequence(client, hubId, year, month) {
 function buildAppointmentCode(hubCode, year, month, seq) {
   const mm  = String(month).padStart(2, '0');
   const yy  = String(year).slice(-2);
-  const num = String(seq).padStart(5, '0');
-  return `${hubCode}_APT_${mm}-${yy}_${num}`;
+  const num = String(seq).padStart(3, '0'); // rolls to 4+ digits gracefully past 999
+  return `${hubCode}_APT_${mm}${yy}_${num}`;
 }
 
 // Claims the next sequence number for this hub/month and returns the full
