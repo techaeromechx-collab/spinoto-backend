@@ -198,6 +198,7 @@ function getCustomer(req, res, next) {
           a.id, a.lead_id, a.customer_name, a.mobile, a.whatsapp,
           a.vehicle_number, a.scheduled_date, a.scheduled_time,
           a.total_price, a.notes, a.cancellation_reason, a.created_at, a.updated_at,
+          a.vehicle_type_id, a.make_id, a.model_id,
           ast.name     AS status_name,
           ast.color    AS status_color,
           ast.bg_color AS status_bg,
@@ -268,6 +269,7 @@ function getCustomer(req, res, next) {
         SELECT
           e.id, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
           e.customer_name, e.mobile, e.whatsapp, e.vehicle_number,
+          e.vehicle_type_id, e.make_id, e.model_id,
           h.hub_name,
           vt.name AS vehicle_type_name,
           mk.name AS make_name,
@@ -405,8 +407,11 @@ function getCustomer(req, res, next) {
         vehicleMap.set(key, {
           cv_id:             null,
           vehicle_number:    a.vehicle_number,
+          vehicle_type_id:   a.vehicle_type_id || null,
           vehicle_type_name: a.vehicle_type_name,
+          make_id:           a.make_id || null,
           make_name:         a.make_name,
+          model_id:          a.model_id || null,
           model_name:        a.model_name,
           segment_name:      a.segment_name   || null,
           body_type_name:    a.body_type_name || null,
@@ -421,8 +426,11 @@ function getCustomer(req, res, next) {
         const entry = vehicleMap.get(key);
         entry.visit_count++;
         // Fill missing details from appointment
+        if (!entry.vehicle_type_id)   entry.vehicle_type_id   = a.vehicle_type_id || null;
         if (!entry.vehicle_type_name) entry.vehicle_type_name = a.vehicle_type_name;
+        if (!entry.make_id)           entry.make_id           = a.make_id || null;
         if (!entry.make_name)         entry.make_name         = a.make_name;
+        if (!entry.model_id)          entry.model_id          = a.model_id || null;
         if (!entry.model_name)        entry.model_name        = a.model_name;
         if (!entry.segment_name)      entry.segment_name      = a.segment_name   || null;
         if (!entry.body_type_name)    entry.body_type_name    = a.body_type_name || null;
@@ -455,8 +463,11 @@ function getCustomer(req, res, next) {
         vehicleMap.set(key, {
           cv_id:             null,
           vehicle_number:    e.vehicle_number,
+          vehicle_type_id:   e.vehicle_type_id || null,
           vehicle_type_name: e.vehicle_type_name,
+          make_id:           e.make_id || null,
           make_name:         e.make_name,
+          model_id:          e.model_id || null,
           model_name:        e.model_name,
           body_type_name:    e.body_type_name || null,
           color:             null, year: null, notes: null,
@@ -467,8 +478,11 @@ function getCustomer(req, res, next) {
       } else {
         const entry = vehicleMap.get(key);
         entry.visit_count++;
+        if (!entry.vehicle_type_id)   entry.vehicle_type_id   = e.vehicle_type_id || null;
         if (!entry.vehicle_type_name) entry.vehicle_type_name = e.vehicle_type_name;
+        if (!entry.make_id)           entry.make_id           = e.make_id || null;
         if (!entry.make_name)         entry.make_name         = e.make_name;
+        if (!entry.model_id)          entry.model_id          = e.model_id || null;
         if (!entry.model_name)        entry.model_name        = e.model_name;
       }
     }
@@ -646,34 +660,84 @@ function addCustomerVehicle(req, res, next) {
 function updateCustomerVehicle(req, res, next) {
   handle(req, res, next, async () => {
     const { mobile, id } = req.params;
-    const { vehicle_type_id, make_id, model_id, color, year, notes } = req.body;
+    const {
+      vehicle_type_id, make_id, model_id, color, year, notes,
+      vehicle_number, propagate_vehicle_number,
+    } = req.body;
 
     const existing = await pool.query(
-      `SELECT id FROM customer_vehicles WHERE id = $1 AND mobile = $2`,
+      `SELECT id, vehicle_number FROM customer_vehicles WHERE id = $1 AND mobile = $2`,
       [parseInt(id, 10), mobile]
     );
     if (!existing.rows[0]) return res.status(404).json({ error: 'Vehicle not found' });
 
-    await pool.query(
-      `UPDATE customer_vehicles SET
-         vehicle_type_id = $1,
-         make_id         = $2,
-         model_id        = $3,
-         color           = $4,
-         year            = $5,
-         notes           = $6
-       WHERE id = $7 AND mobile = $8`,
-      [
-        vehicle_type_id || null,
-        make_id         || null,
-        model_id        || null,
-        color           || null,
-        year ? parseInt(year, 10) : null,
-        notes           || null,
-        parseInt(id, 10),
-        mobile,
-      ]
-    );
+    const oldPlate = existing.rows[0].vehicle_number;
+    const newPlate = vehicle_number?.trim() ? vehicle_number.trim().toUpperCase() : oldPlate;
+    const plateChanged = newPlate !== oldPlate;
+
+    if (plateChanged) {
+      const dupe = await pool.query(
+        `SELECT id FROM customer_vehicles WHERE mobile = $1 AND vehicle_number = $2 AND id <> $3`,
+        [mobile, newPlate, parseInt(id, 10)]
+      );
+      if (dupe.rows[0]) {
+        return res.status(409).json({ error: `Vehicle ${newPlate} is already registered for this customer.` });
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      await client.query(
+        `UPDATE customer_vehicles SET
+           vehicle_type_id = $1,
+           make_id         = $2,
+           model_id        = $3,
+           color           = $4,
+           year            = $5,
+           notes           = $6,
+           vehicle_number  = $7
+         WHERE id = $8 AND mobile = $9`,
+        [
+          vehicle_type_id || null,
+          make_id         || null,
+          model_id        || null,
+          color           || null,
+          year ? parseInt(year, 10) : null,
+          notes           || null,
+          newPlate,
+          parseInt(id, 10),
+          mobile,
+        ]
+      );
+
+      // Optional cascade: propagate a corrected plate number onto this
+      // customer's past appointments/estimates/invoices. Purchase invoices
+      // don't store their own vehicle_number — they inherit it live via
+      // their linked estimate/appointment — so nothing to update there.
+      if (plateChanged && propagate_vehicle_number) {
+        await client.query(
+          `UPDATE appointments SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+          [newPlate, mobile, oldPlate]
+        );
+        await client.query(
+          `UPDATE estimates SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+          [newPlate, mobile, oldPlate]
+        );
+        await client.query(
+          `UPDATE customer_invoices SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+          [newPlate, mobile, oldPlate]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     const full = await pool.query(`
       SELECT cv.id, cv.mobile, cv.vehicle_number, cv.color, cv.year, cv.notes, cv.created_at,
@@ -693,6 +757,34 @@ function updateCustomerVehicle(req, res, next) {
     `, [parseInt(id, 10)]);
 
     res.json({ item: full.rows[0] });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customers/:mobile/vehicle-usage?number=PLATE — how many past
+// appointments/estimates/invoices reference this exact plate for this
+// customer. Used by the Edit Vehicle modal to show what a vehicle-number
+// correction would actually touch before offering to propagate it.
+// Purchase invoices don't store their own vehicle_number (they inherit it
+// live via their linked estimate/appointment), so nothing to count there.
+// ─────────────────────────────────────────────────────────────────────────────
+function getVehicleUsage(req, res, next) {
+  handle(req, res, next, async () => {
+    const mobile = req.params.mobile;
+    const plate  = (req.query.number || '').trim().toUpperCase();
+    if (!plate) return res.status(400).json({ error: 'number query param is required' });
+
+    const [apt, est, ci] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS c FROM appointments WHERE mobile = $1 AND vehicle_number = $2`, [mobile, plate]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM estimates WHERE mobile = $1 AND vehicle_number = $2`, [mobile, plate]),
+      pool.query(`SELECT COUNT(*)::int AS c FROM customer_invoices WHERE mobile = $1 AND vehicle_number = $2`, [mobile, plate]),
+    ]);
+
+    res.json({
+      appointments: apt.rows[0].c,
+      estimates:    est.rows[0].c,
+      invoices:     ci.rows[0].c,
+    });
   });
 }
 
@@ -804,20 +896,22 @@ function getCustomerTimeline(req, res, next) {
     const mobile = req.params.mobile;
 
     const [apptRes, estRes, piRes, ciRes, vehRes] = await Promise.all([
-      // Appointments
+      // Appointments — status is a status_id FK (not a slug string column),
+      // and hubs' name column is hub_name, not name. Same joins as the
+      // proven-working appointments query in getCustomer() above.
       pool.query(`
         SELECT
           a.id, a.scheduled_date AS event_date, a.created_at,
           'appointment' AS type,
-          COALESCE(aps.name, a.status) AS status,
-          aps.color AS status_color,
+          ast.name AS status,
+          ast.color AS status_color,
           a.vehicle_number,
           vt.name AS vehicle_type_name,
           mk.name AS make_name, md.name AS model_name,
-          h.name  AS hub_name,
+          h.hub_name AS hub_name,
           a.notes
         FROM appointments a
-        LEFT JOIN appointment_statuses aps ON aps.slug = a.status
+        LEFT JOIN appointment_statuses ast ON ast.id = a.status_id
         LEFT JOIN vehicle_types  vt  ON vt.id  = a.vehicle_type_id
         LEFT JOIN vehicle_makes  mk  ON mk.id  = a.make_id
         LEFT JOIN vehicle_models md  ON md.id  = a.model_id
@@ -836,7 +930,7 @@ function getCustomerTimeline(req, res, next) {
           NULL AS vehicle_number,
           NULL AS vehicle_type_name,
           NULL AS make_name, NULL AS model_name,
-          h.name AS hub_name,
+          h.hub_name AS hub_name,
           e.notes,
           e.grand_total AS amount
         FROM estimates e
@@ -845,31 +939,35 @@ function getCustomerTimeline(req, res, next) {
         ORDER BY e.created_at DESC
       `, [mobile]),
 
-      // Purchase invoices (sell invoices from hub side)
+      // Purchase invoices (sell invoices from hub side) — purchase_invoices
+      // has no invoice_date or mobile column; mobile is derived via the
+      // linked appointment/estimate, same pattern as purchase_invoices.controller.js.
       pool.query(`
         SELECT
-          pi.id, pi.invoice_date AS event_date, pi.created_at,
+          pi.id, pi.created_at AS event_date, pi.created_at,
           'purchase_invoice' AS type,
           pi.payment_status AS status,
           NULL AS status_color,
           NULL AS vehicle_number,
           NULL AS vehicle_type_name,
           NULL AS make_name, NULL AS model_name,
-          h.name AS hub_name,
+          h.hub_name AS hub_name,
           pi.notes,
           pi.grand_total AS amount
         FROM purchase_invoices pi
-        LEFT JOIN hubs h ON h.id = pi.hub_id
-        WHERE pi.mobile = $1
-        ORDER BY pi.invoice_date DESC, pi.created_at DESC
+        LEFT JOIN hubs         h       ON h.id       = pi.hub_id
+        LEFT JOIN appointments a       ON a.id       = pi.appointment_id
+        LEFT JOIN estimates    est_ctx ON est_ctx.id = pi.estimate_id
+        WHERE COALESCE(a.mobile, est_ctx.mobile) = $1
+        ORDER BY pi.created_at DESC
       `, [mobile]),
 
-      // Customer invoices
+      // Customer invoices — status lives in the `status` column, not payment_status.
       pool.query(`
         SELECT
           ci.id, ci.created_at AS event_date, ci.created_at,
           'customer_invoice' AS type,
-          ci.payment_status AS status,
+          ci.status AS status,
           NULL AS status_color,
           NULL AS vehicle_number,
           NULL AS vehicle_type_name,
@@ -920,5 +1018,5 @@ function getCustomerTimeline(req, res, next) {
 module.exports = {
   listCustomers, getCustomer, updateCustomer, deleteCustomer,
   listCustomerVehicles, addCustomerVehicle, updateCustomerVehicle, deleteCustomerVehicle,
-  getCustomerTimeline,
+  getCustomerTimeline, getVehicleUsage,
 };

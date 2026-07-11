@@ -16,6 +16,7 @@ router.get('/',        ...canView, ctrl.listCustomers);
 
 // Vehicle sub-routes — must be before /:mobile to avoid param clash
 router.get   ('/:mobile/timeline',     ...canView,        ctrl.getCustomerTimeline);
+router.get   ('/:mobile/vehicle-usage', ...canView,       ctrl.getVehicleUsage);
 router.get   ('/:mobile/vehicles',     ...canView,        ctrl.listCustomerVehicles);
 router.post  ('/:mobile/vehicles',     ...canAddVehicle,  ctrl.addCustomerVehicle);
 router.put   ('/:mobile/vehicles/:id', ...canEditVehicle, ctrl.updateCustomerVehicle);
