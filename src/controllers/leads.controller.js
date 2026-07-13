@@ -7,6 +7,7 @@ const {
 } = require('../services/smartAlerts.service');
 const { logActivity }  = require('../services/activityLog.service');
 const { sendPush }     = require('../utils/sendPush');
+const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 
 // ---------- validators ----------
 const leadSchema = z.object({
@@ -62,7 +63,7 @@ function handle(req, res, next, fn) {
 // Full SELECT fragment reused by list + get
 const LEAD_SELECT = `
   SELECT
-    l.id, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
+    l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
     l.priority, l.tags,
     l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
     s.name  AS state_name,  l.state_id,
@@ -146,7 +147,7 @@ function listLeads(req, res, next) {
     // Separate SELECT for list view — adds service/category subqueries in SELECT clause
     const LIST_SELECT = `
       SELECT
-        l.id, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
+        l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
         l.priority, l.tags,
         l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
         s.name  AS state_name,  l.state_id,
@@ -300,6 +301,22 @@ function getLead(req, res, next) {
     }
 
     res.json({ item: { ...lead, vehicle_in_master, cc_missing, engine_cc, cc_category_name, services: svcRows.rows, categories: catRows.rows } });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/leads/by-token/:token — resolves a public_token (used in
+// shareable /leads/:token URLs) to the underlying numeric id, then
+// delegates to the exact same logic as GET /api/leads/:id. Kept as a thin
+// wrapper rather than a refactor of getLead's internals, so the existing,
+// already-working permission-scoped SELECT logic is untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+function getLeadByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = await resolveTokenToId(pool, 'leads', req.params.token);
+    if (!id) return res.status(404).json({ error: 'Lead not found' });
+    req.params.id = String(id);
+    return getLead(req, res, next);
   });
 }
 
@@ -598,10 +615,10 @@ function createLead(req, res, next) {
           name, mobile, whatsapp, state_id, city_id, area_id,
           vehicle_type_id, make_id, model_id, body_type_id, segment_ids,
           lead_source, status, total_price, notes, created_by, assigned_to,
-          priority, tags
+          priority, tags, public_token
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-          $18, $19
+          $18, $19, $20
         ) RETURNING id`,
         [
           data.name, data.mobile, data.whatsapp || null,
@@ -610,7 +627,7 @@ function createLead(req, res, next) {
           data.body_type_id || null, data.segment_ids,
           data.lead_source || null, initialStatus, totalPrice, data.notes || null,
           userId, data.assigned_to || null,
-          data.priority || 'normal', data.tags || [],
+          data.priority || 'normal', data.tags || [], generatePublicToken(),
         ]
       );
 
@@ -1018,5 +1035,5 @@ async function checkMobile(req, res, next) {
 }
 
 module.exports = {
-  listLeads, getLead, createLead, updateLead, deleteLead, lookupPrice, exportLeads, getStageStats, bulkAssign, bulkDelete, checkMobile,
+  listLeads, getLead, getLeadByToken, createLead, updateLead, deleteLead, lookupPrice, exportLeads, getStageStats, bulkAssign, bulkDelete, checkMobile,
 };

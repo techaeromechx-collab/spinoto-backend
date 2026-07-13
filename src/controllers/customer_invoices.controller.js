@@ -4,6 +4,7 @@ const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
+const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -17,10 +18,11 @@ function handle(req, res, next, fn) {
 
 const CI_SELECT = `
   SELECT
-    ci.id, ci.purchase_invoice_id, ci.estimate_id, ci.appointment_id, ci.hub_id,
+    ci.id, ci.public_token, ci.purchase_invoice_id, ci.estimate_id, est_ctx.public_token AS estimate_token, ci.appointment_id, ci.hub_id,
     -- Fall back to appointment data if CI columns were stored as null
     COALESCE(ci.customer_name, a.customer_name) AS customer_name,
     COALESCE(ci.mobile,        a.mobile)        AS mobile,
+    (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(ci.mobile, a.mobile)) AS customer_token,
     COALESCE(ci.vehicle_number, a.vehicle_number) AS vehicle_number,
     ci.status, ci.subtotal_ex_gst, ci.total_gst, ci.grand_total, ci.amount_paid,
     ci.notes, ci.created_at, ci.updated_at,
@@ -31,6 +33,7 @@ const CI_SELECT = `
     (ci.grand_total - ci.amount_paid) AS balance,
     (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
+    (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_token,
 
     -- Vehicle details — from the linked appointment when present, otherwise
     -- (standalone estimate, no appointment) from the linked estimate's own
@@ -185,6 +188,20 @@ function getCustomerInvoice(req, res, next) {
     item.items    = await _getItems(id);
     item.payments = await _getPayments(id);
     res.json({ item });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customer-invoices/by-token/:token — resolves a public_token
+// (used in shareable /customer-invoices/:token URLs) to the numeric id,
+// then delegates to the exact same logic as GET /api/customer-invoices/:id.
+// ─────────────────────────────────────────────────────────────────────────────
+function getCustomerInvoiceByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = await resolveTokenToId(pool, 'customer_invoices', req.params.token);
+    if (!id) return res.status(404).json({ error: 'Customer invoice not found' });
+    req.params.id = String(id);
+    return getCustomerInvoice(req, res, next);
   });
 }
 
@@ -401,8 +418,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
             discount_mode, transaction_discount_type,
             transaction_discount_value, transaction_discount_amount,
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
-            notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
+            notes, public_token)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
@@ -417,6 +434,7 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           // copy, not kept in sync afterward (same pattern as customer_name/
           // mobile/vehicle_number above).
           est.notes || null,
+          generatePublicToken(),
         ]
       );
       const ciId = ciRow.rows[0].id;
@@ -680,4 +698,4 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
   });
 }
 
-module.exports = { listCustomerInvoices, getCustomerInvoice, addPayment, deletePayment, approveCustomerInvoice, updateCustomerInvoiceNotes, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };
+module.exports = { listCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken, addPayment, deletePayment, approveCustomerInvoice, updateCustomerInvoiceNotes, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };

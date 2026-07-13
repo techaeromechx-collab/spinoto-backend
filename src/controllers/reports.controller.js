@@ -491,7 +491,7 @@ async function getDashboardStats(req, res, next) {
 
       // Recent invoices — scoped via appointment → lead
       pool.query(
-        `SELECT ci.id,
+        `SELECT ci.id, ci.public_token,
                 COALESCE(ci.customer_name, a.customer_name) AS customer_name,
                 COALESCE(ci.mobile, a.mobile) AS mobile,
                 ci.grand_total AS total,

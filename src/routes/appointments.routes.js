@@ -15,6 +15,8 @@ router.get   ('/stats', ...canView,   ctrl.getStats);
 
 router.get   ('/',      ...canView,   ctrl.listAppointments);
 router.post  ('/',      ...canCreate, ctrl.createAppointment);
+// by-token — resolves a shareable-URL token; must be before /:id
+router.get   ('/by-token/:token', ...canView, ctrl.getAppointmentByToken);
 router.get   ('/:id',   ...canView,   ctrl.getAppointment);
 router.patch ('/:id',   ...canEdit,   ctrl.updateAppointment);
 

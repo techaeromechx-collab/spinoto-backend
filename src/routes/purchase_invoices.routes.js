@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
-const { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
+const { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
 const router = express.Router();
 
 const canView     = requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS', 'VIEW_INVOICE', 'VIEW_PURCHASE_INVOICE');   // hub users: VIEW_INVOICE (or no perms = open)
@@ -18,6 +18,8 @@ router.get('/tech-rate-summary', canView,    getTechRateSummary);
 router.get('/export-payouts',    canView,    exportPayouts);
 router.post('/bulk-payment',     canPayment, bulkPayment);
 router.post('/generate',     canGenerate, generatePurchaseInvoice);
+// by-token — resolves a shareable-URL token; must be before /:id
+router.get('/by-token/:token', canView,   getPurchaseInvoiceByToken);
 router.get('/:id',           canView,     getPurchaseInvoice);
 router.post('/:id/approve',     canApprovePI,     approvePurchaseInvoice);
 router.post('/:id/reject-approval', canApprovePI, rejectPurchaseInvoiceApproval);

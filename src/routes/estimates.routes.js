@@ -5,6 +5,7 @@ const { requireAuth, requirePermission, requirePermissionOrHub } = require('../m
 const {
   listEstimates,
   getEstimate,
+  getEstimateByToken,
   createEstimate,
   updateEstimate,
   submitEstimate,
@@ -29,6 +30,8 @@ router.use(requireAuth);
 
 router.get('/',                                    canView,    listEstimates);
 router.post('/',                                   canCreate,  createEstimate);
+// by-token — resolves a shareable-URL token; must be before /:id
+router.get('/by-token/:token',                     canView,    getEstimateByToken);
 router.get('/:id',                                 canView,    getEstimate);
 router.patch('/:id',                               canEdit,    updateEstimate);
 router.post('/:id/submit',                         canSubmit,  submitEstimate);

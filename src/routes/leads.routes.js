@@ -25,6 +25,8 @@ router.get ('/',     requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEAD
 router.post('/',    requireAuth, requirePermission('CREATE_LEAD'), c.createLead);
 router.post('/bulk-assign',  requireAuth, requirePermission('EDIT_LEAD'),   c.bulkAssign);
 router.post('/bulk-delete',  requireAuth, requirePermission('DELETE_LEAD'), c.bulkDelete);
+// by-token — resolves a shareable-URL token to a lead; must be before /:id
+router.get ('/by-token/:token', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.getLeadByToken);
 router.get ('/:id', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.getLead);
 router.patch('/:id', requireAuth, requirePermission('EDIT_LEAD'),  c.updateLead);
 router.delete('/:id', requireAuth, requirePermission('DELETE_LEAD'), c.deleteLead);

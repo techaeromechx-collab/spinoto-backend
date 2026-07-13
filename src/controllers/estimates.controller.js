@@ -18,6 +18,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -283,6 +284,7 @@ async function _getItems(estimateId) {
 const EST_SELECT = `
   SELECT
     e.id,
+    e.public_token,
     e.appointment_id,
     e.hub_id,
     e.status,
@@ -308,6 +310,7 @@ const EST_SELECT = `
     -- otherwise from the estimate's own standalone columns.
     COALESCE(a.customer_name, e.customer_name)   AS customer_name,
     COALESCE(a.mobile, e.mobile)                 AS mobile,
+    (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(a.mobile, e.mobile)) AS customer_token,
     COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
     a.scheduled_date,
 
@@ -347,10 +350,12 @@ const EST_SELECT = `
 
     -- Linked customer invoice (null if not yet generated)
     (SELECT ci.id     FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_id,
+    (SELECT ci.public_token FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_token,
     (SELECT ci.status FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_status,
 
     -- Linked purchase invoice (id + status, so UI can gate CI generation)
     (SELECT pi.id     FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_id,
+    (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_token,
     (SELECT pi.status FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_status
 
   FROM estimates e
@@ -472,6 +477,20 @@ function getEstimate(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/estimates/by-token/:token — resolves a public_token (used in
+// shareable /estimates/:token URLs) to the numeric id, then delegates to
+// the exact same logic as GET /api/estimates/:id.
+// ─────────────────────────────────────────────────────────────────────────────
+function getEstimateByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = await resolveTokenToId(pool, 'estimates', req.params.token);
+    if (!id) return res.status(404).json({ error: 'Estimate not found' });
+    req.params.id = String(id);
+    return getEstimate(req, res, next);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/estimates — Create
 // ─────────────────────────────────────────────────────────────────────────────
 function createEstimate(req, res, next) {
@@ -535,9 +554,10 @@ function createEstimate(req, res, next) {
             discount_mode, transaction_discount_type, transaction_discount_value,
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
             customer_name, mobile, whatsapp, vehicle_number,
-            vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id)
+            vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id,
+            public_token)
          VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
          RETURNING id`,
         [
           data.appointment_id || null, data.hub_id, data.notes || null, req.user.id,
@@ -560,10 +580,15 @@ function createEstimate(req, res, next) {
           isStandalone ? (data.body_type_id    || null) : null,
           isStandalone ? (data.segment_ids     || [])   : [],
           isStandalone ? (data.cc_category_id  || null) : null,
+          generatePublicToken(),
         ]
       );
 
       const estimateId = ins.rows[0].id;
+
+      // Make sure this mobile number has a customer routing identity
+      // (public_token) even if no customer_profiles row is ever created.
+      await ensureCustomerIdentity(client, profileMobile);
 
       if (data.is_b2b && data.save_b2b_to_profile) {
         await _saveB2bProfileDefault(client, profileMobile, {
@@ -1256,6 +1281,7 @@ function deleteEstimate(req, res, next) {
 module.exports = {
   listEstimates,
   getEstimate,
+  getEstimateByToken,
   createEstimate,
   updateEstimate,
   submitEstimate,

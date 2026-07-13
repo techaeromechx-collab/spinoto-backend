@@ -14,6 +14,10 @@ const canDelVehicle  = [requireAuth, requirePermission('DELETE_CUSTOMER_VEHICLE'
 
 router.get('/',        ...canView, ctrl.listCustomers);
 
+// by-token — resolves a shareable-URL token to a customer (via
+// customer_identities); grouped with the other sub-routes below.
+router.get   ('/by-token/:token',      ...canView,        ctrl.getCustomerByToken);
+
 // Vehicle sub-routes — must be before /:mobile to avoid param clash
 router.get   ('/:mobile/timeline',     ...canView,        ctrl.getCustomerTimeline);
 router.get   ('/:mobile/vehicle-usage', ...canView,       ctrl.getVehicleUsage);

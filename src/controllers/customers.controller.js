@@ -13,6 +13,7 @@
  */
 
 const { pool } = require('../config/db');
+const { ensureCustomerIdentity } = require('../utils/publicToken');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -137,6 +138,7 @@ function listCustomers(req, res, next) {
       )
       SELECT
         agg.mobile,
+        ci.public_token,
         COALESCE(cp.display_name, agg.customer_name)   AS customer_name,
         COALESCE(cp.whatsapp,     agg.whatsapp)         AS whatsapp,
         cp.email,
@@ -147,6 +149,7 @@ function listCustomers(req, res, next) {
         agg.last_activity
       FROM agg
       LEFT JOIN customer_profiles cp ON cp.mobile = agg.mobile
+      LEFT JOIN customer_identities ci ON ci.mobile = agg.mobile
       WHERE NOT COALESCE(cp.is_deleted, FALSE)
       ORDER BY agg.last_activity DESC NULLS LAST
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
@@ -188,6 +191,25 @@ function listCustomers(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/customers/:mobile — Detail for one customer
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customers/by-token/:token — resolves a public_token (used in
+// shareable /customers/:token URLs) to the customer's mobile number via
+// customer_identities, then delegates to the exact same logic as
+// GET /api/customers/:mobile. Kept as a thin wrapper — the response still
+// includes `mobile`, which is fine since it's authenticated JSON, not a URL.
+// ─────────────────────────────────────────────────────────────────────────────
+function getCustomerByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const r = await pool.query(
+      `SELECT mobile FROM customer_identities WHERE public_token = $1`,
+      [req.params.token]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Customer not found' });
+    req.params.mobile = r.rows[0].mobile;
+    return getCustomer(req, res, next);
+  });
+}
+
 function getCustomer(req, res, next) {
   handle(req, res, next, async () => {
     const mobile = req.params.mobile;
@@ -195,7 +217,7 @@ function getCustomer(req, res, next) {
     const [apptsRes, invoicesRes, standaloneEstRes] = await Promise.all([
       pool.query(`
         SELECT
-          a.id, a.lead_id, a.customer_name, a.mobile, a.whatsapp,
+          a.id, a.public_token, a.lead_id, a.customer_name, a.mobile, a.whatsapp,
           a.vehicle_number, a.scheduled_date, a.scheduled_time,
           a.total_price, a.notes, a.cancellation_reason, a.created_at, a.updated_at,
           a.vehicle_type_id, a.make_id, a.model_id,
@@ -231,6 +253,7 @@ function getCustomer(req, res, next) {
       pool.query(`
         SELECT
           ci.id,
+          ci.public_token,
           COALESCE(ci.customer_name, a.customer_name) AS customer_name,
           ci.grand_total                              AS total,
           ci.amount_paid,
@@ -242,6 +265,7 @@ function getCustomer(req, res, next) {
           ci.created_at,
           ci.status,
           ci.estimate_id,
+          est.public_token AS estimate_token,
           ci.is_b2b,
           ci.b2b_company_name,
           ci.b2b_gst_number,
@@ -257,6 +281,7 @@ function getCustomer(req, res, next) {
         FROM customer_invoices ci
         LEFT JOIN hubs         h ON h.id  = ci.hub_id
         LEFT JOIN appointments a ON a.id  = ci.appointment_id
+        LEFT JOIN estimates    est ON est.id = ci.estimate_id
         WHERE COALESCE(ci.mobile, a.mobile) = $1
         ORDER BY ci.created_at DESC
         LIMIT 30
@@ -267,7 +292,7 @@ function getCustomer(req, res, next) {
       // lives until a Customer Invoice is eventually generated.
       pool.query(`
         SELECT
-          e.id, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
+          e.id, e.public_token, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
           e.customer_name, e.mobile, e.whatsapp, e.vehicle_number,
           e.vehicle_type_id, e.make_id, e.model_id,
           h.hub_name,
@@ -309,6 +334,18 @@ function getCustomer(req, res, next) {
       );
     } catch (_) { /* table not yet created */ }
     const profile = profileRes.rows[0] || null;
+
+    // customer_identities holds the shareable-URL routing token for this
+    // mobile — optional/defensive the same way profile/vehicles are, in
+    // case migration 086 hasn't run yet in this environment.
+    let publicToken = null;
+    try {
+      const identRes = await pool.query(
+        `SELECT public_token FROM customer_identities WHERE mobile = $1`,
+        [mobile]
+      );
+      publicToken = identRes.rows[0]?.public_token || null;
+    } catch (_) { /* table not yet created */ }
 
     // customer_vehicles is optional (table may not exist yet if migration hasn't run)
     let custVehRes = { rows: [] };
@@ -490,6 +527,7 @@ function getCustomer(req, res, next) {
     return res.json({
       item: {
         mobile,
+        public_token: publicToken,
         whatsapp,
         email:               profile?.email         || null,
         profile_notes:       profile?.notes         || null,
@@ -862,6 +900,10 @@ function updateCustomer(req, res, next) {
       isB2b ? b2b_address.trim()               : null,
     ]);
 
+    // Make sure this mobile number has a customer routing identity
+    // (public_token) even if it's never appeared on an appointment/estimate.
+    await ensureCustomerIdentity(pool, mobile);
+
     res.json({ ok: true });
   });
 }
@@ -1018,5 +1060,5 @@ function getCustomerTimeline(req, res, next) {
 module.exports = {
   listCustomers, getCustomer, updateCustomer, deleteCustomer,
   listCustomerVehicles, addCustomerVehicle, updateCustomerVehicle, deleteCustomerVehicle,
-  getCustomerTimeline, getVehicleUsage,
+  getCustomerTimeline, getVehicleUsage, getCustomerByToken,
 };

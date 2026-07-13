@@ -4,13 +4,22 @@ const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
+const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 
 const idParam = z.coerce.number().int().positive();
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch((err) => {
     if (err.name === 'ZodError') return res.status(400).json({ error: err.errors.map(e => e.message).join('; ') });
-    if (err.code === '23505')   return res.status(409).json({ error: 'Purchase invoice already exists for this estimate' });
+    if (err.code === '23505') {
+      // Distinguish the real "one PI per estimate" conflict from the
+      // astronomically-unlikely public_token collision, so the latter (if it
+      // ever happens) doesn't surface a misleading error message.
+      if (err.constraint === 'idx_purchase_invoices_public_token') {
+        return res.status(409).json({ error: 'Could not generate a unique link for this invoice — please try again.' });
+      }
+      return res.status(409).json({ error: 'Purchase invoice already exists for this estimate' });
+    }
     if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   });
@@ -18,7 +27,7 @@ function handle(req, res, next, fn) {
 
 const PI_SELECT = `
   SELECT
-    pi.id, pi.estimate_id, pi.appointment_id, pi.hub_id,
+    pi.id, pi.public_token, pi.estimate_id, est_ctx.public_token AS estimate_token, pi.appointment_id, pi.hub_id,
     pi.commission_percent, pi.rate_mode, pi.status,
     pi.subtotal_ex_gst, pi.total_gst, pi.grand_total,
     pi.notes, pi.approved_by, pi.approved_at,
@@ -30,10 +39,12 @@ const PI_SELECT = `
     -- otherwise from the linked estimate's own standalone columns.
     COALESCE(a.customer_name, est_ctx.customer_name)   AS customer_name,
     COALESCE(a.mobile, est_ctx.mobile)                 AS mobile,
+    (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(a.mobile, est_ctx.mobile)) AS customer_token,
     COALESCE(a.vehicle_number, est_ctx.vehicle_number) AS vehicle_number,
     u.name  AS created_by_name,
     ab.name AS approved_by_name,
     (SELECT id FROM customer_invoices ci WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id LIMIT 1) AS customer_invoice_id,
+    (SELECT ci.public_token FROM customer_invoices ci WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id LIMIT 1) AS customer_invoice_token,
     (SELECT COUNT(*)::int FROM purchase_invoice_items pii WHERE pii.purchase_invoice_id = pi.id) AS item_count,
 
     -- Vehicle details
@@ -171,6 +182,20 @@ function getPurchaseInvoice(req, res, next) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/purchase-invoices/by-token/:token — resolves a public_token
+// (used in shareable /purchase-invoices/:token URLs) to the numeric id,
+// then delegates to the exact same logic as GET /api/purchase-invoices/:id.
+// ─────────────────────────────────────────────────────────────────────────────
+function getPurchaseInvoiceByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = await resolveTokenToId(pool, 'purchase_invoices', req.params.token);
+    if (!id) return res.status(404).json({ error: 'Purchase invoice not found' });
+    req.params.id = String(id);
+    return getPurchaseInvoice(req, res, next);
+  });
+}
+
 function generatePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
     const { estimate_id } = z.object({ estimate_id: z.coerce.number().int().positive() }).parse(req.body);
@@ -290,14 +315,15 @@ function generatePurchaseInvoice(req, res, next) {
       const piRow = await client.query(
         `INSERT INTO purchase_invoices
            (estimate_id, appointment_id, hub_id, commission_percent, rate_mode,
-            subtotal_ex_gst, total_gst, grand_total, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+            subtotal_ex_gst, total_gst, grand_total, created_by, public_token)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           useCommission ? commissionPct : 0,      // 0 when using tech_rate mode — column is NOT NULL
           rateMode,
           subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
           req.user?.id || null,
+          generatePublicToken(),
         ]
       );
       const piId = piRow.rows[0].id;
@@ -938,7 +964,8 @@ function listPayouts(req, res, next) {
     // Fetch all approved, unpaid PIs with their urgency bucket
     const r = await pool.query(
       `SELECT
-         pi.id, pi.hub_id, pi.grand_total, pi.amount_paid, pi.payment_status,
+         pi.id, pi.public_token AS purchase_invoice_token,
+         pi.hub_id, pi.grand_total, pi.amount_paid, pi.payment_status,
          pi.payout_due_date, pi.payout_schedule, pi.approved_at,
          h.hub_name, h.payout_terms,
          COALESCE(a.customer_name, e.customer_name)   AS customer_name,
@@ -946,6 +973,9 @@ function listPayouts(req, res, next) {
          (SELECT ci.id FROM customer_invoices ci
           WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id
           LIMIT 1) AS customer_invoice_id,
+         (SELECT ci.public_token FROM customer_invoices ci
+          WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id
+          LIMIT 1) AS customer_invoice_token,
          CASE
            WHEN pi.payout_due_date IS NULL                                                         THEN 'awaiting_payment'
            WHEN pi.payout_due_date <  $1::date                                                     THEN 'overdue'
@@ -1015,6 +1045,7 @@ function listHubPayments(req, res, next) {
       `SELECT
          hp.id, hp.amount, hp.method, hp.reference_no, hp.notes, hp.paid_at,
          hp.purchase_invoice_id,
+         pi.public_token AS purchase_invoice_token,
          pi.grand_total AS pi_grand_total,
          pi.amount_paid AS pi_amount_paid,
          h.id AS hub_id, h.hub_name,
@@ -1341,4 +1372,4 @@ async function rejectPurchaseInvoiceApproval(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };

@@ -2,7 +2,7 @@
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const {
-  listCustomerInvoices, getCustomerInvoice,
+  listCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken,
   addPayment, deletePayment,
   approveCustomerInvoice,
   updateCustomerInvoiceNotes,
@@ -22,6 +22,7 @@ router.get('/',                        canView,    listCustomerInvoices);
 // Static routes BEFORE /:id to avoid param capture
 router.post('/from-estimate',          canCreate,  generateCustomerInvoiceFromEstimate);
 router.get('/vehicle-history/:vnum',   canView,    getVehicleHistory);
+router.get('/by-token/:token',         canView,    getCustomerInvoiceByToken);
 router.get('/:id',                     canView,    getCustomerInvoice);
 router.patch('/:id',                   canEdit,    updateCustomerInvoiceNotes);
 router.post('/:id/approve',            canEdit,    approveCustomerInvoice);

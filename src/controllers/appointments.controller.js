@@ -15,6 +15,7 @@ const { z } = require('zod');
 const { pool } = require('../config/db');
 const { logActivity } = require('../services/activityLog.service');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
+const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
 
 // ─── Hub schedule validator ───────────────────────────────────────────────────
 // Returns { status, code, error } if the scheduled slot violates hub hours/days,
@@ -195,10 +196,12 @@ function handle(req, res, next, fn) {
 const APPT_SELECT = `
   SELECT
     a.id,
+    a.public_token,
     a.appointment_code,
     a.lead_id,
     a.customer_name,
     a.mobile,
+    (SELECT public_token FROM customer_identities WHERE mobile = a.mobile) AS customer_token,
     a.whatsapp,
     a.vehicle_number,
     a.segment_ids,
@@ -260,6 +263,7 @@ const APPT_SELECT = `
 
     -- Linked estimate (used to lock fields in edit mode + status prerequisite checks)
     (SELECT e.id     FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_id,
+    (SELECT e.public_token FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_token,
     (SELECT e.status FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_status,
     EXISTS (SELECT 1 FROM estimates e WHERE e.appointment_id = a.id)                            AS has_estimate,
 
@@ -267,6 +271,9 @@ const APPT_SELECT = `
     (SELECT ci.id     FROM customer_invoices ci
        JOIN estimates e ON e.id = ci.estimate_id
        WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_id,
+    (SELECT ci.public_token FROM customer_invoices ci
+       JOIN estimates e ON e.id = ci.estimate_id
+       WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_token,
     (SELECT ci.status FROM customer_invoices ci
        JOIN estimates e ON e.id = ci.estimate_id
        WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status,
@@ -347,13 +354,13 @@ function createAppointment(req, res, next) {
           pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode, pickup_maps_link,
           pickup_scheduled_date, pickup_scheduled_time,
           drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode, drop_maps_link,
-          assigned_to, created_by
+          assigned_to, created_by, public_token
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
           $18,$19,$20,$21,$22,$23,
           $24,$25,
           $26,$27,$28,$29,$30,$31,
-          $32,$33
+          $32,$33,$34
         ) RETURNING id`,
         [
           data.lead_id || null,           // $1
@@ -389,10 +396,15 @@ function createAppointment(req, res, next) {
           data.drop_maps_link || null,     // $31
           assignedTo,                            // $32
           req.user.id,                           // $33
+          generatePublicToken(),                 // $34
         ]
       );
 
       const apptId = ins.rows[0].id;
+
+      // Make sure this mobile number has a customer routing identity
+      // (public_token) even if no customer_profiles row is ever created.
+      await ensureCustomerIdentity(client, data.mobile);
 
       // Insert service line items
       for (const svc of data.services) {
@@ -612,6 +624,20 @@ function getAppointment(req, res, next) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/appointments/by-token/:token — resolves a public_token (used in
+// shareable /appointments/:token URLs) to the numeric id, then delegates to
+// the exact same logic as GET /api/appointments/:id.
+// ─────────────────────────────────────────────────────────────────────────────
+function getAppointmentByToken(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = await resolveTokenToId(pool, 'appointments', req.params.token);
+    if (!id) return res.status(404).json({ error: 'Appointment not found' });
+    req.params.id = String(id);
+    return getAppointment(req, res, next);
+  });
+}
+
 async function checkIsTerminal(id) {
   const currentAppt = await pool.query(
     `SELECT ast.slug FROM appointments a
@@ -791,6 +817,11 @@ function updateAppointment(req, res, next) {
           await client.query('ROLLBACK');
           return res.status(404).json({ error: 'Appointment not found' });
         }
+        // Mobile can be corrected after creation — make sure the new number
+        // has a shareable-URL identity too, so customer_token stays populated.
+        if (data.mobile !== undefined) {
+          await ensureCustomerIdentity(client, data.mobile);
+        }
       } else {
         // Confirm appointment exists even if only services are changing
         const exists = await client.query(`SELECT id FROM appointments WHERE id = $1`, [id]);
@@ -919,6 +950,7 @@ module.exports = {
   listAppointments,
   getStats,
   getAppointment,
+  getAppointmentByToken,
   updateAppointment,
   markVehiclePicked,
   markAtWorkshop,
