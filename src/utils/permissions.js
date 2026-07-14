@@ -237,6 +237,13 @@ const PERMISSIONS = Object.freeze({
     group: 'Appointments',
   },
 
+  DELETE_APPOINTMENT: {
+    code: 'DELETE_APPOINTMENT',
+    label: 'Delete Appointment',
+    description: 'Permanently delete an appointment and its whole chain (estimate, purchase invoice, customer invoice, claims). Blocked once any payment exists — cancel instead.',
+    group: 'Appointments',
+  },
+
   // ---- Customers ----
   VIEW_CUSTOMER: {
     code: 'VIEW_CUSTOMER',
@@ -342,6 +349,12 @@ const PERMISSIONS = Object.freeze({
     code: 'DELETE_INVOICE_PAYMENT',
     label: 'Delete Invoice Payment',
     description: 'Delete payment entries — including from fully PAID invoices, which reopens the appointment and pulls the hub payout back.',
+    group: 'Invoices',
+  },
+  EDIT_INVOICE_PAYMENT: {
+    code: 'EDIT_INVOICE_PAYMENT',
+    label: 'Edit Invoice Payment Date',
+    description: 'Correct a payment\'s date. Shifts the hub payout due date and the warranty validity window for future claims.',
     group: 'Invoices',
   },
 

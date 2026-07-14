@@ -271,6 +271,50 @@ function addPayment(req, res, next) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/customer-invoices/:id/payments/:payId — correct a payment's date.
+// Amount/method are immutable (delete + re-add for those); only paid_at moves.
+// Re-runs _recalcStatus so the hub payout due date re-anchors to the (possibly
+// new) latest payment date. Existing warranty claims keep their stored
+// service-date snapshot; only claims registered AFTER this edit see the shift.
+// ─────────────────────────────────────────────────────────────────────────────
+function updatePayment(req, res, next) {
+  handle(req, res, next, async () => {
+    const id    = idParam.parse(req.params.id);
+    const payId = idParam.parse(req.params.payId);
+    const data  = z.object({
+      paid_at: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}/, 'paid_at must be a date (YYYY-MM-DD)'),
+    }).parse(req.body);
+
+    const payRow = await pool.query(
+      `SELECT id FROM customer_invoice_payments WHERE id = $1 AND customer_invoice_id = $2`,
+      [payId, id]
+    );
+    if (!payRow.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE customer_invoice_payments SET paid_at = $1 WHERE id = $2`,
+        [data.paid_at, payId]
+      );
+      // Amounts unchanged, but the payout due date is anchored to the LATEST
+      // paid_at — recalc re-syncs it (and split installment dates) correctly.
+      await _recalcStatus(client, id);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally { client.release(); }
+
+    const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
+    full.rows[0].items    = await _getItems(id);
+    full.rows[0].payments = await _getPayments(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
 function deletePayment(req, res, next) {
   handle(req, res, next, async () => {
     const id    = idParam.parse(req.params.id);
@@ -784,4 +828,4 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
   });
 }
 
-module.exports = { listCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken, addPayment, deletePayment, approveCustomerInvoice, updateCustomerInvoiceNotes, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };
+module.exports = { listCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken, addPayment, updatePayment, deletePayment, approveCustomerInvoice, updateCustomerInvoiceNotes, generateCustomerInvoiceFromEstimate, syncCustomerInvoiceFromEstimate, getVehicleHistory };

@@ -952,6 +952,194 @@ async function markAtWorkshop(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Appointment deletion (DELETE_APPOINTMENT permission)
+//
+// An appointment anchors a whole chain: services → estimate → PI → CI →
+// claims. Deletion cascades through all of it — but is HARD-BLOCKED the
+// moment any money has moved (CI customer payments or PI hub payments).
+// Real jobs get CANCELLED; deletion is for junk/test/duplicate entries.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Collects everything hanging off an appointment — used by both the preview
+// endpoint (the frontend warning popup) and the delete guards.
+async function _collectAppointmentChain(apptId) {
+  const est = (await pool.query(
+    `SELECT id, status, grand_total, warranty_claim_id FROM estimates WHERE appointment_id = $1 ORDER BY id DESC LIMIT 1`,
+    [apptId]
+  )).rows[0] || null;
+
+  let pi = null, ci = null, claims = [];
+  if (est) {
+    pi = (await pool.query(
+      `SELECT id, status, payment_status, COALESCE(amount_paid,0) AS amount_paid, grand_total
+         FROM purchase_invoices WHERE estimate_id = $1 ORDER BY id DESC LIMIT 1`, [est.id]
+    )).rows[0] || null;
+    ci = (await pool.query(
+      `SELECT ci.id, ci.status, ci.grand_total, COALESCE(ci.amount_paid,0) AS amount_paid,
+              (SELECT COUNT(*)::int FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id) AS payment_count
+         FROM customer_invoices ci WHERE ci.estimate_id = $1 ORDER BY ci.id DESC LIMIT 1`, [est.id]
+    )).rows[0] || null;
+    if (ci) {
+      claims = (await pool.query(
+        `SELECT id, claim_code, status, claim_type, redo_appointment_id
+           FROM warranty_claims WHERE customer_invoice_id = $1`, [ci.id]
+      )).rows;
+    }
+  }
+  return { est, pi, ci, claims };
+}
+
+// GET /api/appointments/:id/delete-preview — what would be deleted, and any
+// blockers. Drives the confirmation popup.
+function deletePreview(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+    const appt = (await pool.query(
+      `SELECT a.id, a.appointment_code, a.lead_id, a.is_warranty_redo, a.warranty_claim_id,
+              (SELECT COUNT(*)::int FROM appointments a2 WHERE a2.lead_id = a.lead_id AND a2.id <> a.id) AS other_appointments
+         FROM appointments a WHERE a.id = $1`, [id]
+    )).rows[0];
+    if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+
+    const { est, pi, ci, claims } = await _collectAppointmentChain(id);
+
+    const blockers = [];
+    if (ci && (parseFloat(ci.amount_paid) > 0 || ci.payment_count > 0)) {
+      blockers.push(`Customer invoice CI-${String(ci.id).padStart(6, '0')} has ${ci.payment_count} payment(s) totalling ₹${parseFloat(ci.amount_paid).toFixed(2)}.`);
+    }
+    if (pi && parseFloat(pi.amount_paid) > 0) {
+      blockers.push(`Hub payout of ₹${parseFloat(pi.amount_paid).toFixed(2)} was already made on PI-${String(pi.id).padStart(6, '0')}.`);
+    }
+
+    res.json({
+      appointment: { id: appt.id, code: appt.appointment_code, is_warranty_redo: appt.is_warranty_redo },
+      estimate: est ? { id: est.id, status: est.status, grand_total: est.grand_total } : null,
+      purchase_invoice: pi ? { id: pi.id, code: `PI-${String(pi.id).padStart(6, '0')}`, status: pi.status } : null,
+      customer_invoice: ci ? { id: ci.id, code: `CI-${String(ci.id).padStart(6, '0')}`, status: ci.status } : null,
+      claims: claims.map(c => ({ id: c.id, code: c.claim_code, status: c.status })),
+      lead_revert: !!(appt.lead_id && appt.other_appointments === 0),
+      redo_claim_reset: appt.is_warranty_redo && appt.warranty_claim_id ? true : false,
+      blockers,
+      deletable: blockers.length === 0,
+    });
+  });
+}
+
+// DELETE /api/appointments/:id
+function deleteAppointment(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+    const appt = (await pool.query(
+      `SELECT id, appointment_code, lead_id, is_warranty_redo, warranty_claim_id FROM appointments WHERE id = $1`, [id]
+    )).rows[0];
+    if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+
+    const { est, pi, ci, claims } = await _collectAppointmentChain(id);
+
+    // ── Hard blocks: money has moved ──
+    if (ci && (parseFloat(ci.amount_paid) > 0 || ci.payment_count > 0)) {
+      return res.status(409).json({
+        error: `CI-${String(ci.id).padStart(6, '0')} has customer payments (₹${parseFloat(ci.amount_paid).toFixed(2)}) — this job has financial history. Cancel the appointment instead of deleting it, or delete the payments first.`,
+      });
+    }
+    if (pi && parseFloat(pi.amount_paid) > 0) {
+      return res.status(409).json({
+        error: `A hub payout of ₹${parseFloat(pi.amount_paid).toFixed(2)} was already made on PI-${String(pi.id).padStart(6, '0')} — this job has financial history. Cancel the appointment instead of deleting it.`,
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1) Claims made against this job's CI: unhook any redo jobs they
+      //    spawned (those live on OTHER appointments), then delete the claims.
+      for (const c of claims) {
+        await client.query(`UPDATE appointments SET warranty_claim_id = NULL WHERE warranty_claim_id = $1`, [c.id]);
+        await client.query(`UPDATE estimates    SET warranty_claim_id = NULL WHERE warranty_claim_id = $1`, [c.id]);
+      }
+      if (ci) {
+        await client.query(`DELETE FROM warranty_claims WHERE customer_invoice_id = $1`, [ci.id]);
+      }
+
+      // 2) If THIS appointment is a warranty-redo job, reset its claim so a
+      //    fresh redo can be created (resolved/approved → approved, links cleared).
+      if (appt.warranty_claim_id) {
+        await client.query(
+          `UPDATE warranty_claims
+              SET redo_appointment_id = NULL, redo_estimate_id = NULL,
+                  status = CASE WHEN status = 'resolved' THEN 'approved' ELSE status END,
+                  updated_at = NOW()
+            WHERE id = $1`, [appt.warranty_claim_id]);
+      }
+
+      // 3) CI (no payments — guaranteed above)
+      if (ci) {
+        await client.query(`DELETE FROM customer_invoice_payments WHERE customer_invoice_id = $1`, [ci.id]);
+        await client.query(`DELETE FROM customer_invoice_items    WHERE customer_invoice_id = $1`, [ci.id]);
+        await client.query(`DELETE FROM customer_invoices         WHERE id = $1`, [ci.id]);
+      }
+
+      // 4) PI (unpaid — guaranteed above)
+      if (pi) {
+        await client.query(`DELETE FROM pi_payment_schedule    WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM hub_payments           WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [pi.id]);
+        await client.query(`DELETE FROM purchase_invoices      WHERE id = $1`, [pi.id]);
+      }
+
+      // 5) Estimate
+      if (est) {
+        await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [est.id]);
+        await client.query(`DELETE FROM estimates      WHERE id = $1`, [est.id]);
+      }
+
+      // 6) The appointment itself + its satellites
+      await client.query(`DELETE FROM appointment_services     WHERE appointment_id = $1`, [id]);
+      await client.query(`DELETE FROM appointment_reminder_log WHERE appointment_id = $1`, [id]);
+      await client.query(`DELETE FROM appointments             WHERE id = $1`, [id]);
+
+      // 7) Lead: if this was the lead's ONLY appointment, un-convert it back
+      //    to the default pipeline status and log it on the lead timeline.
+      if (appt.lead_id) {
+        const others = await client.query(
+          `SELECT COUNT(*)::int AS n FROM appointments WHERE lead_id = $1`, [appt.lead_id]);
+        if (others.rows[0].n === 0) {
+          const defStatus = await client.query(
+            `SELECT name FROM lead_statuses WHERE is_default = TRUE AND is_active = TRUE LIMIT 1`);
+          if (defStatus.rows[0]) {
+            await client.query(`UPDATE leads SET status = $1, updated_at = NOW() WHERE id = $2`,
+              [defStatus.rows[0].name, appt.lead_id]);
+          }
+        }
+        await client.query(
+          `INSERT INTO lead_activities (lead_id, type, new_value, note, created_by)
+           VALUES ($1, 'status_changed', 'Appointment deleted', $2, $3)`,
+          [appt.lead_id,
+           `Appointment ${appt.appointment_code || `#${id}`} was permanently deleted${others.rows[0].n === 0 ? ' — lead returned to pipeline' : ''}`,
+           req.user.id]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    logActivity({
+      userId: req.user?.id, userName: req.user?.name,
+      action: 'appointment_deleted', entity: 'appointment', entityId: id,
+      description: `Deleted appointment ${appt.appointment_code || `#${id}`}${est ? ` incl. estimate #${est.id}` : ''}${pi ? `, PI-${String(pi.id).padStart(6, '0')}` : ''}${ci ? `, CI-${String(ci.id).padStart(6, '0')}` : ''}${claims.length ? `, ${claims.length} claim(s)` : ''}`,
+    });
+
+    res.status(204).end();
+  });
+}
+
 module.exports = {
   createAppointment,
   listAppointments,
@@ -961,4 +1149,6 @@ module.exports = {
   updateAppointment,
   markVehiclePicked,
   markAtWorkshop,
+  deletePreview,
+  deleteAppointment,
 };

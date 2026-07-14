@@ -3,7 +3,7 @@ const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const {
   listCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken,
-  addPayment, deletePayment,
+  addPayment, updatePayment, deletePayment,
   approveCustomerInvoice,
   updateCustomerInvoiceNotes,
   generateCustomerInvoiceFromEstimate,
@@ -31,5 +31,6 @@ router.patch('/:id',                   canEdit,    updateCustomerInvoiceNotes);
 router.post('/:id/approve',            canEdit,    approveCustomerInvoice);
 router.post('/:id/sync-from-estimate', canEdit,    syncCustomerInvoiceFromEstimate);
 router.post('/:id/payments',           canPayment, addPayment);
+router.patch('/:id/payments/:payId',   requirePermission('EDIT_INVOICE_PAYMENT'), updatePayment);
 router.delete('/:id/payments/:payId',  canDeletePayment, deletePayment);
 module.exports = router;
