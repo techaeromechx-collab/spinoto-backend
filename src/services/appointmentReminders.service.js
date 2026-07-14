@@ -23,6 +23,7 @@
 
 const { pool } = require('../config/db');
 const { sendPush } = require('../utils/sendPush');
+const { isNotificationEnabled } = require('../utils/notificationPrefs');
 
 const WINDOWS = [
   { hours: 24,   label: '24 hours' },
@@ -89,6 +90,8 @@ async function fireAppointmentReminders() {
         // Fix #6: track whether at least one notification was inserted
         let notified = 0;
         for (const userId of recipientSet) {
+          if (!(await isNotificationEnabled(client, userId, 'appointment_reminder'))) continue;
+
           const r = await client.query(`
             INSERT INTO notifications (user_id, type, title, body)
             VALUES ($1, 'appointment_reminder', $2, $3)

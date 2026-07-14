@@ -7,6 +7,7 @@ const {
 } = require('../services/smartAlerts.service');
 const { logActivity }  = require('../services/activityLog.service');
 const { sendPush }     = require('../utils/sendPush');
+const { isNotificationEnabled } = require('../utils/notificationPrefs');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 
 // ---------- validators ----------
@@ -462,11 +463,13 @@ function updateLead(req, res, next) {
           [leadMeta?.created_by, leadMeta?.assigned_to, req.user.id].filter(Boolean)
         )];
         for (const uid of notifyUsers) {
-          await client.query(
-            `INSERT INTO notifications (user_id, type, title, body, lead_id)
-             VALUES ($1, 'follow_up_scheduled', $2, $3, $4)`,
-            [uid, `Follow-up scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, id]
-          );
+          if (await isNotificationEnabled(client, uid, 'follow_up_scheduled')) {
+            await client.query(
+              `INSERT INTO notifications (user_id, type, title, body, lead_id)
+               VALUES ($1, 'follow_up_scheduled', $2, $3, $4)`,
+              [uid, `Follow-up scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, id]
+            );
+          }
           sendPush(uid, 'follow_up_scheduled', `Follow-up Scheduled`, `Follow up for "${leadLabel}" on ${dateStr} at ${timeStr}`, '/leads');
         }
       }
@@ -551,11 +554,13 @@ function updateLead(req, res, next) {
           const leadLabel = parts.join(' • ') || `Lead #${id}`;
           const notifTitle = 'Lead Assigned';
           const notifBody  = `${leadLabel} assigned to you by ${assignerName}`;
-          await pool.query(
-            `INSERT INTO notifications (user_id, type, title, body, lead_id)
-             VALUES ($1, 'lead_assigned', $2, $3, $4)`,
-            [coreData.assigned_to, notifTitle, notifBody, id]
-          );
+          if (await isNotificationEnabled(pool, coreData.assigned_to, 'lead_assigned')) {
+            await pool.query(
+              `INSERT INTO notifications (user_id, type, title, body, lead_id)
+               VALUES ($1, 'lead_assigned', $2, $3, $4)`,
+              [coreData.assigned_to, notifTitle, notifBody, id]
+            );
+          }
           // Push immediately (single assignment — don't wait for summary)
           sendPush(coreData.assigned_to, 'lead_assigned', notifTitle, notifBody, '/leads');
         }
@@ -951,12 +956,15 @@ function bulkAssign(req, res, next) {
     const newAssigneeRow = await pool.query(`SELECT name FROM users WHERE id = $1`, [assigned_to]);
     const newAssigneeName = newAssigneeRow.rows[0]?.name || `User #${assigned_to}`;
 
+    const bulkAssignNotifEnabled = await isNotificationEnabled(pool, assigned_to, 'lead_assigned');
     for (const leadId of assignable_ids) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, body, lead_id)
-         VALUES ($1, 'lead_assigned', $2, $3, $4)`,
-        [assigned_to, `Lead Assigned`, `Lead #${leadId} assigned to you by ${assignerName}`, leadId]
-      );
+      if (bulkAssignNotifEnabled) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, lead_id)
+           VALUES ($1, 'lead_assigned', $2, $3, $4)`,
+          [assigned_to, `Lead Assigned`, `Lead #${leadId} assigned to you by ${assignerName}`, leadId]
+        );
+      }
       // Log assignment change to activity timeline
       await pool.query(
         `INSERT INTO lead_activities (lead_id, type, old_value, new_value, created_by)

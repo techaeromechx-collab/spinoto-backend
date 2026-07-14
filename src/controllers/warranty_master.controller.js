@@ -313,7 +313,40 @@ function lookupWarranty(req, res, next) {
   });
 }
 
+// ── EFFECTIVE COVERAGE for one service ────────────────────────────────────────
+// GET /effective?service_id=X&category_id=Y
+// Returns the active, date-valid rules at both levels so the Services page can
+// show what a service actually carries (own rules + inherited category rules)
+// and offer one-click exclusions.
+function effectiveForService(req, res, next) {
+  handle(req, res, next, async () => {
+    const serviceId  = req.query.service_id  ? parseInt(req.query.service_id,  10) : null;
+    const categoryId = req.query.category_id ? parseInt(req.query.category_id, 10) : null;
+    if (!serviceId) return res.status(400).json({ error: 'service_id is required' });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const r = await pool.query(
+      `${WM_SELECT}
+        WHERE wm.is_active = TRUE
+          AND wm.valid_from <= $1
+          AND (wm.valid_until IS NULL OR wm.valid_until >= $1)
+          AND (
+                (wm.applies_to = 'service'  AND wm.ref_id = $2)
+             OR (wm.applies_to = 'category' AND $3::int IS NOT NULL AND wm.ref_id = $3)
+          )
+        ORDER BY wm.promise_type, wm.applies_to, wm.vehicle_type_id NULLS FIRST`,
+      [today, serviceId, categoryId]
+    );
+
+    const rows = r.rows.map(withLabel);
+    res.json({
+      service_rules:  rows.filter(x => x.applies_to === 'service'),
+      category_rules: rows.filter(x => x.applies_to === 'category'),
+    });
+  });
+}
+
 module.exports = {
   listWarranties, getWarranty, createWarranty, updateWarranty, deleteWarranty,
-  lookupWarranty, warrantyLabel,
+  lookupWarranty, effectiveForService, warrantyLabel,
 };

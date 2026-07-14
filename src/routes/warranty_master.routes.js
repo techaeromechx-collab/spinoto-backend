@@ -14,8 +14,9 @@ const canCreate = [requireAuth, requirePermission('CREATE_WARRANTY', 'MANAGE_WAR
 const canEdit   = [requireAuth, requirePermission('EDIT_WARRANTY',   'MANAGE_WARRANTIES', 'MANAGE_MASTER_DATA')];
 const canDelete = [requireAuth, requirePermission('DELETE_WARRANTY', 'MANAGE_WARRANTIES', 'MANAGE_MASTER_DATA')];
 
-router.get('/',       canRead,   c.listWarranties);
-router.get('/lookup', canRead,   c.lookupWarranty);   // ?service_id=&part_id=&category_id=&vehicle_type_id=
+router.get('/',          canRead, c.listWarranties);
+router.get('/lookup',    canRead, c.lookupWarranty);       // ?service_id=&part_id=&category_id=&vehicle_type_id=
+router.get('/effective', canRead, c.effectiveForService);  // ?service_id=&category_id= — Services page coverage tags
 router.get('/:id',    canRead,   c.getWarranty);
 router.post('/',      canCreate, c.createWarranty);
 router.patch('/:id',  canEdit,   c.updateWarranty);

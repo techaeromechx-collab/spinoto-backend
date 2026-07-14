@@ -2,6 +2,7 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
 const { sendPush } = require('../utils/sendPush');
+const { isNotificationEnabled } = require('../utils/notificationPrefs');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -103,11 +104,13 @@ function addNote(req, res, next) {
           const title       = `New note on ${leadLabel}`;
           const body        = `${author.name} added: ${notePreview}`;
           for (const uid of recipientIds) {
-            await pool.query(
-              `INSERT INTO notifications (user_id, type, title, body, lead_id)
-               VALUES ($1, 'note_added', $2, $3, $4)`,
-              [uid, title, body, leadId]
-            );
+            if (await isNotificationEnabled(pool, uid, 'note_added')) {
+              await pool.query(
+                `INSERT INTO notifications (user_id, type, title, body, lead_id)
+                 VALUES ($1, 'note_added', $2, $3, $4)`,
+                [uid, title, body, leadId]
+              );
+            }
             sendPush(uid, 'note_added', title, body, '/leads');
           }
         }

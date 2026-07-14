@@ -11,6 +11,7 @@
 
 const { pool }     = require('../config/db');
 const { sendPush } = require('../utils/sendPush');
+const { isNotificationEnabled } = require('../utils/notificationPrefs');
 
 // ── Load alert thresholds from DB (falls back to defaults if not set) ─────────
 const DEFAULT_ALERT_CFG = {
@@ -59,6 +60,11 @@ async function alreadyNotifiedToday(client, userId, type, leadId = null) {
 
 // ── Helper: insert notification ───────────────────────────────────────────────
 async function notify(client, { userId, type, title, body, leadId = null }) {
+  // Respect the user's notification_settings toggle — same check sendPush()
+  // already applies to push delivery, now applied to the in-app bell feed too.
+  const enabled = await isNotificationEnabled(client, userId, type);
+  if (!enabled) return;
+
   await client.query(
     `INSERT INTO notifications (user_id, type, title, body, lead_id)
      VALUES ($1, $2, $3, $4, $5)`,
