@@ -28,6 +28,7 @@ function handle(req, res, next, fn) {
 const PI_SELECT = `
   SELECT
     pi.id, pi.public_token, pi.estimate_id, est_ctx.public_token AS estimate_token, pi.appointment_id, pi.hub_id,
+    est_ctx.warranty_claim_id,
     pi.commission_percent, pi.rate_mode, pi.status,
     pi.subtotal_ex_gst, pi.total_gst, pi.grand_total,
     pi.notes, pi.approved_by, pi.approved_at,
@@ -203,7 +204,8 @@ function generatePurchaseInvoice(req, res, next) {
     // Validate estimate
     const estRow = await pool.query(
       `SELECT e.id, e.status, e.appointment_id, e.hub_id,
-              e.discount_mode, e.transaction_discount_type, e.transaction_discount_value
+              e.discount_mode, e.transaction_discount_type, e.transaction_discount_value,
+              e.warranty_claim_id
        FROM estimates e WHERE e.id = $1`, [estimate_id]
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
@@ -263,6 +265,24 @@ function generatePurchaseInvoice(req, res, next) {
 
     const roundFn = getRoundingFunction(new Date());
 
+    // Warranty redo: the claim's cost_bearer decides who pays for the redo.
+    //   'hub'     → hub did faulty work, redo is on them: hub payable forced to ₹0
+    //   'company' → goodwill: hub is paid on the ORIGINAL item's rate, since the
+    //               redo estimate's customer rate is ₹0 (or a partial charge)
+    let redoCostBearer = null, redoBasisRate = null;
+    if (est.warranty_claim_id) {
+      const claimRow = await pool.query(
+        `SELECT wc.cost_bearer, cii.customer_rate AS orig_rate
+           FROM warranty_claims wc
+           LEFT JOIN customer_invoice_items cii ON cii.id = wc.customer_invoice_item_id
+          WHERE wc.id = $1`, [est.warranty_claim_id]
+      );
+      if (claimRow.rows[0]) {
+        redoCostBearer = claimRow.rows[0].cost_bearer;
+        redoBasisRate  = claimRow.rows[0].orig_rate != null ? Number(claimRow.rows[0].orig_rate) : null;
+      }
+    }
+
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
     const items = itemsRow.rows.map(item => {
       const qty    = Number(item.quantity);
@@ -280,25 +300,34 @@ function generatePurchaseInvoice(req, res, next) {
       // custRate = post-discount ex-GST per unit
       const custRate = roundFn(postDiscIncGst / qty / (1 + gstPct / 100), 4);
 
+      // Rate basis: normally the customer rate; for company-borne warranty
+      // redos, the original item's rate (the redo's customer rate is ~₹0).
+      const basisRate = (redoCostBearer === 'company' && redoBasisRate != null)
+        ? roundFn(redoBasisRate, 4)
+        : custRate;
+
       let appliedRatePct; // the % stored per-item for audit trail
       let hubRate;
 
       if (useCommission) {
         // Commission mode: hub earns (100 - commission)% of customer rate
         appliedRatePct = commissionPct;
-        hubRate        = roundFn(custRate * (1 - commissionPct / 100), 4);
+        hubRate        = roundFn(basisRate * (1 - commissionPct / 100), 4);
       } else {
         // Tech rate mode: tech_rate% is deducted from customer rate (platform fee)
         // Hub earns: customer_rate - (customer_rate × tech_rate%)
         const isService    = item.item_type === 'service';
         const techRate     = isService ? (techRateService ?? 0) : (techRateParts ?? 0);
         appliedRatePct     = techRate;
-        const techDeduct   = roundFn(custRate * (techRate / 100), 4);
-        hubRate            = roundFn(custRate - techDeduct, 4);
+        const techDeduct   = roundFn(basisRate * (techRate / 100), 4);
+        hubRate            = roundFn(basisRate - techDeduct, 4);
       }
 
+      // Hub-borne warranty redo: the hub eats the redo cost entirely
+      if (redoCostBearer === 'hub') hubRate = 0;
+
       const hubAmount    = roundFn(hubRate * qty);
-      const techDeductAmt = roundFn(custRate * qty) - hubAmount; // deduction for display
+      const techDeductAmt = roundFn(basisRate * qty) - hubAmount; // deduction for display
       const gstAmount    = roundFn(hubAmount * gstPct / 100);
       const totalPayable = roundFn(hubAmount + gstAmount);
 
@@ -453,12 +482,21 @@ function approvePurchaseInvoice(req, res, next) {
         pi.grand_total = grandTotal;
       }
 
+      // A ₹0 PI (hub-borne warranty redo) has nothing to pay out — mark its
+      // payment_status 'paid' at approval so it never lingers in the payouts
+      // queue (payouts lists status='approved' AND payment_status != 'paid').
+      // NOTE: 'paid' lives in payment_status, NOT status — the status column's
+      // CHECK only allows pending_approval/approved/cancelled. Normal PIs
+      // always have grand_total > 0 and are untouched by this.
+      const zeroPayable = parseFloat(pi.grand_total) <= 0.011;
+
       await client.query(
         `UPDATE purchase_invoices
          SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW(),
-             payout_due_date=NULL, payout_schedule=$2
+             payout_due_date=NULL, payout_schedule=$2,
+             payment_status=$4
          WHERE id=$3`,
-        [req.user?.id || null, payout_schedule, id]
+        [req.user?.id || null, payout_schedule, id, zeroPayable ? 'paid' : 'pending']
       );
 
       // If split: create 3 equal installments (1/3 each). due_date starts

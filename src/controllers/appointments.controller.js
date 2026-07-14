@@ -106,6 +106,7 @@ const createSchema = z.object({
   scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Time must be HH:MM').optional().nullable(),
   status_id: z.coerce.number().int().positive().optional().nullable(),
   notes: z.string().trim().max(3000).optional().nullable(),
+  odometer_km: z.coerce.number().int().nonnegative().optional().nullable(),
   pickup_required: z.boolean().optional().default(false),
   pickup_address_line1: z.string().trim().max(200).optional().nullable(),
   pickup_address_line2: z.string().trim().max(200).optional().nullable(),
@@ -138,6 +139,7 @@ const updateSchema = z.object({
   scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional().nullable(),
   notes: z.string().trim().max(3000).optional().nullable(),
+  odometer_km: z.coerce.number().int().nonnegative().optional().nullable(),
   hub_id: z.coerce.number().int().positive().optional().nullable(),
   vehicle_number: z.string().trim().max(30).optional().nullable(),
   cancellation_reason: z.string().trim().max(500).optional().nullable(),
@@ -209,6 +211,9 @@ const APPT_SELECT = `
     a.scheduled_time,
     a.total_price,
     a.notes,
+    a.odometer_km,
+    a.is_warranty_redo,
+    a.warranty_claim_id,
     a.cancellation_reason,
     a.pickup_required,
     a.pickup_address_line1,
@@ -354,13 +359,13 @@ function createAppointment(req, res, next) {
           pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode, pickup_maps_link,
           pickup_scheduled_date, pickup_scheduled_time,
           drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode, drop_maps_link,
-          assigned_to, created_by, public_token
+          assigned_to, created_by, public_token, odometer_km
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
           $18,$19,$20,$21,$22,$23,
           $24,$25,
           $26,$27,$28,$29,$30,$31,
-          $32,$33,$34
+          $32,$33,$34,$35
         ) RETURNING id`,
         [
           data.lead_id || null,           // $1
@@ -397,6 +402,7 @@ function createAppointment(req, res, next) {
           assignedTo,                            // $32
           req.user.id,                           // $33
           generatePublicToken(),                 // $34
+          data.odometer_km ?? null,              // $35
         ]
       );
 
@@ -709,6 +715,7 @@ function updateAppointment(req, res, next) {
     if (data.scheduled_date !== undefined) { params.push(data.scheduled_date); fields.push(`scheduled_date      = $${params.length}`); }
     if (data.scheduled_time !== undefined) { params.push(data.scheduled_time); fields.push(`scheduled_time      = $${params.length}`); }
     if (data.notes !== undefined) { params.push(data.notes); fields.push(`notes               = $${params.length}`); }
+    if (data.odometer_km !== undefined) { params.push(data.odometer_km); fields.push(`odometer_km         = $${params.length}`); }
     if (data.hub_id !== undefined) { params.push(data.hub_id); fields.push(`hub_id              = $${params.length}`); }
     if (data.vehicle_number !== undefined) { params.push(data.vehicle_number); fields.push(`vehicle_number      = $${params.length}`); }
     if (data.cancellation_reason !== undefined) { params.push(data.cancellation_reason); fields.push(`cancellation_reason = $${params.length}`); }

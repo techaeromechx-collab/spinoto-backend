@@ -38,6 +38,19 @@ const itemSchema = z.object({
   discount_value:  z.coerce.number().nonnegative().optional().default(0),
   discount_amount: z.coerce.number().nonnegative().optional().default(0),
   discount_source: z.enum(['master', 'manual']).optional().nullable(),
+  // Warranty/guarantee snapshots — resolved from warranty_master at add-time
+  // and frozen here so later master edits never change what this estimate
+  // promised. Both promise types can apply to the same line at once.
+  warranty_months: z.coerce.number().int().positive().optional().nullable(),
+  warranty_days:   z.coerce.number().int().positive().optional().nullable(),
+  warranty_km:     z.coerce.number().int().positive().optional().nullable(),
+  warranty_text:   z.string().trim().max(300).optional().nullable(),
+  warranty_source: z.enum(['master', 'manual']).optional().nullable(),
+  guarantee_months: z.coerce.number().int().positive().optional().nullable(),
+  guarantee_days:   z.coerce.number().int().positive().optional().nullable(),
+  guarantee_km:     z.coerce.number().int().positive().optional().nullable(),
+  guarantee_text:   z.string().trim().max(300).optional().nullable(),
+  guarantee_source: z.enum(['master', 'manual']).optional().nullable(),
 });
 
 // Shared B2B fields, validated the same way on create and update: when
@@ -90,6 +103,7 @@ const createSchema = z.object({
   body_type_id:              z.coerce.number().int().positive().optional().nullable(),
   segment_ids:               z.array(z.coerce.number().int().positive()).optional().default([]),
   cc_category_id:            z.coerce.number().int().positive().optional().nullable(),
+  odometer_km:               z.coerce.number().int().nonnegative().optional().nullable(),
 }).superRefine((data, ctx) => {
   b2bFieldsRefine(data, ctx);
   if (!data.appointment_id) {
@@ -264,6 +278,16 @@ async function _getItems(estimateId) {
        ei.discount_value,
        ei.discount_amount,
        ei.discount_source,
+       ei.warranty_months,
+       ei.warranty_days,
+       ei.warranty_km,
+       ei.warranty_text,
+       ei.warranty_source,
+       ei.guarantee_months,
+       ei.guarantee_days,
+       ei.guarantee_km,
+       ei.guarantee_text,
+       ei.guarantee_source,
        ei.created_at,
        ei.updated_at,
        COALESCE(ei.hsn_sac, s.sac_code, p.hsn_code) AS hsn_sac,
@@ -289,6 +313,8 @@ const EST_SELECT = `
     e.hub_id,
     e.status,
     e.notes,
+    e.odometer_km,
+    e.warranty_claim_id,
     e.subtotal_ex_gst,
     e.total_gst,
     e.grand_total,
@@ -555,9 +581,9 @@ function createEstimate(req, res, next) {
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
             customer_name, mobile, whatsapp, vehicle_number,
             vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id,
-            public_token)
+            public_token, odometer_km)
          VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
          RETURNING id`,
         [
           data.appointment_id || null, data.hub_id, data.notes || null, req.user.id,
@@ -581,6 +607,7 @@ function createEstimate(req, res, next) {
           isStandalone ? (data.segment_ids     || [])   : [],
           isStandalone ? (data.cc_category_id  || null) : null,
           generatePublicToken(),
+          data.odometer_km ?? null,
         ]
       );
 
@@ -613,13 +640,15 @@ function createEstimate(req, res, next) {
              (estimate_id, item_type, service_id, part_id, description,
               quantity, customer_rate, gst_percent, gst_amount, total_inc_gst,
               is_from_appointment, hsn_sac,
-              discount_type, discount_value, discount_amount, discount_source)
+              discount_type, discount_value, discount_amount, discount_source,
+              warranty_months, warranty_days, warranty_km, warranty_text, warranty_source,
+              guarantee_months, guarantee_days, guarantee_km, guarantee_text, guarantee_source)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
              COALESCE(
                (SELECT sac_code FROM services WHERE id = $3),
                (SELECT hsn_code FROM parts    WHERE id = $4)
              ),
-             $12,$13,$14,$15)`,
+             $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
           [
             estimateId,
             item.item_type,
@@ -636,6 +665,16 @@ function createEstimate(req, res, next) {
             forceZeroDiscount ? 0           : (item.discount_value  || 0),
             forceZeroDiscount ? 0           : discountAmt,
             forceZeroDiscount ? null        : (item.discount_source || null),
+            item.warranty_months ?? null,
+            item.warranty_days   ?? null,
+            item.warranty_km     ?? null,
+            item.warranty_text   || null,
+            item.warranty_source || null,
+            item.guarantee_months ?? null,
+            item.guarantee_days   ?? null,
+            item.guarantee_km     ?? null,
+            item.guarantee_text   || null,
+            item.guarantee_source || null,
           ]
         );
       }
@@ -832,13 +871,15 @@ function updateEstimate(req, res, next) {
                (estimate_id, item_type, service_id, part_id, description,
                 quantity, customer_rate, gst_percent, gst_amount, total_inc_gst,
                 is_from_appointment, hsn_sac,
-                discount_type, discount_value, discount_amount, discount_source)
+                discount_type, discount_value, discount_amount, discount_source,
+                warranty_months, warranty_days, warranty_km, warranty_text, warranty_source,
+                guarantee_months, guarantee_days, guarantee_km, guarantee_text, guarantee_source)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
                COALESCE(
                  (SELECT sac_code FROM services WHERE id = $3),
                  (SELECT hsn_code FROM parts    WHERE id = $4)
                ),
-               $12,$13,$14,$15)
+               $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
              RETURNING id`,
             [
               id,
@@ -856,6 +897,16 @@ function updateEstimate(req, res, next) {
               forceZeroDiscount ? 0    : (item.discount_value  || 0),
               forceZeroDiscount ? 0    : discountAmt,
               forceZeroDiscount ? null : (item.discount_source || null),
+              item.warranty_months ?? null,
+              item.warranty_days   ?? null,
+              item.warranty_km     ?? null,
+              item.warranty_text   || null,
+              item.warranty_source || null,
+              item.guarantee_months ?? null,
+              item.guarantee_days   ?? null,
+              item.guarantee_km     ?? null,
+              item.guarantee_text   || null,
+              item.guarantee_source || null,
             ]
           );
 

@@ -5,6 +5,7 @@ const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
+const { resolveClaimForEstimate } = require('./warranty_claims.controller');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -19,13 +20,15 @@ function handle(req, res, next, fn) {
 const CI_SELECT = `
   SELECT
     ci.id, ci.public_token, ci.purchase_invoice_id, ci.estimate_id, est_ctx.public_token AS estimate_token, ci.appointment_id, ci.hub_id,
+    est_ctx.warranty_claim_id,
+    (SELECT wc.claim_code FROM warranty_claims wc WHERE wc.id = est_ctx.warranty_claim_id) AS warranty_claim_code,
     -- Fall back to appointment data if CI columns were stored as null
     COALESCE(ci.customer_name, a.customer_name) AS customer_name,
     COALESCE(ci.mobile,        a.mobile)        AS mobile,
     (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(ci.mobile, a.mobile)) AS customer_token,
     COALESCE(ci.vehicle_number, a.vehicle_number) AS vehicle_number,
     ci.status, ci.subtotal_ex_gst, ci.total_gst, ci.grand_total, ci.amount_paid,
-    ci.notes, ci.created_at, ci.updated_at,
+    ci.notes, ci.odometer_km, ci.created_at, ci.updated_at,
     ci.discount_mode, ci.transaction_discount_type,
     ci.transaction_discount_value, ci.transaction_discount_amount,
     ci.is_b2b, ci.b2b_company_name, ci.b2b_gst_number, ci.b2b_address,
@@ -62,10 +65,19 @@ const CI_SELECT = `
 
 async function _getItems(ciId) {
   const r = await pool.query(
-    `SELECT id, estimate_item_id, item_type, description, quantity,
-            customer_rate, gst_percent, gst_amount, total_inc_gst, hsn_sac,
-            discount_type, discount_value, discount_amount
-     FROM customer_invoice_items WHERE customer_invoice_id = $1 ORDER BY id`,
+    `SELECT cii.id, cii.estimate_item_id, cii.item_type, cii.description, cii.quantity,
+            cii.customer_rate, cii.gst_percent, cii.gst_amount, cii.total_inc_gst, cii.hsn_sac,
+            cii.discount_type, cii.discount_value, cii.discount_amount,
+            cii.warranty_months, cii.warranty_days, cii.warranty_km, cii.warranty_text,
+            cii.guarantee_months, cii.guarantee_days, cii.guarantee_km, cii.guarantee_text,
+            wc.id AS claim_id, wc.claim_code, wc.status AS claim_status, wc.claim_type
+     FROM customer_invoice_items cii
+     LEFT JOIN LATERAL (
+       SELECT id, claim_code, status, claim_type FROM warranty_claims
+       WHERE customer_invoice_item_id = cii.id
+       ORDER BY id DESC LIMIT 1
+     ) wc ON TRUE
+     WHERE cii.customer_invoice_id = $1 ORDER BY cii.id`,
     [ciId]
   );
   return r.rows;
@@ -85,14 +97,14 @@ async function _getPayments(ciId) {
 
 async function _recalcStatus(client, ciId) {
   const r = await client.query(
-    `SELECT ci.grand_total, ci.status AS current_status, ci.appointment_id,
+    `SELECT ci.grand_total, ci.status AS current_status, ci.appointment_id, ci.estimate_id,
             COALESCE(SUM(p.amount),0) AS paid
      FROM customer_invoices ci
      LEFT JOIN customer_invoice_payments p ON p.customer_invoice_id = ci.id
-     WHERE ci.id = $1 GROUP BY ci.grand_total, ci.status, ci.appointment_id`,
+     WHERE ci.id = $1 GROUP BY ci.grand_total, ci.status, ci.appointment_id, ci.estimate_id`,
     [ciId]
   );
-  const { grand_total, current_status, appointment_id, paid } = r.rows[0];
+  const { grand_total, current_status, appointment_id, estimate_id, paid } = r.rows[0];
   const amtPaid = parseFloat(paid);
   const total   = parseFloat(grand_total);
 
@@ -117,7 +129,7 @@ async function _recalcStatus(client, ciId) {
   // below 'paid' clears it again. See utils/payoutSchedule.js.
   await syncPayoutDueDate(client, { customerInvoiceId: ciId });
 
-  return { status, appointment_id };
+  return { status, appointment_id, estimate_id };
 }
 
 function listCustomerInvoices(req, res, next) {
@@ -247,6 +259,8 @@ function addPayment(req, res, next) {
     // Auto-advance appointment → CLOSED when CI is fully paid
     if (recalcResult?.status === 'paid') {
       await advanceAppointmentStatus(recalcResult.appointment_id, 'closed');
+      // If this CI belongs to a warranty-redo estimate, resolve the claim
+      await resolveClaimForEstimate(recalcResult.estimate_id);
     }
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
@@ -296,7 +310,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
               e.discount_mode, e.transaction_discount_type,
               e.transaction_discount_value, e.transaction_discount_amount,
               e.is_b2b, e.b2b_company_name, e.b2b_gst_number, e.b2b_address,
-              e.customer_name, e.mobile, e.vehicle_number, e.notes
+              e.customer_name, e.mobile, e.vehicle_number, e.notes,
+              e.odometer_km, e.warranty_claim_id
        FROM estimates e WHERE e.id = $1`,
       [estimate_id]
     );
@@ -318,6 +333,9 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
         error: 'A purchase invoice must be created and approved before generating a customer invoice.',
       });
     }
+    // Note: PI payment progress lives in payment_status, not status — status
+    // stays 'approved' after approval, so checking 'approved' alone is correct
+    // (incl. ₹0 warranty-redo PIs, whose payment_status is auto-set 'paid').
     if (piRow.rows[0].status !== 'approved') {
       return res.status(400).json({
         error: `The purchase invoice must be approved before generating a customer invoice (current PI status: ${piRow.rows[0].status}).`,
@@ -339,10 +357,10 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     // Pull appointment details for the CI header — falls back to the
     // estimate's own standalone customer/vehicle columns when there is no
     // linked appointment.
-    let appt = { customer_name: est.customer_name, mobile: est.mobile, vehicle_number: est.vehicle_number };
+    let appt = { customer_name: est.customer_name, mobile: est.mobile, vehicle_number: est.vehicle_number, odometer_km: est.odometer_km ?? null };
     if (est.appointment_id) {
       const apptRow = await pool.query(
-        `SELECT customer_name, mobile, vehicle_number FROM appointments WHERE id = $1`,
+        `SELECT customer_name, mobile, vehicle_number, odometer_km FROM appointments WHERE id = $1`,
         [est.appointment_id]
       );
       appt = apptRow.rows[0] || appt;
@@ -418,8 +436,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
             discount_mode, transaction_discount_type,
             transaction_discount_value, transaction_discount_amount,
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
-            notes, public_token)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
+            notes, public_token, odometer_km)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
@@ -435,6 +453,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           // mobile/vehicle_number above).
           est.notes || null,
           generatePublicToken(),
+          // Odometer baseline for warranty-claim KM validation
+          appt.odometer_km ?? null,
         ]
       );
       const ciId = ciRow.rows[0].id;
@@ -444,19 +464,43 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           `INSERT INTO customer_invoice_items
              (customer_invoice_id, estimate_item_id, item_type, description,
               quantity, customer_rate, gst_percent, gst_amount, total_inc_gst, hsn_sac,
-              discount_type, discount_value, discount_amount)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+              discount_type, discount_value, discount_amount,
+              warranty_months, warranty_days, warranty_km, warranty_text,
+              guarantee_months, guarantee_days, guarantee_km, guarantee_text)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
           [ciId, item.id, item.item_type, item.description,
            item.quantity, item.customer_rate, item.gst_percent,
            item.gst_amount.toFixed(2), item.total_inc_gst.toFixed(2),
            item.hsn_sac || null,
-           item.discount_type || null, item.discount_value || 0, item.discount_amount || 0]
+           item.discount_type || null, item.discount_value || 0, item.discount_amount || 0,
+           // Warranty/guarantee snapshots carried from the estimate item
+           // (frozen at estimate time — never re-looked-up from the master).
+           item.warranty_months ?? null, item.warranty_days ?? null,
+           item.warranty_km ?? null, item.warranty_text || null,
+           item.guarantee_months ?? null, item.guarantee_days ?? null,
+           item.guarantee_km ?? null, item.guarantee_text || null]
         );
       }
+      // A ₹0 invoice (free warranty redo) is settled by definition — no
+      // payment will ever arrive, so mark it paid right away. Normal invoices
+      // always have grand_total > 0 and are untouched by this.
+      const isZeroTotal = grandTotal <= 0.011;
+      if (isZeroTotal) {
+        await client.query(
+          `UPDATE customer_invoices SET status = 'paid', amount_paid = 0, updated_at = NOW() WHERE id = $1`,
+          [ciId]
+        );
+      }
+
       await client.query('COMMIT');
 
       // Advance appointment → Invoice Generated
       await advanceAppointmentStatus(est.appointment_id, 'invoice-generated');
+      if (isZeroTotal) {
+        // Free redo: nothing to collect — close out and resolve the claim
+        await advanceAppointmentStatus(est.appointment_id, 'closed');
+        await resolveClaimForEstimate(estimate_id);
+      }
 
       const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [ciId]);
       full.rows[0].items    = await _getItems(ciId);
@@ -653,13 +697,19 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
           `INSERT INTO customer_invoice_items
              (customer_invoice_id, estimate_item_id, item_type, description,
               quantity, customer_rate, gst_percent, gst_amount, total_inc_gst, hsn_sac,
-              discount_type, discount_value, discount_amount)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+              discount_type, discount_value, discount_amount,
+              warranty_months, warranty_days, warranty_km, warranty_text,
+              guarantee_months, guarantee_days, guarantee_km, guarantee_text)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
           [
             id, item.id, item.item_type, item.description,
             item.quantity, item.customer_rate, item.gst_percent,
             item.gst_amount, item.total_inc_gst, item.hsn_sac || null,
             item.discount_type || null, item.discount_value || 0, item.discount_amount || 0,
+            item.warranty_months ?? null, item.warranty_days ?? null,
+            item.warranty_km ?? null, item.warranty_text || null,
+            item.guarantee_months ?? null, item.guarantee_days ?? null,
+            item.guarantee_km ?? null, item.guarantee_text || null,
           ]
         );
       }

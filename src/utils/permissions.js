@@ -479,6 +479,64 @@ const PERMISSIONS = Object.freeze({
     group: 'Discounts',
   },
 
+  // ---- Warranties ----
+  CREATE_WARRANTY: {
+    code: 'CREATE_WARRANTY',
+    label: 'Create Warranty',
+    description: 'Add new warranty rules to the warranty master.',
+    group: 'Warranties',
+  },
+  EDIT_WARRANTY: {
+    code: 'EDIT_WARRANTY',
+    label: 'Edit Warranty',
+    description: 'Update existing warranty rules.',
+    group: 'Warranties',
+  },
+  DELETE_WARRANTY: {
+    code: 'DELETE_WARRANTY',
+    label: 'Delete Warranty',
+    description: 'Remove warranty rules permanently.',
+    group: 'Warranties',
+  },
+  MANAGE_WARRANTIES: {
+    code: 'MANAGE_WARRANTIES',
+    label: 'Manage Warranties (Full)',
+    description: 'Full access — create, edit, and delete warranty rules. Prefer granular permissions above.',
+    group: 'Warranties',
+  },
+
+  // ---- Warranty Claims ----
+  VIEW_CLAIM: {
+    code: 'VIEW_CLAIM',
+    label: 'View Warranty Claims',
+    description: 'See warranty claims and their status.',
+    group: 'Warranty Claims',
+  },
+  CREATE_CLAIM: {
+    code: 'CREATE_CLAIM',
+    label: 'Register Warranty Claim',
+    description: 'Register new warranty claims against paid customer invoices.',
+    group: 'Warranty Claims',
+  },
+  APPROVE_CLAIM: {
+    code: 'APPROVE_CLAIM',
+    label: 'Approve / Reject Claims',
+    description: 'Decide warranty claims — approve (incl. expired goodwill cases) or reject.',
+    group: 'Warranty Claims',
+  },
+  RESOLVE_CLAIM: {
+    code: 'RESOLVE_CLAIM',
+    label: 'Create Redo Jobs',
+    description: 'Create the redo appointment + estimate for an approved claim.',
+    group: 'Warranty Claims',
+  },
+  MANAGE_CLAIMS: {
+    code: 'MANAGE_CLAIMS',
+    label: 'Manage Warranty Claims (Full)',
+    description: 'Full access to the entire warranty claim workflow.',
+    group: 'Warranty Claims',
+  },
+
   // ---- Operations ----
   BULK_UPLOAD: {
     code: 'BULK_UPLOAD',
