@@ -727,6 +727,27 @@ function claimStats(req, res, next) {
   });
 }
 
+// ── AUTO-UNRESOLVE hook ───────────────────────────────────────────────────────
+// Mirror of resolveClaimForEstimate: called when a redo CI drops back BELOW
+// 'paid' (payment deleted) — the claim returns to 'approved' so it doesn't
+// read as settled while its invoice is outstanding. Fire-and-forget.
+async function unresolveClaimForEstimate(estimateId) {
+  if (!estimateId) return;
+  try {
+    const r = await pool.query(
+      `UPDATE warranty_claims wc
+          SET status = 'approved', updated_at = NOW()
+        FROM estimates e
+        WHERE e.id = $1 AND e.warranty_claim_id = wc.id AND wc.status = 'resolved'
+        RETURNING wc.id`,
+      [estimateId]
+    );
+    if (r.rowCount > 0) getIO().emit('invalidate', { topic: 'warranty_claims' });
+  } catch (err) {
+    console.error('[warranty_claims] auto-unresolve failed:', err.message);
+  }
+}
+
 // ── AUTO-RESOLVE hook ─────────────────────────────────────────────────────────
 // Called by customer_invoices.controller.js when a redo CI reaches 'paid'.
 // Fire-and-forget: never blocks the payment flow.
@@ -749,5 +770,5 @@ async function resolveClaimForEstimate(estimateId) {
 module.exports = {
   listClaims, getClaim, eligibleItems, createClaim, updateClaim,
   reviewClaim, approveClaim, rejectClaim, cancelClaim, createRedo,
-  claimStats, resolveClaimForEstimate, validateClaim,
+  claimStats, resolveClaimForEstimate, unresolveClaimForEstimate, validateClaim,
 };

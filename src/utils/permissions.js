@@ -334,8 +334,14 @@ const PERMISSIONS = Object.freeze({
   },
   ADD_INVOICE_PAYMENT: {
     code: 'ADD_INVOICE_PAYMENT',
-    label: 'Add / Delete Invoice Payment',
-    description: 'Record payment entries against an invoice and delete incorrect payments.',
+    label: 'Add Invoice Payment',
+    description: 'Record payment entries against an invoice.',
+    group: 'Invoices',
+  },
+  DELETE_INVOICE_PAYMENT: {
+    code: 'DELETE_INVOICE_PAYMENT',
+    label: 'Delete Invoice Payment',
+    description: 'Delete payment entries — including from fully PAID invoices, which reopens the appointment and pulls the hub payout back.',
     group: 'Invoices',
   },
 

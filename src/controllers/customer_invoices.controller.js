@@ -5,7 +5,7 @@ const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
-const { resolveClaimForEstimate } = require('./warranty_claims.controller');
+const { resolveClaimForEstimate, unresolveClaimForEstimate } = require('./warranty_claims.controller');
 
 const idParam = z.coerce.number().int().positive();
 
@@ -37,6 +37,7 @@ const CI_SELECT = `
     (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
     (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_token,
+    (SELECT COALESCE(pi.amount_paid, 0) FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id ORDER BY pi.id DESC LIMIT 1) AS linked_pi_amount_paid,
 
     -- Vehicle details — from the linked appointment when present, otherwise
     -- (standalone estimate, no appointment) from the linked estimate's own
@@ -275,18 +276,53 @@ function deletePayment(req, res, next) {
     const id    = idParam.parse(req.params.id);
     const payId = idParam.parse(req.params.payId);
 
+    // Capture the pre-delete status — deleting a payment off a PAID invoice
+    // must also walk back the side effects that firing 'paid' caused.
+    const prevRow = await pool.query(`SELECT status FROM customer_invoices WHERE id = $1`, [id]);
+    if (!prevRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    const prevStatus = prevRow.rows[0].status;
+
+    // HARD BLOCK: once the hub has actually been paid for this job, the
+    // customer payment can no longer be deleted — deleting it wouldn't
+    // reverse money already sent to the hub, leaving the company out of
+    // pocket with no record of why. Reverse the hub payment first.
+    const piRow = await pool.query(
+      `SELECT COALESCE(pi.amount_paid, 0) AS amount_paid
+         FROM purchase_invoices pi
+        WHERE pi.estimate_id = (SELECT estimate_id FROM customer_invoices WHERE id = $1)
+        ORDER BY pi.id DESC LIMIT 1`,
+      [id]
+    );
+    const hubPaid = piRow.rows[0] ? parseFloat(piRow.rows[0].amount_paid) : 0;
+    if (hubPaid > 0) {
+      return res.status(409).json({
+        error: `Hub payout of ₹${hubPaid.toFixed(2)} has already been made for this job — this payment can no longer be deleted. Reverse the hub payment on the Purchase Invoice first.`,
+      });
+    }
+
     const r = await pool.query(`DELETE FROM customer_invoice_payments WHERE id=$1 AND customer_invoice_id=$2`, [payId, id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Payment not found' });
 
+    let recalcResult = null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await _recalcStatus(client, id);
+      recalcResult = await _recalcStatus(client, id);
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally { client.release(); }
+
+    // Invoice dropped BELOW paid → reverse the paid side effects:
+    //  1. reopen the appointment (closed → invoice-approved)
+    //  2. un-resolve a redo warranty claim, if this CI belongs to one
+    // (payout due dates are already cleared inside _recalcStatus via
+    //  syncPayoutDueDate — it always reflects the CI's current paid state)
+    if (prevStatus === 'paid' && recalcResult?.status !== 'paid') {
+      await advanceAppointmentStatus(recalcResult.appointment_id, 'invoice-approved');
+      await unresolveClaimForEstimate(recalcResult.estimate_id);
+    }
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     full.rows[0].items    = await _getItems(id);

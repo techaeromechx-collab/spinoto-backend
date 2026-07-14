@@ -19,6 +19,8 @@ const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
+const { logActivity } = require('../services/activityLog.service');
+const { getIO } = require('../socket');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -119,6 +121,12 @@ const createSchema = z.object({
 const updateSchema = z.object({
   notes:                     z.string().trim().max(3000).optional().nullable(),
   items:                     z.array(itemSchema).optional(),
+  // Hub reassignment — guarded in updateEstimate: free while no PI exists,
+  // needs confirm_regenerate_pi with an unpaid PI (old PI is deleted and must
+  // be regenerated), hard-blocked once the hub has actually been paid.
+  hub_id:                    z.coerce.number().int().positive().optional(),
+  confirm_regenerate_pi:     z.boolean().optional().default(false),
+  confirm_cost_bearer_company: z.boolean().optional().default(false),
   discount_mode:             z.enum(['none', 'line_item', 'transaction']).optional(),
   transaction_discount_type: z.enum(['percent', 'flat']).optional().nullable(),
   transaction_discount_value: z.coerce.number().nonnegative().optional(),
@@ -378,11 +386,13 @@ const EST_SELECT = `
     (SELECT ci.id     FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_id,
     (SELECT ci.public_token FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_token,
     (SELECT ci.status FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_status,
+    (SELECT ci.grand_total FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_total,
 
     -- Linked purchase invoice (id + status, so UI can gate CI generation)
     (SELECT pi.id     FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_id,
     (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_token,
-    (SELECT pi.status FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_status
+    (SELECT pi.status FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_status,
+    (SELECT pi.grand_total FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_total
 
   FROM estimates e
   LEFT JOIN appointments  a    ON a.id    = e.appointment_id
@@ -707,13 +717,15 @@ function updateEstimate(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
 
-    const cur = await pool.query(`SELECT id, status, created_at, appointment_id, mobile FROM estimates WHERE id = $1`, [id]);
+    const cur = await pool.query(`SELECT id, status, created_at, appointment_id, mobile, hub_id, warranty_claim_id FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
-    const { status, created_at, appointment_id, mobile: standaloneMobile } = cur.rows[0];
+    const { status, created_at, appointment_id, mobile: standaloneMobile, hub_id: currentHubId, warranty_claim_id: claimId } = cur.rows[0];
     const roundFn = getRoundingFunction(created_at);
     // Status restriction removed — estimates can be edited at any status.
     // Invoice sync is handled separately after save.
+
+    const hubChanged = data.hub_id !== undefined && Number(data.hub_id) !== Number(currentHubId);
 
     if (
       data.notes === undefined &&
@@ -724,9 +736,68 @@ function updateEstimate(req, res, next) {
       data.is_b2b === undefined &&
       data.b2b_company_name === undefined &&
       data.b2b_gst_number === undefined &&
-      data.b2b_address === undefined
+      data.b2b_address === undefined &&
+      !hubChanged
     ) {
       return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    // ── Hub reassignment guards ─────────────────────────────────────────────
+    // Rules (see SPEC_estimate_hub_reassignment.md):
+    //   no PI            → free
+    //   unpaid PI        → allowed with confirm_regenerate_pi (old PI deleted)
+    //   hub already paid → hard block (money moved on the old hub's terms)
+    let deletedPiId = null;
+    let newHubName  = null, oldHubName = null;
+    if (hubChanged) {
+      const hubRow = await pool.query(
+        `SELECT id, hub_name, is_active FROM hubs WHERE id = $1`, [data.hub_id]);
+      if (!hubRow.rows[0]) return res.status(400).json({ error: 'Selected hub does not exist.' });
+      if (!hubRow.rows[0].is_active) return res.status(400).json({ error: `${hubRow.rows[0].hub_name} is inactive — pick an active hub.` });
+      newHubName = hubRow.rows[0].hub_name;
+      const oldHubRow = await pool.query(`SELECT hub_name FROM hubs WHERE id = $1`, [currentHubId]);
+      oldHubName = oldHubRow.rows[0]?.hub_name || `Hub #${currentHubId}`;
+
+      const piRow = await pool.query(
+        `SELECT id, status, payment_status, COALESCE(amount_paid, 0) AS amount_paid, grand_total
+           FROM purchase_invoices WHERE estimate_id = $1 ORDER BY id DESC LIMIT 1`, [id]);
+      const pi = piRow.rows[0] || null;
+
+      if (pi && parseFloat(pi.amount_paid) > 0) {
+        return res.status(409).json({
+          code: 'HUB_PAID',
+          error: `Hub payout of ₹${parseFloat(pi.amount_paid).toFixed(2)} has already been made to ${oldHubName} — the hub can no longer be changed. Reverse the hub payment on Purchase Invoice PI-${String(pi.id).padStart(6, '0')} first, or create a new job for the new hub.`,
+        });
+      }
+
+      // Warranty redo estimate: reassigning away from the at-fault hub while
+      // the claim says 'hub bears the cost' would punish the wrong hub.
+      if (claimId) {
+        const claimRow = await pool.query(
+          `SELECT cost_bearer, claim_code FROM warranty_claims WHERE id = $1`, [claimId]);
+        const claim = claimRow.rows[0];
+        if (claim?.cost_bearer === 'hub' && !data.confirm_cost_bearer_company) {
+          return res.status(409).json({
+            code: 'REDO_COST_BEARER',
+            error: `This is a warranty-redo estimate for claim ${claim.claim_code}, where ${oldHubName} bears the redo cost. Moving the work to ${newHubName} means the company must bear the cost instead (the new hub is not at fault). Confirm to continue.`,
+          });
+        }
+      }
+
+      if (pi) {
+        if (!data.confirm_regenerate_pi) {
+          return res.status(409).json({
+            code: 'PI_EXISTS',
+            error: `A purchase invoice (PI-${String(pi.id).padStart(6, '0')}, ₹${parseFloat(pi.grand_total).toFixed(2)}, ${pi.status.replace(/_/g, ' ')}) was generated with ${oldHubName}'s rates. Changing the hub will DELETE it — a new PI must be generated with ${newHubName}'s rates. Confirm to continue.`,
+          });
+        }
+        // Confirmed: remove the old (unpaid) PI so a fresh one can be
+        // generated against the new hub's rates.
+        await pool.query(`DELETE FROM pi_payment_schedule WHERE purchase_invoice_id = $1`, [pi.id]);
+        await pool.query(`DELETE FROM purchase_invoice_items WHERE purchase_invoice_id = $1`, [pi.id]);
+        await pool.query(`DELETE FROM purchase_invoices WHERE id = $1`, [pi.id]);
+        deletedPiId = pi.id;
+      }
     }
 
     const client = await pool.connect();
@@ -740,6 +811,9 @@ function updateEstimate(req, res, next) {
 
       if (data.notes !== undefined) {
         setFields.push(`notes = $${n++}`); setVals.push(data.notes);
+      }
+      if (hubChanged) {
+        setFields.push(`hub_id = $${n++}`); setVals.push(data.hub_id);
       }
       if (data.discount_mode !== undefined) {
         setFields.push(`discount_mode = $${n++}`); setVals.push(data.discount_mode);
@@ -948,6 +1022,31 @@ function updateEstimate(req, res, next) {
         await recalcTotals(client, id);
       }
 
+      // ── Hub reassignment side effects (same transaction) ──────────────────
+      if (hubChanged) {
+        // Keep the linked appointment on the same hub (its appointment_code
+        // stays frozen by design — codes always reflect the original booking)
+        if (appointment_id) {
+          await client.query(
+            `UPDATE appointments SET hub_id = $1, updated_at = NOW() WHERE id = $2`,
+            [data.hub_id, appointment_id]
+          );
+        }
+        // Keep an existing customer invoice's hub display/scoping in sync
+        await client.query(
+          `UPDATE customer_invoices SET hub_id = $1, updated_at = NOW() WHERE estimate_id = $2`,
+          [data.hub_id, id]
+        );
+        // Redo estimate moved away from the at-fault hub → company bears cost
+        if (claimId && data.confirm_cost_bearer_company) {
+          await client.query(
+            `UPDATE warranty_claims SET cost_bearer = 'company', updated_at = NOW()
+              WHERE id = $1 AND cost_bearer = 'hub'`,
+            [claimId]
+          );
+        }
+      }
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -956,10 +1055,26 @@ function updateEstimate(req, res, next) {
       client.release();
     }
 
+    if (hubChanged) {
+      logActivity({
+        userId: req.user?.id, userName: req.user?.name,
+        action: 'estimate_hub_reassigned', entity: 'estimate', entityId: id,
+        description: `Hub reassigned ${oldHubName} → ${newHubName}${deletedPiId ? ` (PI-${String(deletedPiId).padStart(6, '0')} deleted for regeneration)` : ''}`,
+      });
+      getIO().emit('invalidate', { topic: 'appointments' });
+      getIO().emit('invalidate', { topic: 'purchase_invoices' });
+    }
+
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
     estimate.items = await _getItems(id);
-    return res.json({ item: estimate });
+    return res.json({
+      item: estimate,
+      ...(hubChanged ? {
+        hub_reassigned: { from: oldHubName, to: newHubName },
+        pi_deleted: deletedPiId ? `PI-${String(deletedPiId).padStart(6, '0')}` : null,
+      } : {}),
+    });
   });
 }
 

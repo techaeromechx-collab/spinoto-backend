@@ -16,6 +16,9 @@ const canView    = requirePermissionOrHub('VIEW_INVOICE', 'CREATE_INVOICE', 'EDI
 const canCreate  = requirePermission('CREATE_INVOICE');
 const canEdit    = requirePermission('EDIT_INVOICE');
 const canPayment = requirePermission('ADD_INVOICE_PAYMENT');
+// Deleting payments is higher-stakes (can un-pay a PAID invoice, reopen the
+// appointment, and pull the hub payout back) — gated by its own permission.
+const canDeletePayment = requirePermission('DELETE_INVOICE_PAYMENT');
 
 router.use(requireAuth);
 router.get('/',                        canView,    listCustomerInvoices);
@@ -28,5 +31,5 @@ router.patch('/:id',                   canEdit,    updateCustomerInvoiceNotes);
 router.post('/:id/approve',            canEdit,    approveCustomerInvoice);
 router.post('/:id/sync-from-estimate', canEdit,    syncCustomerInvoiceFromEstimate);
 router.post('/:id/payments',           canPayment, addPayment);
-router.delete('/:id/payments/:payId',  canPayment, deletePayment);
+router.delete('/:id/payments/:payId',  canDeletePayment, deletePayment);
 module.exports = router;
