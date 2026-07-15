@@ -26,6 +26,7 @@ router.get('/by-user',             canView,        c.getByUser);
 router.get('/user-detail/:userId', canView,        c.getUserDetail);
 
 // Analytics endpoints
+router.get('/hub-revenue',               canViewRevenue,  c.getHubRevenue);
 router.get('/analytics/revenue-trend',   canViewRevenue,  c.getRevenueTrend);
 router.get('/analytics/funnel',          canViewLeads,    c.getConversionFunnel);
 router.get('/analytics/top-performers',  canViewRevenue,  c.getTopPerformers);

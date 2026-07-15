@@ -863,9 +863,75 @@ async function getLeadsOverTime(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ── GET /api/reports/hub-revenue ──────────────────────────────────────────────
+// Actual revenue per hub = SUM(customer_invoices.grand_total) — the billed
+// customer value. Explicitly NOT hub payouts (PI totals), NOT quoted value
+// (estimates), NOT pipeline value (leads) — those live in other reports.
+// Filters: ?from=&to= (ci.created_at, inclusive both ends — same convention
+// as getRevenueTrend) and ?hub_id= (optional single hub).
+// Cancelled invoices are excluded. NULL-hub invoices group as "No hub".
+async function getHubRevenue(req, res, next) {
+  try {
+    const { from, to } = req.query;
+    const hubId = req.query.hub_id ? Number(req.query.hub_id) : null;
+
+    const params = [];
+    const where = [`ci.status != 'cancelled'`];
+
+    const dateWhere = dateParams(from, to, params, 'ci.created_at');
+    if (dateWhere) where.push(dateWhere);
+    if (hubId) { params.push(hubId); where.push(`ci.hub_id = $${params.length}`); }
+
+    const r = await pool.query(
+      `SELECT
+         ci.hub_id,
+         COALESCE(h.hub_name, 'No hub') AS hub_name,
+         COUNT(*)::int                  AS invoice_count,
+         COALESCE(SUM(ci.grand_total), 0)::numeric(14,2) AS revenue,
+         COALESCE(SUM(ci.amount_paid), 0)::numeric(14,2) AS collected,
+         -- Total PI amount = each CI's linked PI grand_total (latest PI per
+         -- estimate) — the gross figure, regardless of PI status or how much
+         -- of it has already been paid out to the hub.
+         -- Our take = revenue − total PI amount (both inc-GST, like-for-like).
+         COALESCE(SUM(pi.grand_total), 0)::numeric(14,2) AS hub_payable,
+         (COALESCE(SUM(ci.grand_total), 0) - COALESCE(SUM(pi.grand_total), 0))::numeric(14,2) AS our_take,
+         -- Outstanding to hub = the slice of the total PI amount not yet
+         -- paid out (grand_total − amount_paid per PI, floored at 0 so an
+         -- overpaid/adjusted PI never shows as negative).
+         COALESCE(SUM(GREATEST(pi.grand_total - COALESCE(pi.amount_paid, 0), 0)), 0)::numeric(14,2) AS outstanding_to_hub
+       FROM customer_invoices ci
+       LEFT JOIN hubs h ON h.id = ci.hub_id
+       LEFT JOIN LATERAL (
+         SELECT grand_total, amount_paid FROM purchase_invoices
+         WHERE estimate_id = ci.estimate_id
+         ORDER BY id DESC LIMIT 1
+       ) pi ON TRUE
+       WHERE ${where.join(' AND ')}
+       GROUP BY ci.hub_id, h.hub_name
+       ORDER BY revenue DESC, hub_name ASC`,
+      params
+    );
+
+    const total = r.rows.reduce(
+      (acc, row) => ({
+        revenue:            acc.revenue + Number(row.revenue),
+        collected:          acc.collected + Number(row.collected),
+        hub_payable:        acc.hub_payable + Number(row.hub_payable),
+        our_take:           acc.our_take + Number(row.our_take),
+        outstanding_to_hub: acc.outstanding_to_hub + Number(row.outstanding_to_hub),
+        invoice_count:      acc.invoice_count + row.invoice_count,
+      }),
+      { revenue: 0, collected: 0, hub_payable: 0, our_take: 0, outstanding_to_hub: 0, invoice_count: 0 }
+    );
+
+    res.json({ items: r.rows, total });
+  } catch (err) { next(err); }
+}
+
 module.exports = {
   getDashboardStats, getSummary, getStatusDistribution,
   getCategoryRevenue, getByUser, getUserDetail,
   getRevenueTrend, getConversionFunnel, getTopPerformers,
   getTeamPerformance, getLeadsOverTime, getLeadsBySource,
+  getHubRevenue,
 };
