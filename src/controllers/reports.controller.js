@@ -902,6 +902,9 @@ async function getHubRevenue(req, res, next) {
          -- estimate) — the gross figure, regardless of PI status or how much
          -- of it has already been paid out to the hub.
          COALESCE(SUM(pi.grand_total), 0)::numeric(14,2) AS hub_payable,
+         -- Same figure, but only counting PIs that are actually approved —
+         -- lets you see "approved" vs "total, incl. drafts/pending/rejected".
+         COALESCE(SUM(pi.grand_total) FILTER (WHERE pi.status = 'approved'), 0)::numeric(14,2) AS hub_payable_approved,
          -- Outstanding to hub = the slice of the total PI amount not yet
          -- paid out (grand_total − amount_paid per PI, floored at 0 so an
          -- overpaid/adjusted PI never shows as negative).
@@ -909,7 +912,7 @@ async function getHubRevenue(req, res, next) {
        FROM customer_invoices ci
        LEFT JOIN hubs h ON h.id = ci.hub_id
        LEFT JOIN LATERAL (
-         SELECT grand_total, amount_paid FROM purchase_invoices
+         SELECT grand_total, amount_paid, status FROM purchase_invoices
          WHERE estimate_id = ci.estimate_id
          ORDER BY id DESC LIMIT 1
        ) pi ON TRUE
@@ -952,6 +955,7 @@ async function getHubRevenue(req, res, next) {
         revenue: Number(row.revenue),
         collected: Number(row.collected),
         hub_payable: Number(row.hub_payable),
+        hub_payable_approved: Number(row.hub_payable_approved),
         outstanding_to_hub: Number(row.outstanding_to_hub),
         our_take: 0,
       });
@@ -969,24 +973,35 @@ async function getHubRevenue(req, res, next) {
           revenue: 0,
           collected: 0,
           hub_payable: 0,
+          hub_payable_approved: 0,
           outstanding_to_hub: 0,
           our_take: Number(row.our_take),
         });
       }
     }
 
+    // "All-modes estimate" = the simple Revenue − Total PI Amount figure this
+    // report showed before "Our take" was changed to match Payouts exactly.
+    // Kept alongside it as a rougher, broader estimate — includes commission
+    // jobs and non-approved PIs, unlike the Payouts-matching "our_take".
+    for (const row of merged.values()) {
+      row.our_take_est = row.revenue - row.hub_payable;
+    }
+
     const items = [...merged.values()].sort((a, b) => b.revenue - a.revenue || a.hub_name.localeCompare(b.hub_name));
 
     const total = items.reduce(
       (acc, row) => ({
-        revenue:            acc.revenue + row.revenue,
-        collected:          acc.collected + row.collected,
-        hub_payable:        acc.hub_payable + row.hub_payable,
-        our_take:           acc.our_take + row.our_take,
+        revenue:              acc.revenue + row.revenue,
+        collected:            acc.collected + row.collected,
+        hub_payable:          acc.hub_payable + row.hub_payable,
+        hub_payable_approved: acc.hub_payable_approved + row.hub_payable_approved,
+        our_take:             acc.our_take + row.our_take,
+        our_take_est:         acc.our_take_est + row.our_take_est,
         outstanding_to_hub: acc.outstanding_to_hub + row.outstanding_to_hub,
         invoice_count:      acc.invoice_count + row.invoice_count,
       }),
-      { revenue: 0, collected: 0, hub_payable: 0, our_take: 0, outstanding_to_hub: 0, invoice_count: 0 }
+      { revenue: 0, collected: 0, hub_payable: 0, hub_payable_approved: 0, our_take: 0, our_take_est: 0, outstanding_to_hub: 0, invoice_count: 0 }
     );
 
     res.json({ items, total });
