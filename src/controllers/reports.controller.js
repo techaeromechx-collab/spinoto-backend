@@ -867,22 +867,31 @@ async function getLeadsOverTime(req, res, next) {
 // Actual revenue per hub = SUM(customer_invoices.grand_total) — the billed
 // customer value. Explicitly NOT hub payouts (PI totals), NOT quoted value
 // (estimates), NOT pipeline value (leads) — those live in other reports.
-// Filters: ?from=&to= (ci.created_at, inclusive both ends — same convention
-// as getRevenueTrend) and ?hub_id= (optional single hub).
+// Filters: ?from=&to= (inclusive both ends — same convention as getRevenueTrend)
+// and ?hub_id= (optional single hub).
 // Cancelled invoices are excluded. NULL-hub invoices group as "No hub".
+//
+// "Our take" here is intentionally calculated the SAME way as the Payouts
+// page's "Total Take Rate" card (PayoutsPage.jsx / getTechRateSummary):
+// per purchase-invoice-item (customer_rate − hub_rate) × quantity, only for
+// approved, tech_rate-mode purchase invoices. This means commission-mode
+// jobs contribute $0 to "our take" here, same as on the Payouts page — the
+// two numbers are meant to reconcile now, not just both be "some kind of
+// margin". Revenue/Collected/Total PI Amount/Outstanding to Hub are a
+// separate, broader calculation (see below) and are unaffected by this.
 async function getHubRevenue(req, res, next) {
   try {
     const { from, to } = req.query;
     const hubId = req.query.hub_id ? Number(req.query.hub_id) : null;
 
-    const params = [];
-    const where = [`ci.status != 'cancelled'`];
+    // ── Query A: revenue-side numbers, driven by customer_invoices ──────────
+    const paramsA = [];
+    const whereA = [`ci.status != 'cancelled'`];
+    const dateWhereA = dateParams(from, to, paramsA, 'ci.created_at');
+    if (dateWhereA) whereA.push(dateWhereA);
+    if (hubId) { paramsA.push(hubId); whereA.push(`ci.hub_id = $${paramsA.length}`); }
 
-    const dateWhere = dateParams(from, to, params, 'ci.created_at');
-    if (dateWhere) where.push(dateWhere);
-    if (hubId) { params.push(hubId); where.push(`ci.hub_id = $${params.length}`); }
-
-    const r = await pool.query(
+    const revRes = await pool.query(
       `SELECT
          ci.hub_id,
          COALESCE(h.hub_name, 'No hub') AS hub_name,
@@ -892,9 +901,7 @@ async function getHubRevenue(req, res, next) {
          -- Total PI amount = each CI's linked PI grand_total (latest PI per
          -- estimate) — the gross figure, regardless of PI status or how much
          -- of it has already been paid out to the hub.
-         -- Our take = revenue − total PI amount (both inc-GST, like-for-like).
          COALESCE(SUM(pi.grand_total), 0)::numeric(14,2) AS hub_payable,
-         (COALESCE(SUM(ci.grand_total), 0) - COALESCE(SUM(pi.grand_total), 0))::numeric(14,2) AS our_take,
          -- Outstanding to hub = the slice of the total PI amount not yet
          -- paid out (grand_total − amount_paid per PI, floored at 0 so an
          -- overpaid/adjusted PI never shows as negative).
@@ -906,25 +913,83 @@ async function getHubRevenue(req, res, next) {
          WHERE estimate_id = ci.estimate_id
          ORDER BY id DESC LIMIT 1
        ) pi ON TRUE
-       WHERE ${where.join(' AND ')}
-       GROUP BY ci.hub_id, h.hub_name
-       ORDER BY revenue DESC, hub_name ASC`,
-      params
+       WHERE ${whereA.join(' AND ')}
+       GROUP BY ci.hub_id, h.hub_name`,
+      paramsA
     );
 
-    const total = r.rows.reduce(
+    // ── Query B: "our take", matching Payouts' Total Take Rate formula ──────
+    // Grouped by the purchase invoice's own hub_id (not the CI's), filtered
+    // by pi.created_at so it still respects the report's date range/hub
+    // filter — Payouts itself has no date filter, but this report does.
+    const paramsB = [];
+    const whereB = [`pi.status = 'approved'`, `pi.rate_mode = 'tech_rate'`];
+    const dateWhereB = dateParams(from, to, paramsB, 'pi.created_at');
+    if (dateWhereB) whereB.push(dateWhereB);
+    if (hubId) { paramsB.push(hubId); whereB.push(`pi.hub_id = $${paramsB.length}`); }
+
+    const takeRes = await pool.query(
+      `SELECT
+         pi.hub_id,
+         COALESCE(h.hub_name, 'No hub') AS hub_name,
+         COALESCE(SUM((pii.customer_rate - pii.hub_rate) * pii.quantity * (1 + pii.gst_percent / 100)), 0)::numeric(14,2) AS our_take
+       FROM purchase_invoice_items pii
+       JOIN purchase_invoices pi ON pi.id = pii.purchase_invoice_id
+       LEFT JOIN hubs h ON h.id = pi.hub_id
+       WHERE ${whereB.join(' AND ')}
+       GROUP BY pi.hub_id, h.hub_name`,
+      paramsB
+    );
+
+    // ── Merge both, keyed by hub_id (null-hub rows merge under the same key) ─
+    const merged = new Map();
+    const keyOf = (hid) => (hid === null || hid === undefined ? 'none' : String(hid));
+    for (const row of revRes.rows) {
+      merged.set(keyOf(row.hub_id), {
+        hub_id: row.hub_id,
+        hub_name: row.hub_name,
+        invoice_count: row.invoice_count,
+        revenue: Number(row.revenue),
+        collected: Number(row.collected),
+        hub_payable: Number(row.hub_payable),
+        outstanding_to_hub: Number(row.outstanding_to_hub),
+        our_take: 0,
+      });
+    }
+    for (const row of takeRes.rows) {
+      const key = keyOf(row.hub_id);
+      const existing = merged.get(key);
+      if (existing) {
+        existing.our_take = Number(row.our_take);
+      } else {
+        merged.set(key, {
+          hub_id: row.hub_id,
+          hub_name: row.hub_name,
+          invoice_count: 0,
+          revenue: 0,
+          collected: 0,
+          hub_payable: 0,
+          outstanding_to_hub: 0,
+          our_take: Number(row.our_take),
+        });
+      }
+    }
+
+    const items = [...merged.values()].sort((a, b) => b.revenue - a.revenue || a.hub_name.localeCompare(b.hub_name));
+
+    const total = items.reduce(
       (acc, row) => ({
-        revenue:            acc.revenue + Number(row.revenue),
-        collected:          acc.collected + Number(row.collected),
-        hub_payable:        acc.hub_payable + Number(row.hub_payable),
-        our_take:           acc.our_take + Number(row.our_take),
-        outstanding_to_hub: acc.outstanding_to_hub + Number(row.outstanding_to_hub),
+        revenue:            acc.revenue + row.revenue,
+        collected:          acc.collected + row.collected,
+        hub_payable:        acc.hub_payable + row.hub_payable,
+        our_take:           acc.our_take + row.our_take,
+        outstanding_to_hub: acc.outstanding_to_hub + row.outstanding_to_hub,
         invoice_count:      acc.invoice_count + row.invoice_count,
       }),
       { revenue: 0, collected: 0, hub_payable: 0, our_take: 0, outstanding_to_hub: 0, invoice_count: 0 }
     );
 
-    res.json({ items: r.rows, total });
+    res.json({ items, total });
   } catch (err) { next(err); }
 }
 
