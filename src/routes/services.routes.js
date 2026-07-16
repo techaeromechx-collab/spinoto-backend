@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const c = require('../controllers/services.controller');
+const { cacheGet } = require('../utils/responseCache');
 
 const router = express.Router();
 
@@ -15,7 +16,9 @@ const canDestroy = [requireAuth, requirePermission('DELETE_SERVICE', 'MANAGE_MAS
 const canManageHub = [requireAuth, requirePermission('EDIT_HUB', 'MANAGE_HUBS')];
 
 // Categories
-router.get   ('/categories',          canView,    c.listCategories);
+// Shared/non-per-user reference data, changes only via Master Data edits —
+// cached and invalidated the same way as vehicles (see vehicles.routes.js).
+router.get   ('/categories',          canView,    cacheGet('services'), c.listCategories);
 router.post  ('/categories',          canCreate,  c.createCategory);
 router.post  ('/categories/reorder',  canUpdate,  c.reorderCategories);
 router.patch ('/categories/:id',      canUpdate,  c.updateCategory);
@@ -25,7 +28,7 @@ router.post  ('/categories/:id/hubs', canManageHub, c.assignCategoryToHub);
 router.delete('/categories/:id/hubs/:hubId', canManageHub, c.unassignCategoryFromHub);
 
 // Services
-router.get   ('/services',          canView,    c.listServices);
+router.get   ('/services',          canView,    cacheGet('services'), c.listServices);
 router.get   ('/services/:id',      canView,    c.getService);
 router.get   ('/services/:id/hubs', canView,      c.getServiceHubs);
 router.post  ('/services/:id/hubs', canManageHub, c.assignServiceToHub);

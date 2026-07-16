@@ -1,6 +1,7 @@
 const { z } = require('zod');
 const { pool } = require('../config/db');
 const { getIO } = require('../socket');
+const { notifyHubsPricingChange } = require('../utils/hubNotify');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 
@@ -259,7 +260,17 @@ function createPricing(req, res, next) {
 
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [r.rows[0].id]);
     getIO().emit('invalidate', { topic: 'pricing' });
-    res.status(201).json({ item: enrichRow(full.rows[0]) });
+    const item = enrichRow(full.rows[0]);
+
+    notifyHubsPricingChange(pool, {
+      serviceId:  item.service_id,
+      categoryId: item.category_id,
+      targetName: item.target_name,
+      action:     'added',
+      price:      item.price,
+    }).catch(() => {});
+
+    res.status(201).json({ item });
   });
 }
 
@@ -308,7 +319,17 @@ function updatePricing(req, res, next) {
 
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [id]);
     getIO().emit('invalidate', { topic: 'pricing' });
-    res.json({ item: enrichRow(full.rows[0]) });
+    const item = enrichRow(full.rows[0]);
+
+    notifyHubsPricingChange(pool, {
+      serviceId:  item.service_id,
+      categoryId: item.category_id,
+      targetName: item.target_name,
+      action:     'updated',
+      price:      item.price,
+    }).catch(() => {});
+
+    res.json({ item });
   });
 }
 
@@ -326,7 +347,17 @@ function togglePricingStatus(req, res, next) {
     if (r.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
     const full = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [id]);
     getIO().emit('invalidate', { topic: 'pricing' });
-    res.json({ item: enrichRow(full.rows[0]) });
+    const item = enrichRow(full.rows[0]);
+
+    notifyHubsPricingChange(pool, {
+      serviceId:  item.service_id,
+      categoryId: item.category_id,
+      targetName: item.target_name,
+      action:     data.is_active ? 'activated' : 'deactivated',
+      price:      item.price,
+    }).catch(() => {});
+
+    res.json({ item });
   });
 }
 
@@ -336,9 +367,24 @@ function togglePricingStatus(req, res, next) {
 function deletePricing(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
-    const r  = await pool.query('DELETE FROM pricing WHERE id = $1', [id]);
+
+    // Fetch before deleting — need the target name/dimensions for the notification.
+    const existing = await pool.query(`${PRICING_SELECT} WHERE p.id = $1`, [id]);
+    if (existing.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
+    const removedItem = enrichRow(existing.rows[0]);
+
+    const r = await pool.query('DELETE FROM pricing WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Pricing rule not found' });
     getIO().emit('invalidate', { topic: 'pricing' });
+
+    notifyHubsPricingChange(pool, {
+      serviceId:  removedItem.service_id,
+      categoryId: removedItem.category_id,
+      targetName: removedItem.target_name,
+      action:     'removed',
+      price:      null,
+    }).catch(() => {});
+
     res.status(204).end();
   });
 }

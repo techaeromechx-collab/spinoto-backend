@@ -3,6 +3,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const { getIO } = require('../socket');
+const { notifyHubsReferenceDataChange } = require('../utils/hubNotify');
 
 // ── Validators ────────────────────────────────────────────────────────────────
 const ccSchemaBase = z.object({
@@ -120,6 +121,13 @@ function updateCategory(req, res, next) {
       WHERE  vm.engine_cc IS NOT NULL
     `);
 
+    // CC category ranges feed the pricing lookup's specificity matching for
+    // 2W services — a range edit can silently reprice a hub's 2W services.
+    notifyHubsReferenceDataChange(pool, {
+      title: `CC Category Updated — ${r.rows[0].name}`,
+      body:  `Range changed to ${r.rows[0].min_cc}–${r.rows[0].max_cc}cc. Check 2W pricing rules that depend on this range.`,
+    }).catch(() => {});
+
     res.json({ item: r.rows[0] });
   });
 }
@@ -131,6 +139,11 @@ function updateCategory(req, res, next) {
 function deleteCategory(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
+
+    // Fetch name up front — needed for the hub notification either way.
+    const existing = await pool.query('SELECT name FROM cc_categories WHERE id = $1', [id]);
+    if (existing.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
+    const ccName = existing.rows[0].name;
 
     // Check if used in any pricing rules
     const usedInPricing = await pool.query(
@@ -151,6 +164,12 @@ function deleteCategory(req, res, next) {
       );
       if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
       getIO().emit('invalidate', { topic: 'cc_categories' });
+
+      notifyHubsReferenceDataChange(pool, {
+        title: `CC Category Deactivated — ${ccName}`,
+        body:  `"${ccName}" is no longer active. Pricing rules using this range will stop matching.`,
+      }).catch(() => {});
+
       return res.json({
         warning: 'This category is referenced by pricing rules or vehicles and has been deactivated instead of deleted.',
         deactivated: true,
@@ -160,6 +179,12 @@ function deleteCategory(req, res, next) {
     const r = await pool.query('DELETE FROM cc_categories WHERE id = $1', [id]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'CC category not found' });
     getIO().emit('invalidate', { topic: 'cc_categories' });
+
+    notifyHubsReferenceDataChange(pool, {
+      title: `CC Category Removed — ${ccName}`,
+      body:  `"${ccName}" was removed from reference data.`,
+    }).catch(() => {});
+
     res.status(204).end();
   });
 }

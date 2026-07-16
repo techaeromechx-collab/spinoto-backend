@@ -30,6 +30,19 @@ function initIO(httpServer) {
     },
   });
 
+  // Every master-data write already does getIO().emit('invalidate', { topic })
+  // to tell the frontend to refetch. Piggyback on that same call to also
+  // clear the server-side response cache (responseCache.js) for that topic —
+  // one interception point covers every controller without touching any of
+  // them individually.
+  const originalEmit = _io.emit.bind(_io);
+  _io.emit = (event, payload, ...rest) => {
+    if (event === 'invalidate' && payload?.topic) {
+      require('./utils/responseCache').invalidateTopic(payload.topic);
+    }
+    return originalEmit(event, payload, ...rest);
+  };
+
   _io.on('connection', (socket) => {
     // No auth needed — invalidate events carry no sensitive data.
     // The frontend re-fetches via its own authenticated API calls.

@@ -412,12 +412,14 @@ function createAppointment(req, res, next) {
       // (public_token) even if no customer_profiles row is ever created.
       await ensureCustomerIdentity(client, data.mobile);
 
-      // Insert service line items
-      for (const svc of data.services) {
+      // Insert service line items — one multi-row statement instead of a loop
+      if (data.services.length > 0) {
+        const vals = data.services.map((_, i) =>
+          `($1, $${i * 3 + 2}, $${i * 3 + 3}, $${i * 3 + 4})`).join(',');
         await client.query(
           `INSERT INTO appointment_services (appointment_id, service_id, category_id, price)
-           VALUES ($1, $2, $3, $4)`,
-          [apptId, svc.service_id, svc.category_id || null, svc.price]
+           VALUES ${vals}`,
+          [apptId, ...data.services.flatMap(s => [s.service_id, s.category_id || null, s.price])]
         );
       }
 

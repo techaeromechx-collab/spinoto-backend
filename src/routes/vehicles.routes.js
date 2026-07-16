@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const c = require('../controllers/vehicles.controller');
+const { cacheGet } = require('../utils/responseCache');
 
 const router = express.Router();
 
@@ -40,11 +41,15 @@ const canViewRef = [requireAuth, requirePermission(
   'MANAGE_MASTER_DATA', 'CREATE_VEHICLE', 'UPDATE_VEHICLE', 'DELETE_VEHICLE',
   'VIEW_VEHICLE', 'VIEW_ESTIMATE', 'CREATE_ESTIMATE', 'EDIT_ESTIMATE', 'CREATE_LEAD',
 )];
-router.get('/types',      canViewRef, c.listTypes);
-router.get('/makes',      canViewRef, c.listMakes);
-router.get('/models',     canViewRef, c.listModels);
-router.get('/segments',   canViewRef, c.listSegments);
-router.get('/body-types', canViewRef, c.listBodyTypes);
+// Reference lists are shared/non-per-user and change rarely — cache the
+// rendered JSON, keyed per full URL (so e.g. ?type_class=2W vs 4W never
+// collide), and let socket.js's invalidate-emit wrap clear it the moment
+// someone edits Master Data.
+router.get('/types',      canViewRef, cacheGet('vehicles'), c.listTypes);
+router.get('/makes',      canViewRef, cacheGet('vehicles'), c.listMakes);
+router.get('/models',     canViewRef, cacheGet('vehicles'), c.listModels);
+router.get('/segments',   canViewRef, cacheGet('vehicles'), c.listSegments);
+router.get('/body-types', canViewRef, cacheGet('vehicles'), c.listBodyTypes);
 
 // ── Reference list writes — granular permissions per data type ────────────────
 const canManageTypes    = [requireAuth, requirePermission('MANAGE_VEHICLE_TYPES', 'MANAGE_MASTER_DATA')];

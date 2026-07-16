@@ -1,13 +1,15 @@
 const express = require('express');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
 const c = require('../controllers/locations.controller');
+const { cacheGet } = require('../utils/responseCache');
 
 const router = express.Router();
 
 // Reads — any authenticated user (callers need them for the lead form).
-router.get('/states', requireAuth, c.listStates);
-router.get('/cities', requireAuth, c.listCities);
-router.get('/areas',  requireAuth, c.listAreas);
+// Shared reference data, cached — invalidated on Master Data edits.
+router.get('/states', requireAuth, cacheGet('locations'), c.listStates);
+router.get('/cities', requireAuth, cacheGet('locations'), c.listCities);
+router.get('/areas',  requireAuth, cacheGet('locations'), c.listAreas);
 
 // Writes — anyone with MANAGE_MASTER_DATA.
 const canManage = [requireAuth, requirePermission('MANAGE_MASTER_DATA')];

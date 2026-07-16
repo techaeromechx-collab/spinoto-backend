@@ -12,6 +12,21 @@
  */
 
 const ImageKit = require('imagekit');
+const { CircuitBreaker } = require('./circuitBreaker');
+
+// ImageKit is called synchronously in the request path (upload/delete both
+// `await` it before responding — see hub_documents.controller.js). Without a
+// breaker, a slow/unreachable ImageKit would let every upload/delete request
+// hang until the platform's own timeout, tying up a request + the file
+// buffer in memory for each one — a burst of uploads during an ImageKit
+// outage could exhaust the app's capacity for completely unrelated pages.
+const breaker = new CircuitBreaker('imagekit', {
+  failureThreshold: 4,
+  failureWindowMs: 30_000,
+  resetTimeoutMs: 20_000,
+  requestTimeoutMs: 10_000, // uploads can legitimately take a few seconds; don't cut them too short
+  maxConcurrent: 5,
+});
 
 let _client = null;
 
@@ -42,19 +57,21 @@ function getClient() {
  * @returns {{ url: string, fileId: string }}
  */
 async function uploadToImageKit(buffer, fileName, folder = 'hub-docs') {
-  const client = getClient();
+  return breaker.fire(async () => {
+    const client = getClient();
 
-  const response = await client.upload({
-    file:              buffer.toString('base64'),
-    fileName,
-    folder,
-    useUniqueFileName: true,
+    const response = await client.upload({
+      file:              buffer.toString('base64'),
+      fileName,
+      folder,
+      useUniqueFileName: true,
+    });
+
+    return {
+      url:    response.url,
+      fileId: response.fileId,
+    };
   });
-
-  return {
-    url:    response.url,
-    fileId: response.fileId,
-  };
 }
 
 /**
@@ -65,11 +82,16 @@ async function uploadToImageKit(buffer, fileName, folder = 'hub-docs') {
 async function deleteFromImageKit(fileId) {
   if (!fileId) return;
   try {
-    const client = getClient();
-    await client.deleteFile(fileId);
+    await breaker.fire(async () => {
+      const client = getClient();
+      await client.deleteFile(fileId);
+    });
   } catch (err) {
+    // Already best-effort — a slow/down ImageKit (breaker open, timeout, or
+    // a real API error) should never block the caller from finishing its
+    // own DB cleanup.
     console.warn('[ImageKit] delete failed:', err.message);
   }
 }
 
-module.exports = { uploadToImageKit, deleteFromImageKit };
+module.exports = { uploadToImageKit, deleteFromImageKit, _breaker: breaker };

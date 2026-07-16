@@ -1789,66 +1789,112 @@ async function importLeads(req, res, next) {
     let inserted = 0;
     let updated  = 0;
 
-    for (const r of parsedRows) {
-      if (r.action === 'update_status') {
-        // Update status of existing lead
-        await client.query(
-          `UPDATE leads
-              SET status = $1
-            WHERE id = $2`,
-          [r.statusName || null, r.existingLeadId]
-        );
+    // ── Batched writes ───────────────────────────────────────────────────────
+    // Previously this looped one INSERT/UPDATE per row (plus one price SELECT
+    // and one INSERT per lead-service) — ~4–6 round trips per lead. Now:
+    // a handful of multi-row statements, chunked to keep each statement's
+    // parameter count well under Postgres's 65,535 limit and locks short.
+    const chunk = (arr, n) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+      return out;
+    };
 
-        // Mark pending follow-ups as done
-        await client.query(
-          `UPDATE lead_events
-              SET is_done = TRUE,
-                  done_at = NOW()
-            WHERE lead_id = $1
-              AND is_done = FALSE`,
-          [r.existingLeadId]
-        );
+    const toUpdate = parsedRows.filter(r => r.action === 'update_status');
+    const toInsert = parsedRows.filter(r => r.action !== 'update_status');
 
-        updated++;
-      } else {
-        // Insert new lead
-        const leadRes = await client.query(
-          `INSERT INTO leads
-             (name, mobile, whatsapp, state_id, city_id, area_id,
-              vehicle_type_id, make_id, model_id, body_type_id, segment_ids, lead_source, status, notes,
-              assigned_to, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-           RETURNING id`,
-          [
-            r.name, r.mobile, r.whatsapp,
-            r.stateId, r.cityId, r.areaId,
-            r.vehicleTypeId, r.makeId, r.modelId, r.bodyTypeId,
-            r.segmentId ? [r.segmentId] : [],
-            r.leadSrc,
-            r.statusName || null,
-            r.vehicleNote
-              ? [r.notes, r.vehicleNote].filter(Boolean).join('\n')
-              : (r.notes || null),
-            r.assignedTo, createdBy,
-          ]
-        );
-        const leadId = leadRes.rows[0].id;
+    // 1) Status updates — one statement per chunk via VALUES join,
+    //    plus one ANY() statement to close pending follow-ups.
+    for (const batch of chunk(toUpdate, 500)) {
+      const values = [];
+      const params = [];
+      batch.forEach((r, i) => {
+        params.push(r.existingLeadId, r.statusName || null);
+        values.push(`($${i * 2 + 1}::int, $${i * 2 + 2}::text)`);
+      });
+      await client.query(
+        `UPDATE leads AS l SET status = v.status
+           FROM (VALUES ${values.join(',')}) AS v(id, status)
+          WHERE l.id = v.id`,
+        params
+      );
+      await client.query(
+        `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+          WHERE lead_id = ANY($1) AND is_done = FALSE`,
+        [batch.map(r => r.existingLeadId)]
+      );
+    }
+    updated = toUpdate.length;
 
-        for (const svcId of r.serviceIds) {
-          const pr = await client.query(`SELECT price FROM pricing WHERE service_id = $1 LIMIT 1`, [svcId]);
-          await client.query(
-            `INSERT INTO lead_services (lead_id, service_id, price) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-            [leadId, svcId, pr.rows[0]?.price || 0]
-          );
-        }
-        for (const catId of r.categoryIds) {
-          await client.query(
-            `INSERT INTO lead_categories (lead_id, category_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-            [leadId, catId]
-          );
-        }
-        inserted++;
-      }
+    // 2) Pre-fetch service prices ONCE for all distinct services in the file
+    //    (was: one SELECT per service per lead).
+    const allServiceIds = [...new Set(toInsert.flatMap(r => r.serviceIds))];
+    const priceBySvc = new Map();
+    if (allServiceIds.length) {
+      const pr = await client.query(
+        `SELECT DISTINCT ON (service_id) service_id, price
+           FROM pricing WHERE service_id = ANY($1)
+          ORDER BY service_id, id`,
+        [allServiceIds]
+      );
+      for (const row of pr.rows) priceBySvc.set(row.service_id, row.price);
+    }
+
+    // 3) Lead inserts — multi-row VALUES with RETURNING id. Postgres returns
+    //    RETURNING rows in insert order for a plain VALUES insert, so ids map
+    //    back to the batch by index. 200 rows × 16 params = 3,200 params/stmt.
+    const svcRows = []; // [leadId, serviceId, price]
+    const catRows = []; // [leadId, categoryId]
+    for (const batch of chunk(toInsert, 200)) {
+      const values = [];
+      const params = [];
+      batch.forEach((r, i) => {
+        const base = i * 16;
+        params.push(
+          r.name, r.mobile, r.whatsapp,
+          r.stateId, r.cityId, r.areaId,
+          r.vehicleTypeId, r.makeId, r.modelId, r.bodyTypeId,
+          r.segmentId ? [r.segmentId] : [],
+          r.leadSrc,
+          r.statusName || null,
+          r.vehicleNote
+            ? [r.notes, r.vehicleNote].filter(Boolean).join('\n')
+            : (r.notes || null),
+          r.assignedTo, createdBy
+        );
+        values.push(`(${Array.from({ length: 16 }, (_, j) => `$${base + j + 1}`).join(',')})`);
+      });
+      const ins = await client.query(
+        `INSERT INTO leads
+           (name, mobile, whatsapp, state_id, city_id, area_id,
+            vehicle_type_id, make_id, model_id, body_type_id, segment_ids, lead_source, status, notes,
+            assigned_to, created_by)
+         VALUES ${values.join(',')}
+         RETURNING id`,
+        params
+      );
+      ins.rows.forEach((row, i) => {
+        const r = batch[i];
+        for (const svcId of r.serviceIds) svcRows.push([row.id, svcId, priceBySvc.get(svcId) || 0]);
+        for (const catId of r.categoryIds) catRows.push([row.id, catId]);
+      });
+    }
+    inserted = toInsert.length;
+
+    // 4) Lead services + categories — multi-row inserts, chunked.
+    for (const batch of chunk(svcRows, 1000)) {
+      const values = batch.map((_, i) => `($${i * 3 + 1},$${i * 3 + 2},$${i * 3 + 3})`).join(',');
+      await client.query(
+        `INSERT INTO lead_services (lead_id, service_id, price) VALUES ${values} ON CONFLICT DO NOTHING`,
+        batch.flat()
+      );
+    }
+    for (const batch of chunk(catRows, 1000)) {
+      const values = batch.map((_, i) => `($${i * 2 + 1},$${i * 2 + 2})`).join(',');
+      await client.query(
+        `INSERT INTO lead_categories (lead_id, category_id) VALUES ${values} ON CONFLICT DO NOTHING`,
+        batch.flat()
+      );
     }
 
     await client.query('COMMIT');

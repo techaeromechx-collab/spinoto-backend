@@ -6,7 +6,7 @@
  */
 
 const { pool }    = require('../config/db');
-const { sendPush } = require('../utils/sendPush');
+const { sendPush, sendToSubscription } = require('../utils/sendPush');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
@@ -106,7 +106,6 @@ function adminTest(req, res, next) {
       return res.status(404).json({ error: 'No subscribed devices for this user' });
     }
 
-    const webpush = require('web-push');
     const payload = JSON.stringify({
       title: title.trim(),
       body:  (message || '').trim(),
@@ -114,18 +113,16 @@ function adminTest(req, res, next) {
       type:  'custom',
     });
 
-    const results = await Promise.allSettled(
-      rows.map(sub =>
-        webpush.sendNotification(
-          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-          payload,
-          { TTL: 60 }
-        )
-      )
+    // Same breaker-protected sender used by the fire-and-forget path
+    // (sendPush.js) — this endpoint is the one place a push send is
+    // actually awaited before responding, so it's the one most exposed to
+    // a hanging/down push provider blocking the request.
+    const results = await Promise.all(
+      rows.map(sub => sendToSubscription(sub, payload, { TTL: 60 }))
     );
 
-    const sent   = results.filter(r => r.status === 'fulfilled').length;
-    const failed = results.filter(r => r.status === 'rejected').length;
+    const sent   = results.filter(r => r.ok).length;
+    const failed = results.filter(r => !r.ok).length;
 
     res.json({ ok: true, sent, failed });
   });

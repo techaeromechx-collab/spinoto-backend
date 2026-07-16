@@ -111,9 +111,14 @@ function reorderOutcomes(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      for (let i = 0; i < ids.length; i++) {
-        await client.query('UPDATE call_outcomes SET sort_order = $1 WHERE id = $2', [i + 1, ids[i]]);
-      }
+      await client.query(
+        // Batched: one statement instead of one UPDATE per row —
+        // unnest preserves array order via WITH ORDINALITY.
+        `UPDATE call_outcomes AS t SET sort_order = v.ord
+           FROM unnest($1::int[]) WITH ORDINALITY AS v(id, ord)
+          WHERE t.id = v.id`,
+        [ids]
+      );
       await client.query('COMMIT');
       res.json({ ok: true });
     } catch (err) {

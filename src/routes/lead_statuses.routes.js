@@ -2,11 +2,12 @@
 const express = require('express');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
 const c = require('../controllers/lead_statuses.controller');
+const { cacheGet } = require('../utils/responseCache');
 
 const router = express.Router();
 
 // Read — anyone who works with leads can read statuses
-router.get('/',     requireAuth, requirePermission('VIEW_LEAD', 'CREATE_LEAD', 'EDIT_LEAD', 'MANAGE_MASTER_DATA'), c.listStatuses);
+router.get('/',     requireAuth, requirePermission('VIEW_LEAD', 'CREATE_LEAD', 'EDIT_LEAD', 'MANAGE_MASTER_DATA'), cacheGet('lead_statuses'), c.listStatuses);
 // Manage — only master data admins
 router.post('/reorder', requireAuth, requirePermission('MANAGE_MASTER_DATA'), c.reorderStatuses);
 router.post('/',        requireAuth, requirePermission('MANAGE_MASTER_DATA'), c.createStatus);

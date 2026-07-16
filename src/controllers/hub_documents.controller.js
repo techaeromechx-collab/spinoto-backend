@@ -37,6 +37,14 @@ function handle(req, res, next, fn) {
       if (err.name === 'ZodError') {
         return res.status(400).json({ error: err.errors.map(e => e.message).join('; ') });
       }
+      // ImageKit circuit breaker tripped (or a single call timed out/was
+      // rejected for being over the concurrency limit) — surface a clear,
+      // fast "try again shortly" instead of a generic 500. `err.status` is
+      // set on all three circuit breaker error types (503/503/504).
+      if (err.name === 'CircuitBreakerOpenError' || err.name === 'CircuitBreakerBusyError' || err.name === 'CircuitBreakerTimeoutError') {
+        if (req.file?.path) safeUnlink(req.file.path);
+        return res.status(err.status || 503).json({ error: 'Document storage is temporarily unavailable. Please try again shortly.' });
+      }
       if (err.status) return res.status(err.status).json({ error: err.message });
       next(err);
     });

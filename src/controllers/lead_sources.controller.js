@@ -96,9 +96,14 @@ function reorderSources(req, res, next) {
   handle(req, res, next, async () => {
     const { ids } = req.body;
     if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids must be an array' });
-    await Promise.all(ids.map((id, i) =>
-      pool.query('UPDATE lead_sources SET sort_order = $1 WHERE id = $2', [i + 1, id])
-    ));
+    // Batched: one statement instead of one UPDATE per row (also atomic now —
+    // the old Promise.all could partially apply on failure).
+    await pool.query(
+      `UPDATE lead_sources AS t SET sort_order = v.ord
+         FROM unnest($1::int[]) WITH ORDINALITY AS v(id, ord)
+        WHERE t.id = v.id`,
+      [ids]
+    );
     getIO().emit('invalidate', { topic: 'lead_sources' });
     res.json({ ok: true });
   });

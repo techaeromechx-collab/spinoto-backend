@@ -13,6 +13,7 @@
 
 const webpush = require('web-push');
 const { pool }  = require('../config/db');
+const { CircuitBreaker } = require('./circuitBreaker');
 
 // Configure VAPID once on first require
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
@@ -23,6 +24,43 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
   );
 } else {
   console.warn('[sendPush] VAPID keys not set — push notifications disabled');
+}
+
+// Most callers of sendPush() are fire-and-forget (not awaited), so a hanging
+// push provider wouldn't block a user-facing request — but it would still
+// leak an unresolved promise/socket per call, and a burst of them (e.g. a
+// summary push to every user) could still pile up unbounded concurrent
+// connections to the push provider. The one place this DOES block a request
+// is push.controller.js's admin test-push endpoint, which now also goes
+// through this same breaker via sendToSubscription().
+const breaker = new CircuitBreaker('web-push', {
+  failureThreshold: 6,
+  failureWindowMs: 30_000,
+  resetTimeoutMs: 15_000,
+  requestTimeoutMs: 6_000,
+  maxConcurrent: 10,
+});
+
+/**
+ * sendToSubscription(sub, payload, options)
+ * Breaker-protected single Web Push send. Resolves { ok:true } or
+ * { ok:false, status } — never throws — so callers can fan out with
+ * Promise.all instead of Promise.allSettled and still get a clean result
+ * per device.
+ */
+async function sendToSubscription(sub, payload, options = {}) {
+  try {
+    await breaker.fire(() =>
+      webpush.sendNotification(
+        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        payload,
+        options
+      )
+    );
+    return { id: sub.id, ok: true };
+  } catch (err) {
+    return { id: sub.id, ok: false, status: err.statusCode };
+  }
 }
 
 /**
@@ -59,22 +97,20 @@ async function sendPush(userId, type, title, body, url = '/') {
 
     const payload = JSON.stringify({ title, body, url, type });
 
-    // 3. Send to each subscribed device in parallel
-    const results = await Promise.allSettled(
-      subs.rows.map(sub =>
-        webpush.sendNotification(
-          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-          payload,
-          { TTL: 60 * 60 * 24 } // 24h TTL
-        ).then(() => ({ id: sub.id, ok: true }))
-         .catch(err => ({ id: sub.id, ok: false, status: err.statusCode }))
-      )
+    // 3. Send to each subscribed device in parallel. sendToSubscription()
+    //    is breaker-protected and never throws, so a slow/down push
+    //    provider fails each of these fast instead of hanging — and the
+    //    concurrency cap inside the breaker keeps a big fan-out (e.g. a
+    //    summary push to a user with many devices) from opening unbounded
+    //    connections to the provider all at once.
+    const results = await Promise.all(
+      subs.rows.map(sub => sendToSubscription(sub, payload, { TTL: 60 * 60 * 24 })) // 24h TTL
     );
 
     // 4. Remove dead/expired subscriptions (410 Gone = unsubscribed device)
     const deadIds = results
-      .filter(r => r.status === 'fulfilled' && !r.value.ok && r.value.status === 410)
-      .map(r => r.value.id);
+      .filter(r => !r.ok && r.status === 410)
+      .map(r => r.id);
 
     if (deadIds.length) {
       await pool.query(
@@ -88,4 +124,4 @@ async function sendPush(userId, type, title, body, url = '/') {
   }
 }
 
-module.exports = { sendPush };
+module.exports = { sendPush, sendToSubscription, _breaker: breaker };
