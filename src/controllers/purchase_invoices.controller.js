@@ -5,6 +5,17 @@ const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
+const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
+const { istToday, validateInvoiceDate, validationError } = require('../utils/invoiceDate');
+
+// Books lock + backdating window. Same one-row read as the other controllers.
+async function loadDateSettings() {
+  const r = await pool.query(
+    `SELECT books_locked_through::text AS books_locked_through, backdate_max_days
+       FROM company_settings ORDER BY id LIMIT 1`
+  );
+  return r.rows[0] || { books_locked_through: null, backdate_max_days: 30 };
+}
 
 const idParam = z.coerce.number().int().positive();
 
@@ -33,6 +44,11 @@ const PI_SELECT = `
     pi.subtotal_ex_gst, pi.total_gst, pi.grand_total,
     pi.notes, pi.approved_by, pi.approved_at,
     pi.created_by, pi.created_at, pi.updated_at,
+    -- Legal date of the PI (migration 099). ::text so pg-types 2.x can't
+    -- parse the DATE into a local-midnight JS Date and shift it a day on an
+    -- IST server. created_at stays as the system record — and stays what
+    -- getRoundingFunction() keys off; see the comment at its call sites.
+    pi.invoice_date::text AS invoice_date,
     pi.amount_paid,
     pi.payment_status,
     h.hub_name, h.gst_number AS hub_gst,
@@ -163,7 +179,7 @@ function listPurchaseInvoices(req, res, next) {
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const [dataRes, countRes] = await Promise.all([
-      pool.query(`${PI_SELECT} ${where} ORDER BY pi.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
+      pool.query(`${PI_SELECT} ${where} ORDER BY pi.invoice_date DESC, pi.id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
       pool.query(`SELECT COUNT(*) FROM purchase_invoices pi LEFT JOIN appointments a ON a.id = pi.appointment_id LEFT JOIN estimates est_ctx ON est_ctx.id = pi.estimate_id ${where}`, params),
     ]);
     res.json({ items: dataRes.rows, total: parseInt(countRes.rows[0].count, 10), page, limit });
@@ -180,6 +196,39 @@ function getPurchaseInvoice(req, res, next) {
     item.hub_payments = await _getHubPayments(id);
     item.schedule     = await _getPaymentSchedule(id);
     res.json({ item });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/purchase-invoices/:id/pdf?theme=xxx
+//
+// Renders the purchase invoice through the shared themed-document pipeline.
+//
+// ⚠ The viewer role is derived from the authenticated session inside
+// resolveRender() — never from a query parameter. A hub user always gets the
+// hub view, in which the customer-rate and commission columns are suppressed
+// and the document reads as a sale ("SELL INVOICE", "Grand Total Receivable").
+// Letting the client choose the role here would expose the margin the company
+// takes on that hub's work.
+// ─────────────────────────────────────────────────────────────────────────────
+function getPurchaseInvoicePdf(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+    const r  = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    const invoice = r.rows[0];
+    invoice.items        = await _getItems(id);
+    invoice.hub_payments = await _getHubPayments(id);
+
+    const company = await loadCompany();
+    const { cfg, theme, viewerRole } = resolveRender(company, 'purchase_invoice', req.user, {
+      themeOverride: req.query.theme,
+    });
+
+    await sendPdf(res, {
+      docType: 'purchase_invoice', row: invoice, company, cfg, theme,
+      baseUrl: req.get('origin') || req.get('referer'),
+    });
   });
 }
 
@@ -205,11 +254,53 @@ function generatePurchaseInvoice(req, res, next) {
     const estRow = await pool.query(
       `SELECT e.id, e.status, e.appointment_id, e.hub_id,
               e.discount_mode, e.transaction_discount_type, e.transaction_discount_value,
-              e.warranty_claim_id
+              e.warranty_claim_id,
+              -- Inherit the date when the estimate was deliberately backdated:
+              -- the job is historical, so the hub's bill belongs on the same
+              -- day. A merely OLD estimate (never backdated) means the work has
+              -- just finished, and today is right — original_estimate_date is
+              -- what tells the two apart. See PLAN_backdated_job_chain.md §2.1.
+              e.estimate_date::text AS estimate_date,
+              e.original_estimate_date
        FROM estimates e WHERE e.id = $1`, [estimate_id]
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const est = estRow.rows[0];
+
+    // ── PI date ─────────────────────────────────────────────────────────────
+    // Inherited from a deliberately-backdated estimate, else today. See the
+    // comment on the SELECT above.
+    //
+    // This is VALIDATED, not just assigned. Skipping validation here created a
+    // dead end: the PI would happily take a date the CI's validator later
+    // refuses, leaving a job with a purchase invoice that can never be turned
+    // into a customer invoice, and no endpoint to correct the PI's date.
+    const piToday = istToday();
+    const piInherited = !!est.original_estimate_date && est.estimate_date !== piToday;
+    const piInvoiceDate = piInherited ? est.estimate_date : piToday;
+
+    if (piInvoiceDate !== piToday) {
+      const settings = await loadDateSettings();
+      const check = validateInvoiceDate({
+        invoiceDate: piInvoiceDate,
+        documentType: 'purchase_invoice',
+        chainBefore: est.estimate_date,
+        settings,
+        // Inherited, not chosen. Whoever backdated the ESTIMATE already held
+        // the permission and gave a reason; making the person who generates
+        // the PI hold it too would block the flow for a date they never set.
+        canBackdate: true,
+        canOverride: true,
+        today: piToday,
+      });
+      if (!check.ok) {
+        return res.status(409).json({
+          ...validationError(check),
+          error: `The estimate's date (${est.estimate_date}) cannot be used for this purchase invoice: ` +
+                 `${check.errors[0]?.message} Correct the estimate's date first.`,
+        });
+      }
+    }
 
     // Hub users can only generate invoices for their own hub
     if (req.user.hub_id && req.user.hub_id !== est.hub_id) {
@@ -344,8 +435,11 @@ function generatePurchaseInvoice(req, res, next) {
       const piRow = await client.query(
         `INSERT INTO purchase_invoices
            (estimate_id, appointment_id, hub_id, commission_percent, rate_mode,
-            subtotal_ex_gst, total_gst, grand_total, created_by, public_token)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+            subtotal_ex_gst, total_gst, grand_total, created_by, public_token,
+            invoice_date, original_invoice_date, backdate_reason, backdated_by, backdated_at,
+            updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                 $11::date, $12::date, $13, $14, $15, $16) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           useCommission ? commissionPct : 0,      // 0 when using tech_rate mode — column is NOT NULL
@@ -353,6 +447,12 @@ function generatePurchaseInvoice(req, res, next) {
           subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
           req.user?.id || null,
           generatePublicToken(),
+          piInvoiceDate,
+          piInherited ? piToday : null,
+          piInherited ? `Inherited from backdated estimate #${estimate_id}` : null,
+          piInherited ? (req.user?.id || null) : null,
+          piInherited ? new Date() : null,
+          req.user?.id || null,
         ]
       );
       const piId = piRow.rows[0].id;
@@ -408,6 +508,9 @@ function approvePurchaseInvoice(req, res, next) {
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = r.rows[0];
+    // created_at, NOT invoice_date — this selects the rounding mode off a
+    // hardcoded cutover date (utils/math.js). Keyed to a backdatable field
+    // it would silently change the totals of an already-issued document.
     const roundFn = getRoundingFunction(pi.created_at);
     if (pi.status !== 'pending_approval') {
       return res.status(400).json({ error: `Invoice is already ${pi.status}` });
@@ -650,6 +753,9 @@ function recalculatePurchaseInvoice(req, res, next) {
       [id]
     );
 
+    // created_at, NOT invoice_date — this selects the rounding mode off a
+    // hardcoded cutover date (utils/math.js). Keyed to a backdatable field
+    // it would silently change the totals of an already-issued document.
     const roundFn = getRoundingFunction(pi.created_at);
 
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
@@ -781,6 +887,9 @@ function updatePurchaseInvoice(req, res, next) {
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = r.rows[0];
+    // created_at, NOT invoice_date — this selects the rounding mode off a
+    // hardcoded cutover date (utils/math.js). Keyed to a backdatable field
+    // it would silently change the totals of an already-issued document.
     const roundFn = getRoundingFunction(pi.created_at);
     if (pi.payment_status === 'paid' || parseFloat(pi.amount_paid) > 0) {
       return res.status(400).json({ error: 'Cannot edit — payment has already been recorded.' });
@@ -893,6 +1002,9 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
       return res.status(400).json({ error: 'No completed approved items found in estimate.' });
     }
 
+    // created_at, NOT invoice_date — this selects the rounding mode off a
+    // hardcoded cutover date (utils/math.js). Keyed to a backdatable field
+    // it would silently change the totals of an already-issued document.
     const roundFn = getRoundingFunction(pi.created_at);
 
     // Transaction discount
@@ -1410,4 +1522,4 @@ async function rejectPurchaseInvoiceApproval(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };

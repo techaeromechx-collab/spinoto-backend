@@ -263,6 +263,7 @@ function getCustomer(req, res, next) {
           ci.vehicle_number,
           ci.notes,
           ci.created_at,
+          ci.invoice_date::text AS invoice_date,
           ci.status,
           ci.estimate_id,
           est.public_token AS estimate_token,
@@ -283,7 +284,8 @@ function getCustomer(req, res, next) {
         LEFT JOIN appointments a ON a.id  = ci.appointment_id
         LEFT JOIN estimates    est ON est.id = ci.estimate_id
         WHERE COALESCE(ci.mobile, a.mobile) = $1
-        ORDER BY ci.created_at DESC
+        -- Customer-facing history follows the invoice date, not the keying-in date.
+        ORDER BY ci.invoice_date DESC, ci.id DESC
         LIMIT 30
       `, [mobile]),
 
@@ -293,6 +295,8 @@ function getCustomer(req, res, next) {
       pool.query(`
         SELECT
           e.id, e.public_token, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
+          e.estimate_date::text AS estimate_date,
+          e.original_estimate_date::text AS original_estimate_date,
           e.customer_name, e.mobile, e.whatsapp, e.vehicle_number,
           e.vehicle_type_id, e.make_id, e.model_id,
           h.hub_name,
@@ -309,7 +313,7 @@ function getCustomer(req, res, next) {
         LEFT JOIN body_types     bt ON bt.id = e.body_type_id
         LEFT JOIN cc_categories  cc ON cc.id = e.cc_category_id
         WHERE e.mobile = $1 AND e.appointment_id IS NULL
-        ORDER BY e.created_at DESC
+        ORDER BY e.estimate_date DESC, e.id DESC
         LIMIT 30
       `, [mobile]),
 
@@ -965,7 +969,7 @@ function getCustomerTimeline(req, res, next) {
       // Estimates
       pool.query(`
         SELECT
-          e.id, e.created_at AS event_date, e.created_at,
+          e.id, e.estimate_date::text AS event_date, e.created_at,
           'estimate' AS type,
           e.status,
           NULL AS status_color,
@@ -978,7 +982,7 @@ function getCustomerTimeline(req, res, next) {
         FROM estimates e
         LEFT JOIN hubs h ON h.id = e.hub_id
         WHERE e.mobile = $1
-        ORDER BY e.created_at DESC
+        ORDER BY e.estimate_date DESC, e.id DESC
       `, [mobile]),
 
       // Purchase invoices (sell invoices from hub side) — purchase_invoices
@@ -986,7 +990,10 @@ function getCustomerTimeline(req, res, next) {
       // linked appointment/estimate, same pattern as purchase_invoices.controller.js.
       pool.query(`
         SELECT
-          pi.id, pi.created_at AS event_date, pi.created_at,
+          -- event_date drives the merged timeline's ordering and the date the
+          -- customer sees, so it follows the document's own date. created_at
+          -- is kept alongside purely as the JS sort fallback below.
+          pi.id, pi.invoice_date::text AS event_date, pi.created_at,
           'purchase_invoice' AS type,
           pi.payment_status AS status,
           NULL AS status_color,
@@ -1001,13 +1008,13 @@ function getCustomerTimeline(req, res, next) {
         LEFT JOIN appointments a       ON a.id       = pi.appointment_id
         LEFT JOIN estimates    est_ctx ON est_ctx.id = pi.estimate_id
         WHERE COALESCE(a.mobile, est_ctx.mobile) = $1
-        ORDER BY pi.created_at DESC
+        ORDER BY pi.invoice_date DESC, pi.id DESC
       `, [mobile]),
 
       // Customer invoices — status lives in the `status` column, not payment_status.
       pool.query(`
         SELECT
-          ci.id, ci.created_at AS event_date, ci.created_at,
+          ci.id, ci.invoice_date::text AS event_date, ci.created_at,
           'customer_invoice' AS type,
           ci.status AS status,
           NULL AS status_color,
@@ -1019,7 +1026,7 @@ function getCustomerTimeline(req, res, next) {
           ci.grand_total AS amount
         FROM customer_invoices ci
         WHERE ci.mobile = $1
-        ORDER BY ci.created_at DESC
+        ORDER BY ci.invoice_date DESC, ci.id DESC
       `, [mobile]),
 
       // Manually added vehicles

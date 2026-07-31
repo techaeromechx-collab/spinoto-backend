@@ -1,0 +1,46 @@
+-- 095_invoice_config.sql
+--
+-- Adds the invoice display-configuration blob to company_settings. This
+-- drives everything on the Settings > Invoice Settings page below the theme
+-- picker: which optional fields appear in the invoice header, which columns
+-- appear in the item table, and a set of on/off display flags.
+--
+-- Stored as a single JSONB column rather than ~20 boolean columns because
+-- these are purely presentational preferences — they're never queried,
+-- filtered, joined or aggregated on, and the set will keep growing as more
+-- toggles are added. One column means new toggles need no further migration.
+--
+-- Shape (see DEFAULT_INVOICE_CONFIG in settings.controller.js, which is the
+-- authoritative definition — anything missing from the stored blob falls
+-- back to that default at read time):
+--
+--   {
+--     "industry_type": "automobile",
+--     "flags": {
+--       "show_party_balance": false,   -- outstanding balance line in totals
+--       "free_item_qty":      false,   -- render zero-rate lines as "FREE"
+--       "show_item_description": false,-- second detail line under item name
+--       "show_phone":         true,    -- company phone in the header
+--       "show_time":          false,   -- time-of-day alongside invoice date
+--       "price_history":      false,   -- prior prices this customer paid
+--       "auto_share_theme":   null     -- theme key forced on public/shared
+--     },                               --   views; null = use invoice_theme
+--     "header_fields": { "po_number": false, "eway_bill": false, "vehicle_number": true },
+--     "item_columns":  { "price": true, "qty": true, "batch_no": false,
+--                        "exp_date": false, "mfg_date": false },
+--     "custom_fields":  [ { "id": "cf_a1b2", "label": "Job Card No.", "enabled": true } ],
+--     "custom_columns": [ { "id": "cc_x9y8", "label": "Warranty",     "enabled": true } ]
+--   }
+--
+-- custom_fields / custom_columns hold only the DEFINITIONS. The per-invoice
+-- VALUES live on customer_invoices.custom_fields and
+-- customer_invoice_items.custom_values (migration 096), keyed by the stable
+-- `id` here. Keeping ids stable means renaming a label never orphans
+-- historical data, and deleting a definition leaves stored values harmlessly
+-- ignored rather than corrupting past invoices.
+--
+-- The '{}' default is deliberate and load-bearing: an empty config must
+-- resolve to exactly today's rendering behaviour, so this migration is a
+-- no-op visually for every existing invoice until someone opts in.
+
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS invoice_config JSONB NOT NULL DEFAULT '{}'::jsonb;

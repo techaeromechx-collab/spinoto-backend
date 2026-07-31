@@ -39,6 +39,42 @@ const PERMISSIONS = Object.freeze({
     group: 'Administration',
   },
 
+  // ---- Settings ----
+  // Settings tabs are otherwise gated on is_super_admin, which is all-or-
+  // nothing. Reminders is the one tab whose contents are purely operational —
+  // thresholds for when alerts fire — so it's safe to delegate without also
+  // handing over GSTIN, bank details or the signature image, which live behind
+  // the tabs that stay super-admin only.
+  MANAGE_REMINDERS: {
+    code: 'MANAGE_REMINDERS',
+    label: 'Manage Reminders',
+    description: 'View and edit alert thresholds (Settings → Reminders).',
+    group: 'Settings',
+  },
+  // Covers the whole Invoice Settings tab: theme, accent colour, logo,
+  // signature image, terms and bank details.
+  //
+  // NOT company identity. That's the point of the separate
+  // PUT /settings/company/document-config endpoint this gates — the existing
+  // PUT /settings/company accepts company_name and gstin too, so reusing it
+  // would have quietly made this permission a licence to edit the GSTIN
+  // printed on every invoice.
+  MANAGE_DOCUMENT_SETTINGS: {
+    code: 'MANAGE_DOCUMENT_SETTINGS',
+    label: 'Manage Invoice Settings',
+    description: 'Edit document themes, logo, signature, terms and bank details (Settings → Invoice Settings). Does not allow editing company name or GSTIN.',
+    group: 'Settings',
+  },
+  // The books lock is the only thing that can stop a backdated invoice landing
+  // in a GST period already filed, so it belongs with whoever owns the filing —
+  // usually not the same person who is allowed to backdate.
+  MANAGE_BOOKS_LOCK: {
+    code: 'MANAGE_BOOKS_LOCK',
+    label: 'Lock Accounting Periods',
+    description: 'Close the books through a given date, and set how far back invoices may be dated. Prevents backdated entries landing in a filed period.',
+    group: 'Settings',
+  },
+
   // ---- Leads ----
   CREATE_LEAD: {
     code: 'CREATE_LEAD',
@@ -313,6 +349,16 @@ const PERMISSIONS = Object.freeze({
     description: 'Send an estimate back for revision after review.',
     group: 'Estimates',
   },
+  // Separate from BACKDATE_INVOICE on purpose. The estimate's date says WHEN
+  // THE WORK HAPPENED — an operations call, usually the service advisor's.
+  // The invoice date is an accounting call. Different people, so different
+  // permissions; a role can hold either, both, or neither.
+  BACKDATE_ESTIMATE: {
+    code: 'BACKDATE_ESTIMATE',
+    label: 'Backdate Estimate',
+    description: 'Date an estimate earlier than today, for work that was done before it was entered. Sets the date the whole job chain inherits — the purchase invoice and customer invoice generated from it follow this date.',
+    group: 'Estimates',
+  },
   EXECUTE_ESTIMATE: {
     code: 'EXECUTE_ESTIMATE',
     label: 'Execute Estimate',
@@ -355,6 +401,21 @@ const PERMISSIONS = Object.freeze({
     code: 'EDIT_INVOICE_PAYMENT',
     label: 'Edit Invoice Payment Date',
     description: 'Correct a payment\'s date. Shifts the hub payout due date and the warranty validity window for future claims.',
+    group: 'Invoices',
+  },
+  BACKDATE_INVOICE: {
+    code: 'BACKDATE_INVOICE',
+    label: 'Backdate Invoice',
+    description: 'Set a customer invoice to an earlier date, within the allowed window and the open accounting period. Moves the invoice into that month\'s revenue reports and starts the warranty clock earlier, shortening cover on unclaimed items.',
+    group: 'Invoices',
+  },
+  // Shared by estimates, purchase invoices and customer invoices: it is an
+  // escalation ("ignore the soft limits"), not a per-document capability, and
+  // splitting it three ways would only make it easy to grant inconsistently.
+  OVERRIDE_INVOICE_DATE_LIMITS: {
+    code: 'OVERRIDE_INVOICE_DATE_LIMITS',
+    label: 'Override Date Limits',
+    description: 'Backdate any document — estimate, purchase invoice or customer invoice — beyond the allowed window, into a locked accounting period, or where doing so would retroactively expire a warranty. Intended for the accounts owner only.',
     group: 'Invoices',
   },
 

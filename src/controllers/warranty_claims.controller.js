@@ -13,6 +13,7 @@
 
 const { z }     = require('zod');
 const { pool }  = require('../config/db');
+const { addMonthsDays, ymd } = require('../utils/warrantyPreflight');
 const { getIO } = require('../socket');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity } = require('../utils/publicToken');
@@ -97,10 +98,18 @@ const WC_SELECT = `
 function validateClaim({ warranty_months, warranty_days, warranty_km, service_date, service_odometer_km, claim_date, current_km }) {
   let withinTime = null;
   if (service_date && (warranty_months || warranty_days)) {
-    const expiry = new Date(service_date);
-    if (warranty_months) expiry.setMonth(expiry.getMonth() + Number(warranty_months));
-    if (warranty_days)   expiry.setDate(expiry.getDate() + Number(warranty_days));
-    withinTime = new Date(claim_date) <= expiry;
+    // Pure calendar arithmetic on 'YYYY-MM-DD', shared with the backdating
+    // preflight (utils/warrantyPreflight.js) so the two cannot disagree.
+    //
+    // This previously mixed two clocks: `new Date(service_date)` on a pg DATE
+    // gives LOCAL midnight, while `new Date(claim_date)` on a 'YYYY-MM-DD'
+    // string gives UTC midnight. On an IST server those are 5.5 hours apart,
+    // so a claim filed ON its expiry day was rejected — while the preflight,
+    // which does it correctly, had told the user the cover was still live.
+    // Same bug class as utils/payoutSchedule.js.
+    const expiry = addMonthsDays(ymd(service_date),
+      Number(warranty_months || 0), Number(warranty_days || 0));
+    withinTime = ymd(claim_date) <= expiry;
   }
 
   let withinKm = null;
@@ -126,9 +135,16 @@ async function loadClaimContext(ciItemId) {
        cii.guarantee_months, cii.guarantee_days, cii.guarantee_km, cii.guarantee_text,
        ci.id AS ci_id, ci.status AS ci_status, ci.hub_id, ci.appointment_id, ci.estimate_id,
        ci.customer_name, ci.mobile, ci.vehicle_number, ci.odometer_km AS service_odometer_km,
-       COALESCE(
+         COALESCE(
          (SELECT MAX(p.paid_at)::date FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id),
-         ci.created_at::date
+         -- Falls back to the invoice's own date, not created_at. On a
+         -- backdated invoice the backdated date IS the claim about when the
+         -- work was done, so that is when the warranty clock should start —
+         -- which means backdating shortens the remaining cover. That is
+         -- intended (see SPEC_backdated_customer_invoice.md, decision 4);
+         -- the backdate flow runs a preflight and refuses, without an
+         -- override, to retroactively expire an unclaimed item.
+         ci.invoice_date
        ) AS service_date
      FROM customer_invoice_items cii
      JOIN customer_invoices ci ON ci.id = cii.customer_invoice_id
@@ -206,7 +222,14 @@ function eligibleItems(req, res, next) {
          ci.hub_id, h.hub_name, ci.odometer_km AS service_odometer_km,
          COALESCE(
            (SELECT MAX(p.paid_at)::date FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id),
-           ci.created_at::date
+           -- Falls back to the invoice's own date, not created_at. On a
+           -- backdated invoice the backdated date IS the claim about when the
+           -- work was done, so that is when the warranty clock should start —
+           -- which means backdating shortens the remaining cover. That is
+           -- intended (see SPEC_backdated_customer_invoice.md, decision 4);
+           -- the backdate flow runs a preflight and refuses, without an
+           -- override, to retroactively expire an unclaimed item.
+           ci.invoice_date
          ) AS service_date,
          (SELECT wc.id FROM warranty_claims wc
            WHERE wc.customer_invoice_item_id = cii.id AND wc.claim_type = 'warranty'

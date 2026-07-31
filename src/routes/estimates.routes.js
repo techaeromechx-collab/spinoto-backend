@@ -5,6 +5,7 @@ const { requireAuth, requirePermission, requirePermissionOrHub } = require('../m
 const {
   listEstimates,
   getEstimate,
+  getEstimatePdf,
   getEstimateByToken,
   createEstimate,
   updateEstimate,
@@ -14,6 +15,8 @@ const {
   customerApproval,
   updateItemWorkStatus,
   deleteEstimate,
+  estimateDatePreflight,
+  updateEstimateDate,
 } = require('../controllers/estimates.controller');
 
 const router = express.Router();
@@ -33,6 +36,13 @@ router.post('/',                                   canCreate,  createEstimate);
 // by-token — resolves a shareable-URL token; must be before /:id
 router.get('/by-token/:token',                     canView,    getEstimateByToken);
 router.get('/:id',                                 canView,    getEstimate);
+// Themed PDF — same pipeline as customer invoices and purchase invoices.
+router.get('/:id/pdf',                             canView,    getEstimatePdf);
+// The estimate's date is the anchor for the whole job chain, so it has its
+// own permission rather than riding on general edit rights. The preflight is
+// a dry run and only needs view access.
+router.get('/:id/date-preflight',                  canView,    estimateDatePreflight);
+router.patch('/:id/estimate-date',                 requirePermission('BACKDATE_ESTIMATE', 'OVERRIDE_INVOICE_DATE_LIMITS'), updateEstimateDate);
 router.patch('/:id',                               canEdit,    updateEstimate);
 router.post('/:id/submit',                         canSubmit,  submitEstimate);
 router.post('/:id/company-approve',                canApprove, companyApprove);

@@ -56,6 +56,22 @@ function nextTuesday(date) {
   return ymd(d);
 }
 
+// A due date is a promise about the future, so it can never be in the past.
+//
+// This became reachable once payment dates could be backdated: pay an invoice
+// today but date the payment to June, and nextTuesday() faithfully computes a
+// Tuesday in June — a payout that is overdue the instant it is scheduled, and
+// which sorts to the top of the Payouts urgency list forever.
+//
+// Clamping to the next Tuesday from *today* keeps the anchor honest (the
+// payment really was dated then) while giving the hub a due date it can
+// actually be paid by.
+function clampNotPast(dueDate, now = new Date()) {
+  if (!dueDate) return dueDate;
+  const todayIst = ymd(toIstFields(now));
+  return dueDate < todayIst ? nextTuesday(now) : dueDate;
+}
+
 // Adds `days` to a YYYY-MM-DD string as pure calendar-date arithmetic — the
 // string has no time-of-day or timezone to begin with, so this never touches
 // local time at all.
@@ -103,7 +119,7 @@ async function syncPayoutDueDate(client, { purchaseInvoiceId = null, customerInv
   );
   const ci = ciRes.rows[0];
   const isPaid = !!ci && ci.status === 'paid';
-  const anchor = isPaid ? nextTuesday(ci.last_paid_at || new Date()) : null;
+  const anchor = isPaid ? clampNotPast(nextTuesday(ci.last_paid_at || new Date())) : null;
 
   if (pi.payout_schedule === 'split') {
     const schedRes = await client.query(
@@ -125,4 +141,4 @@ async function syncPayoutDueDate(client, { purchaseInvoiceId = null, customerInv
   }
 }
 
-module.exports = { nextTuesday, syncPayoutDueDate };
+module.exports = { nextTuesday, clampNotPast, syncPayoutDueDate };

@@ -1,6 +1,9 @@
 const { pool } = require('../config/db');
 
 // ── Date-range WHERE helper ────────────────────────────────────────────────────
+// Works for both TIMESTAMPTZ columns (where the `< to + 1 day` form is needed
+// to reach the end of the day) and plain DATE columns like invoice_date, where
+// it is simply equivalent to `<= to`.
 function dateParams(from, to, params, field) {
   const parts = [];
   if (from) { params.push(from); parts.push(`${field} >= $${params.length}::date`); }
@@ -79,7 +82,7 @@ async function getSummary(req, res, next) {
       const params = [];
       let scopeWhere = '';
       if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
-      const dw  = dateParams(f, t, params, 'ci.created_at');
+      const dw  = dateParams(f, t, params, 'ci.invoice_date');
       const hub = hubClause(hub_id, params, 'l.created_by', 'l.assigned_to');
       const clauses = [scopeWhere, dw, hub, "ci.status != 'cancelled'"].filter(Boolean);
       const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -177,7 +180,7 @@ async function getCategoryRevenue(req, res, next) {
       scopeJoin = `AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))`;
     }
 
-    const dw       = dateParams(from, to, params, 'ci.created_at');
+    const dw       = dateParams(from, to, params, 'ci.invoice_date');
     const hub      = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
 
     const r = await pool.query(`
@@ -233,8 +236,9 @@ async function getByUser(req, res, next) {
     const dw       = dateParams(from, to, params, 'l.created_at');
     const dateCond = dw ? `AND ${dw}` : '';
 
-    // Separate date filter for CI Total — based on invoice creation date, not lead date
-    const ciDw       = dateParams(from, to, params, 'ci2.created_at');
+    // Separate date filter for CI Total — based on the invoice's own date
+    // (invoice_date, which may be backdated), not the lead date.
+    const ciDw       = dateParams(from, to, params, 'ci2.invoice_date');
     const ciDateCond = ciDw ? `AND ${ciDw}` : '';
 
     const r = await pool.query(`
@@ -442,7 +446,7 @@ async function getDashboardStats(req, res, next) {
                 COUNT(*)::int AS invoice_count
            FROM customer_invoices ci
            ${isAll ? '' : 'LEFT JOIN appointments a ON a.id = ci.appointment_id LEFT JOIN leads l ON l.id = a.lead_id'}
-          WHERE ci.created_at >= $1::date
+          WHERE ci.invoice_date >= $1::date
           ${isAll ? '' : `AND (l.created_by = ANY($2) OR l.assigned_to = ANY($2))`}`,
         isAll ? [monthStart] : [monthStart, userIds]
       ),
@@ -498,12 +502,13 @@ async function getDashboardStats(req, res, next) {
                 ci.amount_paid,
                 (ci.grand_total - ci.amount_paid) AS outstanding,
                 ci.status AS status_name,
+                ci.invoice_date::text AS invoice_date,
                 ci.created_at
            FROM customer_invoices ci
            LEFT JOIN appointments a ON a.id = ci.appointment_id
            ${isAll ? '' : 'LEFT JOIN leads l ON l.id = a.lead_id'}
            ${isAll ? '' : `WHERE (l.created_by = ANY($1) OR l.assigned_to = ANY($1))`}
-           ORDER BY ci.created_at DESC LIMIT 5`,
+           ORDER BY ci.invoice_date DESC, ci.id DESC LIMIT 5`,
         isAll ? [] : [userIds]
       ),
 
@@ -612,22 +617,22 @@ async function getRevenueTrend(req, res, next) {
     let dateWhere;
     if (from && to) {
       params.push(from); params.push(to);
-      dateWhere = `ci.created_at >= $${params.length - 1}::date AND ci.created_at < ($${params.length}::date + interval '1 day')`;
+      dateWhere = `ci.invoice_date >= $${params.length - 1}::date AND ci.invoice_date <= $${params.length}::date`;
     } else {
-      dateWhere = `ci.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months'`;
+      dateWhere = `ci.invoice_date >= (DATE_TRUNC('month', NOW()) - INTERVAL '11 months')::date`;
     }
 
     const r = await pool.query(`
       SELECT
-        TO_CHAR(DATE_TRUNC('month', ci.created_at), 'Mon YYYY') AS month,
-        DATE_TRUNC('month', ci.created_at)                      AS month_date,
+        TO_CHAR(DATE_TRUNC('month', ci.invoice_date), 'Mon YYYY') AS month,
+        DATE_TRUNC('month', ci.invoice_date)                      AS month_date,
         COALESCE(SUM(ci.amount_paid), 0)                        AS revenue,
         COUNT(*)::int                                            AS invoice_count
       FROM customer_invoices ci
       ${scopeJoin}
       WHERE ${dateWhere}
       ${scopeWhere}
-      GROUP BY DATE_TRUNC('month', ci.created_at)
+      GROUP BY DATE_TRUNC('month', ci.invoice_date)
       ORDER BY month_date ASC
     `, params);
 
@@ -675,11 +680,11 @@ async function getTopPerformers(req, res, next) {
     const { from, to } = req.query;
     const dateParams = from && to ? [from, to] : [];
     const hubDateWhere = from && to
-      ? `pi.created_at >= $1::date AND pi.created_at < ($2::date + interval '1 day')`
-      : `pi.created_at >= NOW() - INTERVAL '90 days'`;
+      ? `pi.invoice_date >= $1::date AND pi.invoice_date <= $2::date`
+      : `pi.invoice_date >= (NOW() - INTERVAL '90 days')::date`;
     const svcDateWhere = from && to
-      ? `cii.created_at >= $1::date AND cii.created_at < ($2::date + interval '1 day')`
-      : `cii.created_at >= NOW() - INTERVAL '90 days'`;
+      ? `ci.invoice_date >= $1::date AND ci.invoice_date <= $2::date`
+      : `ci.invoice_date >= (NOW() - INTERVAL '90 days')::date`;
 
     const [hubs, services] = await Promise.all([
       pool.query(`
@@ -698,7 +703,8 @@ async function getTopPerformers(req, res, next) {
                COUNT(cii.id)                                        AS usage_count,
                COALESCE(SUM(cii.customer_rate * cii.quantity), 0)   AS revenue
           FROM customer_invoice_items cii
-          JOIN estimates e        ON e.id  = (SELECT ci.estimate_id FROM customer_invoices ci WHERE ci.id = cii.customer_invoice_id LIMIT 1)
+          JOIN customer_invoices ci ON ci.id = cii.customer_invoice_id
+          JOIN estimates e        ON e.id  = ci.estimate_id
           JOIN estimate_items ei  ON ei.id = cii.estimate_item_id
           JOIN services s         ON s.id  = ei.service_id
          WHERE ${svcDateWhere}
@@ -887,7 +893,7 @@ async function getHubRevenue(req, res, next) {
     // ── Query A: revenue-side numbers, driven by customer_invoices ──────────
     const paramsA = [];
     const whereA = [`ci.status != 'cancelled'`];
-    const dateWhereA = dateParams(from, to, paramsA, 'ci.created_at');
+    const dateWhereA = dateParams(from, to, paramsA, 'ci.invoice_date');
     if (dateWhereA) whereA.push(dateWhereA);
     if (hubId) { paramsA.push(hubId); whereA.push(`ci.hub_id = $${paramsA.length}`); }
 
@@ -923,11 +929,11 @@ async function getHubRevenue(req, res, next) {
 
     // ── Query B: "our take", matching Payouts' Total Take Rate formula ──────
     // Grouped by the purchase invoice's own hub_id (not the CI's), filtered
-    // by pi.created_at so it still respects the report's date range/hub
+    // by pi.invoice_date so it still respects the report's date range/hub
     // filter — Payouts itself has no date filter, but this report does.
     const paramsB = [];
     const whereB = [`pi.status = 'approved'`, `pi.rate_mode = 'tech_rate'`];
-    const dateWhereB = dateParams(from, to, paramsB, 'pi.created_at');
+    const dateWhereB = dateParams(from, to, paramsB, 'pi.invoice_date');
     if (dateWhereB) whereB.push(dateWhereB);
     if (hubId) { paramsB.push(hubId); whereB.push(`pi.hub_id = $${paramsB.length}`); }
 

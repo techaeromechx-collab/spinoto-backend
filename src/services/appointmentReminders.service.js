@@ -123,11 +123,17 @@ async function fireAppointmentReminders() {
 }
 
 /**
- * Start polling every 15 minutes.
+ * Start polling every 30 minutes.
  * Called once from server.js on startup.
+ *
+ * Matches the smart-alert scheduler's interval on purpose. Both start at boot
+ * and run every 30 minutes, so they stay roughly in step and one database
+ * wake-up serves both — rather than each poller waking a suspended serverless
+ * Postgres on its own schedule. See the note at the top of scheduler.js for
+ * why the interval matters at all.
  */
 function startReminderPoller() {
-  const INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+  const INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
   // Run immediately on startup, then on interval
   fireAppointmentReminders().catch(() => {});
@@ -135,7 +141,7 @@ function startReminderPoller() {
     fireAppointmentReminders().catch(() => {});
   }, INTERVAL_MS);
 
-  console.log('[AppointmentReminders] Poller started — checking every 15 minutes');
+  console.log('[AppointmentReminders] Poller started — checking every 30 minutes');
 }
 
 module.exports = { startReminderPoller, fireAppointmentReminders };

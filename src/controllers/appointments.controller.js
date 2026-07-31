@@ -214,6 +214,8 @@ const APPT_SELECT = `
     a.odometer_km,
     a.is_warranty_redo,
     a.warranty_claim_id,
+    a.booking_source,
+    a.external_ref,
     a.cancellation_reason,
     a.pickup_required,
     a.pickup_address_line1,

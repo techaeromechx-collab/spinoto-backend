@@ -25,8 +25,22 @@ const { getIO } = require('../socket');
 // ─── Validators ───────────────────────────────────────────────────────────────
 
 const idParam = z.coerce.number().int().positive();
+const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
+const { validateInvoiceDate, validationError, istToday, toIstDate } = require('../utils/invoiceDate');
+const { warrantyImpact, WARRANTY_ITEMS_SQL } = require('../utils/warrantyPreflight');
 
 const itemSchema = z.object({
+  // The existing estimate_items row this line came from, when editing.
+  //
+  // Absent = a newly added line. Present = update that row IN PLACE, so its id
+  // survives the edit. That matters because customer_invoice_items and
+  // purchase_invoice_items point at these ids: the save used to delete every
+  // row and re-insert, which forced those links to be nulled first and
+  // permanently severed the estimate↔invoice relationship on every edit.
+  //
+  // An id that doesn't belong to this estimate is ignored and treated as a new
+  // line — the diff only ever looks the id up in this estimate's own rows.
+  id:           z.coerce.number().int().positive().optional().nullable(),
   item_type:    z.enum(['service', 'part']),
   service_id:   z.coerce.number().int().positive().optional().nullable(),
   part_id:      z.coerce.number().int().positive().optional().nullable(),
@@ -106,6 +120,13 @@ const createSchema = z.object({
   segment_ids:               z.array(z.coerce.number().int().positive()).optional().default([]),
   cc_category_id:            z.coerce.number().int().positive().optional().nullable(),
   odometer_km:               z.coerce.number().int().nonnegative().optional().nullable(),
+
+  // Backdating a job that was done before it was entered. Omitted = the
+  // appointment's scheduled date if there is one, else today — so the common
+  // case needs no input at all.
+  estimate_date:             z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'estimate_date must be YYYY-MM-DD').optional(),
+  backdate_reason:           z.string().trim().min(10, 'Please give a reason of at least 10 characters.').optional(),
+  override:                  z.coerce.boolean().optional().default(false),
 }).superRefine((data, ctx) => {
   b2bFieldsRefine(data, ctx);
   if (!data.appointment_id) {
@@ -155,12 +176,334 @@ const companyReviseSchema = z.object({
 
 // ─── Error handler ────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Estimate date support (PLAN_backdated_job_chain.md)
+//
+// The estimate's date is the anchor for the whole job: the purchase invoice and
+// customer invoice generated from it inherit it when the estimate was
+// explicitly backdated. That makes entering a job that happened weeks ago a
+// single date entry rather than three.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadDateSettings() {
+  const r = await pool.query(
+    `SELECT books_locked_through::text AS books_locked_through, backdate_max_days
+       FROM company_settings ORDER BY id LIMIT 1`
+  );
+  return r.rows[0] || { books_locked_through: null, backdate_max_days: 30 };
+}
+
+// Mirrors requirePermission's logic for the finer-grained decisions inside a
+// handler (may this user override a soft rule?), is_super_admin bypass included.
+function hasPerm(req, code) {
+  if (!req.user) return false;
+  if (req.user.is_super_admin) return true;
+  return !!req.user.permissions?.has(code);
+}
+
+// Everything the validator needs about one estimate and its downstream
+// documents, in one round trip.
+async function loadEstimateDateContext(db, id) {
+  const r = await db.query(
+    `SELECT e.id, e.status,
+            e.estimate_date::text          AS estimate_date,
+            e.original_estimate_date::text AS original_estimate_date,
+            a.scheduled_date::text         AS appointment_date,
+            pi.id                          AS pi_id,
+            pi.invoice_date::text          AS pi_invoice_date,
+            pi.amount_paid                 AS pi_amount_paid,
+            ci.id                          AS ci_id,
+            ci.invoice_date::text          AS ci_invoice_date,
+            ci.status                      AS ci_status,
+            (SELECT COUNT(*)::int FROM customer_invoice_payments p
+              WHERE p.customer_invoice_id = ci.id)  AS ci_payment_count
+       FROM estimates e
+       LEFT JOIN appointments a       ON a.id = e.appointment_id
+       LEFT JOIN purchase_invoices pi ON pi.estimate_id = e.id
+       LEFT JOIN customer_invoices ci ON ci.estimate_id = e.id
+      WHERE e.id = $1
+      LIMIT 1`,
+    [id]
+  );
+  return r.rows[0] || null;
+}
+
+// What moving the estimate would do to the linked invoice's warranties.
+//
+// The cascade rewrites customer_invoices.invoice_date directly, which is the
+// same change updateInvoiceDate() guards with a hard WARRANTY_WOULD_EXPIRE
+// rule. Without this the cascade was a way around that rule — and it defaults
+// to on, so it was the EASIER path. Unclaimed warranties would have expired
+// retroactively with no warning and no record.
+async function cascadeWarrantyImpact(db, ctx, newDate, today) {
+  if (!ctx.ci_id) return { shifting: [], expiring: [], unaffected: 0 };
+  const items = await db.query(WARRANTY_ITEMS_SQL, [ctx.ci_id]);
+  return warrantyImpact({
+    items: items.rows,
+    currentDate: ctx.ci_invoice_date,
+    newDate,
+    today,
+  });
+}
+
+// Runs the validator for a proposed estimate date. Shared by the preflight and
+// the write so the dry run can never disagree with the real thing.
+function checkEstimateDate(ctx, newDate, { canBackdate, canOverride, today, warranty = null }) {
+  // The estimate sits at the head of the chain, so nothing is upstream of it —
+  // but anything already generated FROM it constrains how far forward it can
+  // move. The earliest downstream document is the binding one.
+  const downstream = [ctx.pi_invoice_date, ctx.ci_invoice_date].filter(Boolean).sort()[0] || null;
+  return validateInvoiceDate({
+    invoiceDate: newDate,
+    currentDate: ctx.estimate_date,
+    documentType: 'estimate',
+    chainAfter: downstream,
+    chainAfterLabel: ctx.pi_invoice_date && downstream === ctx.pi_invoice_date
+      ? 'its purchase invoice' : 'its customer invoice',
+    settings: ctx._settings,
+    // Only meaningful when the CI is actually moving with us.
+    warranty,
+    canBackdate,
+    canOverride,
+    today,
+  });
+}
+
+// Which downstream documents can follow the estimate, and why not if not.
+// Same freeze rules as phase 3: a PI is frozen once the hub has been paid, a
+// CI once any payment is recorded against it.
+function cascadeTargets(ctx) {
+  const out = [];
+  if (ctx.pi_id) {
+    const paid = Number(ctx.pi_amount_paid || 0) > 0;
+    out.push({
+      type: 'purchase_invoice', id: ctx.pi_id, invoice_date: ctx.pi_invoice_date,
+      can_follow: !paid,
+      blocked_reason: paid ? 'The hub has already been paid for this job.' : null,
+    });
+  }
+  if (ctx.ci_id) {
+    const hasPayments = Number(ctx.ci_payment_count || 0) > 0;
+    const badStatus = !['generated', 'approved'].includes(ctx.ci_status);
+    out.push({
+      type: 'customer_invoice', id: ctx.ci_id, invoice_date: ctx.ci_invoice_date,
+      can_follow: !hasPayments && !badStatus,
+      blocked_reason: hasPayments ? 'The customer invoice has payments recorded against it.'
+        : (badStatus ? `The customer invoice status is ${ctx.ci_status}.` : null),
+    });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/estimates/:id/date-preflight?estimate_date=YYYY-MM-DD
+//   Dry run. Reports what a date change would do — which rules fail, what needs
+//   an override, and which downstream documents can follow — without writing.
+// ─────────────────────────────────────────────────────────────────────────────
+function estimateDatePreflight(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = z.coerce.number().int().positive().parse(req.params.id);
+    const newDate = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'estimate_date must be YYYY-MM-DD')
+      .parse(req.query.estimate_date);
+
+    const ctx = await loadEstimateDateContext(pool, id);
+    if (!ctx) return res.status(404).json({ error: 'Estimate not found' });
+
+    const today = istToday();
+    ctx._settings = await loadDateSettings();
+    const warranty = await cascadeWarrantyImpact(pool, ctx, newDate, today);
+    const check = checkEstimateDate(ctx, newDate, {
+      canBackdate: hasPerm(req, 'BACKDATE_ESTIMATE'),
+      canOverride: false, // report what WOULD need an override, don't apply one
+      today,
+      warranty,
+    });
+
+    res.json({
+      current_date: ctx.estimate_date,
+      proposed_date: newDate,
+      appointment_date: ctx.appointment_date,
+      today,
+      ok: check.ok,
+      unchanged: !!check.unchanged,
+      errors: check.errors,
+      warnings: check.warnings,
+      requires_override: check.errors.some(e => e.overridable),
+      requires_reason: newDate !== ctx.estimate_date,
+      // Same shape the CI preflight returns, so the shared dialog renders it
+      // without a second code path.
+      warranty,
+      cascade: cascadeTargets(ctx),
+      books_locked_through: ctx._settings.books_locked_through,
+      backdate_max_days: ctx._settings.backdate_max_days,
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/estimates/:id/estimate-date
+//   Body: { estimate_date, reason, override?, cascade? }
+//   cascade moves the PI and CI to match, each refused individually if frozen.
+// ─────────────────────────────────────────────────────────────────────────────
+function updateEstimateDate(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = z.coerce.number().int().positive().parse(req.params.id);
+    const body = z.object({
+      estimate_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'estimate_date must be YYYY-MM-DD'),
+      reason: z.string().trim().min(10, 'Please give a reason of at least 10 characters.'),
+      override: z.coerce.boolean().optional().default(false),
+      cascade: z.coerce.boolean().optional().default(true),
+    }).parse(req.body);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Serialise every date change and generation for this job.
+      //
+      // Without it two concurrent edits both read the pre-change state, both
+      // validate against it, and both commit — producing exactly the ordering
+      // the chain rule exists to prevent (a CI dated before its estimate), or
+      // a date moved onto an invoice that received a payment in between.
+      // Keyed on the ESTIMATE id so all three documents in a job contend on
+      // the same lock. Namespace 3 — 1 is appointment creation, 2 is CI
+      // generation.
+      await client.query(`SELECT pg_advisory_xact_lock(3, $1)`, [id]);
+
+      const ctx = await loadEstimateDateContext(client, id);
+      if (!ctx) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Estimate not found' }); }
+
+      if (ctx.estimate_date === body.estimate_date) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'That is already the estimate date.', code: 'UNCHANGED' });
+      }
+      // Mirrors the CI's status freeze. A cancelled or rejected estimate is
+      // history; re-dating it (and cascading from it) is never a correction.
+      if (['cancelled', 'rejected'].includes(ctx.status)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: `An estimate with status "${ctx.status}" cannot have its date changed.`,
+          code: 'BAD_STATUS',
+        });
+      }
+
+      const today = istToday();
+      ctx._settings = await loadDateSettings();
+
+      // When cascading, the downstream documents are moving too, so they must
+      // not also be treated as a ceiling — that would make every cascade
+      // self-blocking. Their own freeze rules still apply below.
+      const movable = cascadeTargets(ctx);
+      const cascading = body.cascade && movable.some(t => t.can_follow);
+      const ctxForCheck = cascading
+        ? { ...ctx,
+            pi_invoice_date: movable.find(t => t.type === 'purchase_invoice')?.can_follow ? null : ctx.pi_invoice_date,
+            ci_invoice_date: movable.find(t => t.type === 'customer_invoice')?.can_follow ? null : ctx.ci_invoice_date }
+        : ctx;
+
+      // Only when the CI is actually being moved — if it stays put its
+      // warranties don't move either.
+      const ciMoving = cascading && movable.find(t => t.type === 'customer_invoice')?.can_follow;
+      const warranty = ciMoving
+        ? await cascadeWarrantyImpact(client, ctx, body.estimate_date, today)
+        : null;
+
+      const check = checkEstimateDate(ctxForCheck, body.estimate_date, {
+        canBackdate: hasPerm(req, 'BACKDATE_ESTIMATE'),
+        canOverride: body.override && hasPerm(req, 'OVERRIDE_INVOICE_DATE_LIMITS'),
+        today,
+        warranty,
+      });
+      if (!check.ok) { await client.query('ROLLBACK'); return res.status(409).json(validationError(check)); }
+
+      await client.query(
+        `UPDATE estimates
+            SET estimate_date          = $1::date,
+                original_estimate_date = COALESCE(original_estimate_date, $2::date),
+                backdate_reason        = $3,
+                backdated_by           = $4,
+                backdated_at           = NOW(),
+                updated_by             = $4,
+                updated_at             = NOW()
+          WHERE id = $5`,
+        [body.estimate_date, ctx.estimate_date, body.reason, req.user?.id || null, id]
+      );
+
+      // ── Cascade ────────────────────────────────────────────────────────
+      const moved = [];
+      if (body.cascade) {
+        for (const t of movable) {
+          if (!t.can_follow) { moved.push({ ...t, moved: false }); continue; }
+          const table = t.type === 'purchase_invoice' ? 'purchase_invoices' : 'customer_invoices';
+          await client.query(
+            `UPDATE ${table}
+                SET invoice_date          = $1::date,
+                    original_invoice_date = COALESCE(original_invoice_date, invoice_date),
+                    backdate_reason       = $2,
+                    backdated_by          = $3,
+                    backdated_at          = NOW(),
+                    updated_by            = $3,
+                    updated_at            = NOW()
+              WHERE id = $4`,
+            [body.estimate_date, `Followed estimate #${id}: ${body.reason}`, req.user?.id || null, t.id]
+          );
+          moved.push({ ...t, moved: true, invoice_date: body.estimate_date });
+        }
+      }
+
+      await client.query('COMMIT');
+
+      logActivity({
+        userId: req.user?.id,
+        userName: req.user?.name,
+        action: 'UPDATE',
+        entity: 'estimate',
+        entityId: id,
+        description:
+          `Estimate date changed on EST-${String(id).padStart(6, '0')}: ` +
+          `${ctx.estimate_date} → ${body.estimate_date}` +
+          (check.overridden?.length ? ` [overrode: ${check.overridden.map(o => o.code).join(', ')}]` : '') +
+          (moved.filter(m => m.moved).length
+            ? ` [also moved: ${moved.filter(m => m.moved).map(m => m.type).join(', ')}]` : '') +
+          ` — ${body.reason}`,
+      });
+
+      res.json({
+        ok: true, id,
+        estimate_date: body.estimate_date,
+        previous_estimate_date: ctx.estimate_date,
+        warnings: check.warnings,
+        overridden: check.overridden || [],
+        warranty,
+        cascade: moved,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+}
+
 function handle(req, res, next, fn) {
   Promise.resolve()
     .then(fn)
     .catch((err) => {
       if (err.name === 'ZodError') {
         return res.status(400).json({ error: err.errors.map(e => e.message).join('; ') });
+      }
+      // Same migration hint the invoice and settings controllers give. Estimate
+      // creation reads company_settings.books_locked_through (migration 100) and
+      // estimates.estimate_date (101); without them this was a bare 500 that
+      // looked like a code fault rather than a pending migration.
+      if (err.code === '42703' && /estimate_date|backdat|books_locked|updated_by/i.test(err.message || '')) {
+        console.error('[estimates] missing column — migrations not applied:', err.message);
+        return res.status(503).json({
+          error: 'Database is behind the code: the document-date columns are missing. ' +
+                 'Run `npm run db:migrate` in backend/ to apply migrations 099-101.',
+          code: 'MIGRATION_PENDING',
+          detail: err.message,
+        });
       }
       next(err);
     });
@@ -331,6 +674,14 @@ const EST_SELECT = `
     e.created_by,
     e.created_at,
     e.updated_at,
+    -- The estimate's own date (migration 101): when the WORK happened, which
+    -- is not necessarily when the row was keyed in. ::text so pg-types can't
+    -- parse the DATE into a local-midnight JS Date and shift it a day on an
+    -- IST server. created_at stays as the system record.
+    e.estimate_date::text          AS estimate_date,
+    e.original_estimate_date::text AS original_estimate_date,
+    e.backdate_reason,
+    e.backdated_at,
     e.discount_mode,
     e.transaction_discount_type,
     e.transaction_discount_value,
@@ -346,6 +697,10 @@ const EST_SELECT = `
     COALESCE(a.mobile, e.mobile)                 AS mobile,
     (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(a.mobile, e.mobile)) AS customer_token,
     COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
+    -- Pickup logistics, printed under BILL TO when the job was a pickup.
+    -- Only the appointment has these; a standalone estimate simply has none.
+    a.pickup_required, a.pickup_address_line1, a.pickup_address_line2,
+    a.pickup_city, a.pickup_pincode,
     a.scheduled_date,
 
     -- Raw vehicle dimension ids (for re-deriving pricing context client-side
@@ -475,7 +830,10 @@ function listEstimates(req, res, next) {
 
     const [dataRes, countRes] = await Promise.all([
       pool.query(
-        `${EST_SELECT} ${where} ORDER BY e.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        // Estimate date, not keyed-in date — a retroactively entered job
+        // belongs where the work happened. id tiebreaker so OFFSET paging
+        // can't repeat or skip rows when many share a date.
+        `${EST_SELECT} ${where} ORDER BY e.estimate_date DESC, e.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
       // Count needs the appointments join too — the search condition
@@ -513,6 +871,38 @@ function getEstimate(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/estimates/:id/pdf?theme=xxx
+//
+// Renders the estimate through the shared themed-document pipeline (the same
+// templates that produce customer invoices and purchase invoices), replacing
+// the browser's window.print() of the on-screen layout.
+//
+// Note the adapter drops customer-rejected line items: the old print view
+// showed them while excluding them from the totals, so the printed rows didn't
+// sum to the printed Grand Total.
+// ─────────────────────────────────────────────────────────────────────────────
+function getEstimatePdf(req, res, next) {
+  handle(req, res, next, async () => {
+    const id  = idParam.parse(req.params.id);
+    const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
+    if (!row.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
+    const estimate = row.rows[0];
+    estimate.items = await _getItems(id);
+
+    const company = await loadCompany();
+    const { cfg, theme } = resolveRender(company, 'estimate', req.user, {
+      themeOverride: req.query.theme,
+      share: req.query.share === '1' || req.query.share === 'true',
+    });
+
+    await sendPdf(res, {
+      docType: 'estimate', row: estimate, company, cfg, theme,
+      baseUrl: req.get('origin') || req.get('referer'),
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/estimates/by-token/:token — resolves a public_token (used in
 // shareable /estimates/:token URLs) to the numeric id, then delegates to
 // the exact same logic as GET /api/estimates/:id.
@@ -537,17 +927,22 @@ function createEstimate(req, res, next) {
     // Mobile used for the "save B2B details to profile" lookup — either the
     // linked appointment's mobile, or the standalone estimate's own mobile.
     let profileMobile = data.mobile || null;
+    let apptScheduledDate = null;
 
     if (!isStandalone) {
       // Validate appointment exists
       const apptCheck = await pool.query(
-        `SELECT id, mobile FROM appointments WHERE id = $1`,
+        // scheduled_date comes along because it is the natural default for the
+        // estimate's date: book the appointment for the day the work happened
+        // and the whole chain lands there without anyone typing a date twice.
+        `SELECT id, mobile, scheduled_date::text AS scheduled_date FROM appointments WHERE id = $1`,
         [data.appointment_id]
       );
       if (!apptCheck.rows[0]) {
         return res.status(400).json({ error: `Appointment #${data.appointment_id} not found.` });
       }
       profileMobile = apptCheck.rows[0].mobile;
+      apptScheduledDate = apptCheck.rows[0].scheduled_date || null;
 
       // Guard: only one estimate per appointment
       const dupCheck = await pool.query(
@@ -560,6 +955,51 @@ function createEstimate(req, res, next) {
           existing_estimate_id: dupCheck.rows[0].id,
         });
       }
+    }
+
+    // ── Estimate date ───────────────────────────────────────────────────────
+    //
+    // Two completely different cases, and conflating them broke the product:
+    //
+    //   USER-CHOSEN date  → a deliberate backdate. Full validation, permission
+    //                       required, reason required.
+    //   DERIVED default   → not a decision the user made. Never validated,
+    //                       never permission-gated.
+    //
+    // The derived default comes from the appointment's scheduled_date, which is
+    // routinely in the FUTURE (that is what a booking is) and may be older than
+    // the backdating window. Running the backdate rules over it meant every
+    // advance booking failed with "Estimate date cannot be in the future", and
+    // any staff member without BACKDATE_ESTIMATE couldn't write up yesterday's
+    // job. Clamped to today instead: an estimate is written when the work is
+    // being quoted, so it can never legitimately be dated ahead.
+    const today = istToday();
+    const derivedDefault = apptScheduledDate && apptScheduledDate < today
+      ? apptScheduledDate     // job already happened — sensible starting point
+      : today;                // future or same-day booking — quoted today
+
+    const estimateDate = data.estimate_date || derivedDefault;
+    const userChoseDate = !!data.estimate_date && data.estimate_date !== today;
+    let dateWarnings = [];
+
+    if (userChoseDate) {
+      const settings = await loadDateSettings();
+      const check = validateInvoiceDate({
+        invoiceDate: estimateDate,
+        documentType: 'estimate',
+        settings,
+        canBackdate: hasPerm(req, 'BACKDATE_ESTIMATE'),
+        canOverride: data.override && hasPerm(req, 'OVERRIDE_INVOICE_DATE_LIMITS'),
+        today,
+      });
+      if (!check.ok) return res.status(409).json(validationError(check));
+      if (!data.backdate_reason) {
+        return res.status(400).json({
+          error: 'A reason is required when dating an estimate earlier than today.',
+          code: 'REASON_REQUIRED',
+        });
+      }
+      dateWarnings = check.warnings;
     }
 
     const client = await pool.connect();
@@ -591,9 +1031,12 @@ function createEstimate(req, res, next) {
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
             customer_name, mobile, whatsapp, vehicle_number,
             vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id,
-            public_token, odometer_km)
+            public_token, odometer_km,
+            estimate_date, original_estimate_date, backdate_reason, backdated_by, backdated_at,
+            updated_by)
          VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
+                 $24::date, $25::date, $26, $27, $28, $29)
          RETURNING id`,
         [
           data.appointment_id || null, data.hub_id, data.notes || null, req.user.id,
@@ -618,6 +1061,22 @@ function createEstimate(req, res, next) {
           isStandalone ? (data.cc_category_id  || null) : null,
           generatePublicToken(),
           data.odometer_km ?? null,
+          estimateDate,
+          // original_estimate_date doubles as the "this job was entered
+          // retroactively" flag that decides whether the PI and CI inherit
+          // this date. Only set when the USER chose the date — a date that
+          // merely came from the appointment is the normal path, not a
+          // backdate, and shouldn't make downstream documents inherit it.
+          // userChoseDate, not "date != today". A derived default is the
+          // normal path, not a backdate, so it must not set the provenance
+          // columns — original_estimate_date is what makes downstream
+          // documents inherit this date, and inheriting an appointment date
+          // nobody deliberately set is exactly the wrong behaviour.
+          userChoseDate ? today : null,
+          userChoseDate ? (data.backdate_reason || null) : null,
+          userChoseDate ? (req.user?.id || null) : null,
+          userChoseDate ? new Date() : null,
+          req.user?.id || null,
         ]
       );
 
@@ -896,14 +1355,25 @@ function updateEstimate(req, res, next) {
         const effectiveMode = modeRow.rows[0]?.discount_mode || 'line_item';
         const forceZeroDiscount = ['transaction', 'none'].includes(effectiveMode);
 
-        // Full replace — preserve approval/work status from original items so
-        // PI/CI sync can still find completed items after the edit.
-        // Build a lookup: "service_id:part_id" → { customer_approved, work_status }
+        // ── Diff, not full replace ──────────────────────────────────────────
+        //
+        // Lines carrying an id are UPDATEd in place; lines without one are
+        // INSERTed; rows the payload no longer mentions are DELETEd. Only that
+        // last group needs its inbound FKs cleared.
+        //
+        // This replaces a delete-every-row-and-re-insert, which was the root of
+        // three separate problems: it nulled customer_invoice_items.estimate_item_id
+        // on every save (severing the link the CI sync needs), it churned ids
+        // that warranty_claims references, and it silently renumbered lines.
         const origRows = await client.query(
-          `SELECT service_id, part_id, description, customer_approved, work_status
+          `SELECT id, service_id, part_id, description, customer_approved, work_status
            FROM estimate_items WHERE estimate_id = $1`,
           [id]
         );
+        // Keyed by id so a payload id can only ever match a row of THIS
+        // estimate — an id from elsewhere falls through to INSERT.
+        const existingById = new Map(origRows.rows.map(r => [Number(r.id), r]));
+        const keptIds = new Set();
         // Manual items have neither service_id nor part_id — key those by
         // description so distinct manual items don't share one map entry.
         const itemKey = (svcId, partId, description) =>
@@ -917,22 +1387,6 @@ function updateEstimate(req, res, next) {
           }
         }
 
-        // Clear FK references before delete
-        await client.query(
-          `UPDATE purchase_invoice_items SET estimate_item_id = NULL
-           WHERE estimate_item_id IN (
-             SELECT id FROM estimate_items WHERE estimate_id = $1
-           )`,
-          [id]
-        );
-        await client.query(
-          `UPDATE customer_invoice_items SET estimate_item_id = NULL
-           WHERE estimate_item_id IN (
-             SELECT id FROM estimate_items WHERE estimate_id = $1
-           )`,
-          [id]
-        );
-        await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [id]);
         for (const item of data.items) {
           const itemForCalc = forceZeroDiscount
             ? { ...item, discount_type: null, discount_value: 0, discount_amount: 0 }
@@ -940,6 +1394,65 @@ function updateEstimate(req, res, next) {
           const { qty, rate, gstPct, gstAmount, totalIncGst, discountAmt } = computeItem(itemForCalc, roundFn);
           const svcId  = item.item_type === 'service' ? (item.service_id || item.item_id || null) : null;
           const partId = item.item_type === 'part'    ? (item.part_id    || item.item_id || null) : null;
+          const existingRow = item.id ? existingById.get(Number(item.id)) : null;
+
+          if (existingRow) {
+            // ── UPDATE in place: the id survives, so every inbound FK stays
+            //    valid. hsn_sac is re-derived exactly as the INSERT does, in
+            //    case the line now points at a different service or part.
+            await client.query(
+              `UPDATE estimate_items SET
+                 item_type = $2, service_id = $3, part_id = $4, description = $5,
+                 quantity = $6, customer_rate = $7, gst_percent = $8,
+                 gst_amount = $9, total_inc_gst = $10, is_from_appointment = $11,
+                 hsn_sac = COALESCE(
+                   (SELECT sac_code FROM services WHERE id = $3),
+                   (SELECT hsn_code FROM parts    WHERE id = $4)
+                 ),
+                 discount_type = $12, discount_value = $13, discount_amount = $14,
+                 discount_source = $15,
+                 warranty_months = $16, warranty_days = $17, warranty_km = $18,
+                 warranty_text = $19, warranty_source = $20,
+                 guarantee_months = $21, guarantee_days = $22, guarantee_km = $23,
+                 guarantee_text = $24, guarantee_source = $25
+               WHERE id = $1`,
+              [
+                existingRow.id,
+                item.item_type, svcId, partId, item.description,
+                qty, rate, gstPct, gstAmount, totalIncGst,
+                item.is_from_appointment ?? false,
+                forceZeroDiscount ? null : (item.discount_type   || null),
+                forceZeroDiscount ? 0    : (item.discount_value  || 0),
+                forceZeroDiscount ? 0    : discountAmt,
+                forceZeroDiscount ? null : (item.discount_source || null),
+                item.warranty_months ?? null,
+                item.warranty_days   ?? null,
+                item.warranty_km     ?? null,
+                item.warranty_text   || null,
+                item.warranty_source || null,
+                item.guarantee_months ?? null,
+                item.guarantee_days   ?? null,
+                item.guarantee_km     ?? null,
+                item.guarantee_text   || null,
+                item.guarantee_source || null,
+              ]
+            );
+            keptIds.add(Number(existingRow.id));
+
+            // An existing row already carries the right approval/work status —
+            // only the estimate-wide statuses below may override it. Deliberately
+            // NOT reapplying statusMap here: that map is keyed by service/part,
+            // so with the same service on two lines it could copy one line's
+            // status onto the other.
+            if (status === 'work_completed' || status === 'work_in_progress') {
+              await client.query(
+                `UPDATE estimate_items SET customer_approved = TRUE, work_status = $2 WHERE id = $1`,
+                [existingRow.id, status === 'work_completed' ? 'completed' : 'in_progress']
+              );
+            }
+            continue;
+          }
+
           const insertedRow = await client.query(
             `INSERT INTO estimate_items
                (estimate_id, item_type, service_id, part_id, description,
@@ -1011,7 +1524,33 @@ function updateEstimate(req, res, next) {
               [restoredApproved, restoredStatus, newItemId]
             );
           }
+          keptIds.add(Number(newItemId));
         }
+
+        // ── Remove only the lines the payload dropped ───────────────────────
+        // Their inbound FKs are cleared first, exactly as before — but now for
+        // these rows alone, so surviving lines keep their invoice links.
+        const removedIds = origRows.rows
+          .map(r => Number(r.id))
+          .filter(rid => !keptIds.has(rid));
+
+        if (removedIds.length) {
+          await client.query(
+            `UPDATE purchase_invoice_items SET estimate_item_id = NULL
+             WHERE estimate_item_id = ANY($1::int[])`,
+            [removedIds]
+          );
+          await client.query(
+            `UPDATE customer_invoice_items SET estimate_item_id = NULL
+             WHERE estimate_item_id = ANY($1::int[])`,
+            [removedIds]
+          );
+          await client.query(
+            `DELETE FROM estimate_items WHERE id = ANY($1::int[])`,
+            [removedIds]
+          );
+        }
+
         await recalcTotals(client, id);
       } else if (
         data.discount_mode !== undefined ||
@@ -1447,6 +1986,7 @@ function deleteEstimate(req, res, next) {
 module.exports = {
   listEstimates,
   getEstimate,
+  getEstimatePdf,
   getEstimateByToken,
   createEstimate,
   updateEstimate,
@@ -1456,4 +1996,6 @@ module.exports = {
   customerApproval,
   updateItemWorkStatus,
   deleteEstimate,
+  estimateDatePreflight,
+  updateEstimateDate,
 };

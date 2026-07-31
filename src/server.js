@@ -47,6 +47,7 @@ const logsRoutes                 = require('./routes/logs.routes');
 const discountMasterRoutes       = require('./routes/discount_master.routes');
 const warrantyMasterRoutes       = require('./routes/warranty_master.routes');
 const warrantyClaimsRoutes       = require('./routes/warranty_claims.routes');
+const integrationsRoutes         = require('./routes/integrations.routes');
 const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
 const pushRoutes                 = require('./routes/push.routes');
 
@@ -94,6 +95,14 @@ app.use(cors({
   // Auth uses Bearer tokens (Authorization header), not cookies — so
   // credentials are not needed. Never combine credentials with origin '*'.
   credentials: false,
+  // Response headers are invisible to cross-origin JS unless listed here, and
+  // the frontend and API are on different ports in development.
+  //   X-Page-Size         — the sheet the theme preview rendered for (A4/A5)
+  //   Content-Disposition — the PDF's filename. The client fetches the PDF with
+  //     a Bearer token and wraps it in a blob URL, and a blob URL carries no
+  //     name, so the browser would otherwise save it as its blob UUID. The
+  //     client has to read the name from this header and apply it itself.
+  exposedHeaders: ['X-Page-Size', 'Content-Disposition'],
 }));
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
@@ -144,6 +153,7 @@ app.use('/api/estimates',         estimatesRoutes);
 app.use('/api/discount-master',   discountMasterRoutes);
 app.use('/api/warranty-master',   warrantyMasterRoutes);
 app.use('/api/warranty-claims',   warrantyClaimsRoutes);
+app.use('/api/integrations',      integrationsRoutes);
 app.use('/api/call-outcomes',     callOutcomesRoutes);
 app.use('/api/settings',   settingsRoutes);
 

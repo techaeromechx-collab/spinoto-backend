@@ -2,7 +2,7 @@
   "name": "spinoto-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Spinoto Lead Management & POS — backend API (Node + Express + PostgreSQL)",
+  "description": "Spinoto Lead Management & POS \u2014 backend API (Node + Express + PostgreSQL)",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
@@ -23,6 +23,8 @@
     "morgan": "^1.10.0",
     "multer": "^2.1.1",
     "pg": "^8.11.5",
+    "puppeteer": "^23.9.0",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
     "web-push": "^3.6.7",
     "xlsx": "^0.18.5",
