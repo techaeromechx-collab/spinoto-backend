@@ -25,6 +25,7 @@
 
 const { resolvePlaceOfSupply, isInterState, splitGst } = require('../utils/gstStates');
 const { qrEnabled } = require('../utils/documentConfig');
+const { staticLogoDataUri, inlineUploadUrl } = require('../utils/inlineImage');
 
 const num = (v) => Number(v || 0);
 
@@ -69,9 +70,16 @@ function sellerFrom(company, cfg) {
     [company?.city, company?.state, company?.pincode].filter(Boolean).join(', '),
   ].filter(Boolean);
 
+  // Both branches must yield something Chrome can load with NO base URL —
+  // PDFs are rendered through page.setContent(), where a root-relative path
+  // resolves to nothing and fails silently. See utils/inlineImage.js.
   let logoUrl = null;
-  if (cfg.global.logo_source === 'uploaded') logoUrl = company?.logo_url || null;
-  else if (cfg.global.logo_source === 'static') logoUrl = '/logo.svg';
+  if (cfg.global.logo_source === 'uploaded') {
+    // Absolute ImageKit URLs pass through; local /uploads paths get inlined.
+    logoUrl = inlineUploadUrl(company?.logo_url) || null;
+  } else if (cfg.global.logo_source === 'static') {
+    logoUrl = staticLogoDataUri();
+  }
 
   return {
     name: company?.company_name || '',
