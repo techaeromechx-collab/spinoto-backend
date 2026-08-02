@@ -201,20 +201,64 @@ function blocksFrom(cfg, company) {
  */
 function pickupAddress(row) {
   if (!row.pickup_required) return [];
+  // On a B2B document the billed party is the company, and the address that
+  // belongs on the invoice is the company's registered one (b2bMeta). The
+  // pickup point is where the car was collected from — useful operationally,
+  // but it is not the recipient's address, and printing both produced two rows
+  // both labelled "Address" with different meanings.
+  if (row.is_b2b && row.b2b_address) return [];
   const cityLine = [row.pickup_city, row.pickup_pincode].filter(Boolean).join(', ');
   return [row.pickup_address_line1, row.pickup_address_line2, cityLine]
     .map(v => (v === null || v === undefined ? '' : String(v).trim()))
     .filter(Boolean);
 }
 
-/** B2B billing rows, shared by estimate + customer invoice. */
+/**
+ * B2B billing rows, shared by estimate + customer invoice.
+ *
+ * NO GSTIN ROW HERE — deliberately.
+ *
+ * `buyer.gstin` (below) is already set from the same `row.b2b_gst_number`, and
+ * docShared's buildBuyerRows renders buyer.gstin AND every meta row. Emitting
+ * it in both places printed the customer's GSTIN twice, identically, on every
+ * B2B invoice in every theme.
+ *
+ * buyer.gstin is the one that stays, because a purchase invoice uses it for the
+ * HUB's GSTIN and passes `meta: []` — dropping it there would remove the GSTIN
+ * from purchase invoices entirely.
+ *
+ * Note this is display only. Place-of-supply and the IGST-vs-CGST/SGST split
+ * read `row.b2b_gst_number` straight off the database row (utils/gstStates),
+ * not either of these, so the tax calculation is untouched.
+ */
 function b2bMeta(row) {
   if (!row.is_b2b) return [];
   const out = [];
-  if (row.b2b_company_name) out.push({ key: 'b2b_company', label: 'Company Name', value: row.b2b_company_name });
-  if (row.b2b_gst_number)   out.push({ key: 'b2b_gstin',   label: 'GSTIN',        value: row.b2b_gst_number });
-  if (row.b2b_address)      out.push({ key: 'b2b_address', label: 'Address',      value: row.b2b_address });
+  // On a B2B document the COMPANY is the billed party and becomes the heading
+  // (see buyerName), so the individual moves down here as a labelled row. That
+  // is who a registered recipient actually is under GST — the business, not
+  // the person who dropped the car off.
+  //
+  // Guarded on b2b_company_name for the same reason buyerName is: with no
+  // company recorded the person stays as the heading, and repeating them here
+  // would print the same name twice.
+  if (row.b2b_company_name && row.customer_name) {
+    out.push({ key: 'b2b_contact', label: 'Customer Name', value: row.customer_name });
+  }
+  if (row.b2b_address) out.push({ key: 'b2b_address', label: 'Address', value: row.b2b_address });
   return out;
+}
+
+/**
+ * Who the document is billed to.
+ *
+ * B2B with a company on file → the company. Everything else → the individual,
+ * which is also the fallback when is_b2b is set but no company name was
+ * captured; an empty heading would be worse than a slightly informal one.
+ */
+function buyerName(row) {
+  if (row.is_b2b && row.b2b_company_name) return row.b2b_company_name;
+  return row.customer_name || '';
 }
 
 /**
@@ -345,7 +389,7 @@ function fromEstimate(row, company, cfg) {
     date: row.created_at,
     seller: sellerFrom(company, cfg),
     buyer: {
-      name: row.customer_name || '',
+      name: buyerName(row),
       phone: row.mobile || '',
       gstin: row.is_b2b ? (row.b2b_gst_number || '') : '',
       meta: b2bMeta(row),
@@ -426,7 +470,7 @@ function fromCustomerInvoice(row, company, cfg) {
     date: row.created_at,
     seller: sellerFrom(company, cfg),
     buyer: {
-      name: row.customer_name || '',
+      name: buyerName(row),
       phone: row.mobile || '',
       gstin: row.is_b2b ? (row.b2b_gst_number || '') : '',
       meta: b2bMeta(row),

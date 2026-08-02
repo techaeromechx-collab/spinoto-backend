@@ -27,7 +27,7 @@ const { esc, money, formatDate, formatShortDate } = require('./shared');
  * "Scan" — precisely because each one owned its own copy. Changing the wording
  * meant finding all six.
  */
-const QR_CAPTION = 'Download Application';
+const QR_CAPTION = 'Track Your Order';
 
 // ─── Page size ────────────────────────────────────────────────────────────────
 
@@ -176,7 +176,7 @@ function buildColumns(doc, cfg) {
   if (ic.hsn) cols.push({ key: 'hsn', label: 'HSN/SAC', align: 'c', get: (it) => esc(it.hsn || '—') });
 
   if (ic.batch_no) cols.push({ key: 'batch_no', label: 'Batch No.', align: 'c', get: (it) => esc(it.batchNo || '—') });
-  if (ic.mfg_date) cols.push({ key: 'mfg_date', label: 'Mfg Date',  align: 'c', get: (it) => esc(formatShortDate(it.mfgDate) || '—') });
+  if (ic.mfg_date) cols.push({ key: 'mfg_date', label: 'Mfg Date', align: 'c', get: (it) => esc(formatShortDate(it.mfgDate) || '—') });
   if (ic.exp_date) cols.push({ key: 'exp_date', label: 'Exp. Date', align: 'c', get: (it) => esc(formatShortDate(it.expDate) || '—') });
 
   for (const def of (cfg.custom_columns || [])) {
@@ -413,7 +413,7 @@ function buildHsnSummary(doc) {
 
   const all = [...groups.values()];
   const totals = {
-    taxable:  money(all.reduce((s, g) => s + g.taxable, 0)),
+    taxable: money(all.reduce((s, g) => s + g.taxable, 0)),
     totalTax: money(all.reduce((s, g) => s + g.tax, 0)),
   };
 
@@ -540,14 +540,14 @@ function inWords(n) {
   if (n === 0) return 'Zero';
   const parts = [];
   const crore = Math.floor(n / 10000000); n %= 10000000;
-  const lakh  = Math.floor(n / 100000);   n %= 100000;
-  const thou  = Math.floor(n / 1000);     n %= 1000;
-  const hund  = Math.floor(n / 100);      n %= 100;
+  const lakh = Math.floor(n / 100000); n %= 100000;
+  const thou = Math.floor(n / 1000); n %= 1000;
+  const hund = Math.floor(n / 100); n %= 100;
   if (crore) parts.push(twoDigits(crore) + ' Crore');
-  if (lakh)  parts.push(twoDigits(lakh)  + ' Lakh');
-  if (thou)  parts.push(twoDigits(thou)  + ' Thousand');
-  if (hund)  parts.push(ONES[hund] + ' Hundred');
-  if (n)     parts.push(twoDigits(n));
+  if (lakh) parts.push(twoDigits(lakh) + ' Lakh');
+  if (thou) parts.push(twoDigits(thou) + ' Thousand');
+  if (hund) parts.push(ONES[hund] + ' Hundred');
+  if (n) parts.push(twoDigits(n));
   return parts.join(' ');
 }
 
