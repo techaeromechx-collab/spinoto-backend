@@ -75,6 +75,17 @@ const PERMISSIONS = Object.freeze({
     group: 'Settings',
   },
 
+  // Issuing a key hands a system outside this application standing read access
+  // to the master data — including, if pricing:read is ticked, the whole price
+  // list. That is a commercial decision, not an operational one, so it sits
+  // with Settings rather than with whoever manages services day to day.
+  MANAGE_API_KEYS: {
+    code: 'MANAGE_API_KEYS',
+    label: 'Manage API Keys',
+    description: 'Create and revoke read-only API keys for outside systems (Settings → API Keys). A key with pricing scope can read your entire price list.',
+    group: 'Settings',
+  },
+
   // ---- Leads ----
   CREATE_LEAD: {
     code: 'CREATE_LEAD',

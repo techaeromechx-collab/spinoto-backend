@@ -48,6 +48,13 @@ const discountMasterRoutes       = require('./routes/discount_master.routes');
 const warrantyMasterRoutes       = require('./routes/warranty_master.routes');
 const warrantyClaimsRoutes       = require('./routes/warranty_claims.routes');
 const integrationsRoutes         = require('./routes/integrations.routes');
+const publicBookingRoutes        = require('./routes/public.booking.routes');
+// Read-only master data for outside systems. Key-authenticated, versioned
+// separately from the internal /api/* routes so its shape can stay stable
+// while those keep changing with the frontend.
+const v1MasterRoutes             = require('./routes/v1_master.routes');
+// Admin side of the same feature: issuing and revoking those keys.
+const apiKeysRoutes              = require('./routes/api_keys.routes');
 const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
 const pushRoutes                 = require('./routes/push.routes');
 
@@ -154,6 +161,11 @@ app.use('/api/discount-master',   discountMasterRoutes);
 app.use('/api/warranty-master',   warrantyMasterRoutes);
 app.use('/api/warranty-claims',   warrantyClaimsRoutes);
 app.use('/api/integrations',      integrationsRoutes);
+app.use('/api/v1/master',         v1MasterRoutes);
+app.use('/api/api-keys',          apiKeysRoutes);
+// UNAUTHENTICATED — booking.spinoto.com. Rate-limited inside the router;
+// requires https://booking.spinoto.com in CORS_ORIGIN.
+app.use('/api/public/booking',    publicBookingRoutes);
 app.use('/api/call-outcomes',     callOutcomesRoutes);
 app.use('/api/settings',   settingsRoutes);
 
