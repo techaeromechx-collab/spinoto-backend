@@ -17,6 +17,15 @@ async function loadDateSettings() {
   return r.rows[0] || { books_locked_through: null, backdate_max_days: 30 };
 }
 
+// Route-level permission is handled by requirePermission; this is the
+// finer-grained check inside a handler. Mirrors the middleware exactly,
+// is_super_admin bypass included — same helper the invoice controllers use.
+function hasPerm(req, code) {
+  if (!req.user) return false;
+  if (req.user.is_super_admin) return true;
+  return !!req.user.permissions?.has(code);
+}
+
 const idParam = z.coerce.number().int().positive();
 
 function handle(req, res, next, fn) {
@@ -248,7 +257,13 @@ function getPurchaseInvoiceByToken(req, res, next) {
 
 function generatePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
-    const { estimate_id } = z.object({ estimate_id: z.coerce.number().int().positive() }).parse(req.body);
+    const { estimate_id, invoice_date } = z.object({
+      estimate_id: z.coerce.number().int().positive(),
+      // Optional, and absent by default. See the PI date block below for why
+      // this exists rather than a cleverer default.
+      invoice_date: z.string().trim()
+        .regex(/^\d{4}-\d{2}-\d{2}$/, 'invoice_date must be YYYY-MM-DD').optional(),
+    }).parse(req.body);
 
     // Validate estimate
     const estRow = await pool.query(
@@ -275,9 +290,25 @@ function generatePurchaseInvoice(req, res, next) {
     // dead end: the PI would happily take a date the CI's validator later
     // refuses, leaving a job with a purchase invoice that can never be turned
     // into a customer invoice, and no endpoint to correct the PI's date.
+    // An explicit date always wins. It exists because the inference below
+    // cannot tell two real situations apart, and guessing wrong on either is
+    // worse than asking:
+    //
+    //   (a) estimate written 1 Aug, work done 1 Aug, paperwork entered 3 Aug
+    //         → the hub's bill belongs on 1 Aug
+    //   (b) estimate written 1 Aug, car sat, work finished 3 Aug
+    //         → the hub's bill belongs on 3 Aug
+    //
+    // Both have an old estimate and neither was backdated, so the stored data
+    // is identical. The default stays (b) — TODAY — deliberately: getting (a)
+    // wrong leaves a PI dated late, which is visible and can be pulled back by
+    // a customer-invoice date change, whereas getting (b) wrong silently
+    // backdates a hub's bill, possibly into a closed period, with nobody having
+    // asked for it. The recoverable error is the one to default to.
     const piToday = istToday();
     const piInherited = !!est.original_estimate_date && est.estimate_date !== piToday;
-    const piInvoiceDate = piInherited ? est.estimate_date : piToday;
+    const piChosen = !!invoice_date;
+    const piInvoiceDate = invoice_date || (piInherited ? est.estimate_date : piToday);
 
     if (piInvoiceDate !== piToday) {
       const settings = await loadDateSettings();
@@ -286,18 +317,26 @@ function generatePurchaseInvoice(req, res, next) {
         documentType: 'purchase_invoice',
         chainBefore: est.estimate_date,
         settings,
-        // Inherited, not chosen. Whoever backdated the ESTIMATE already held
-        // the permission and gave a reason; making the person who generates
+        // Inherited, not chosen: whoever backdated the ESTIMATE already held
+        // the permission and gave a reason, so making the person who generates
         // the PI hold it too would block the flow for a date they never set.
-        canBackdate: true,
-        canOverride: true,
+        // CHOSEN here is the opposite case — this caller is the one picking a
+        // past date, so this caller needs the permission.
+        canBackdate: piChosen ? hasPerm(req, 'BACKDATE_INVOICE') : true,
+        canOverride: piChosen ? false : true,
         today: piToday,
       });
       if (!check.ok) {
         return res.status(409).json({
           ...validationError(check),
-          error: `The estimate's date (${est.estimate_date}) cannot be used for this purchase invoice: ` +
-                 `${check.errors[0]?.message} Correct the estimate's date first.`,
+          // Point at the thing the caller can actually change. When the date was
+          // inherited that is the estimate; when they typed it, it is the date
+          // they typed, and telling them to go fix the estimate would send them
+          // to edit a document that is not wrong.
+          error: piChosen
+            ? `${piInvoiceDate} cannot be used for this purchase invoice: ${check.errors[0]?.message}`
+            : `The estimate's date (${est.estimate_date}) cannot be used for this purchase invoice: ` +
+              `${check.errors[0]?.message} Correct the estimate's date first.`,
         });
       }
     }

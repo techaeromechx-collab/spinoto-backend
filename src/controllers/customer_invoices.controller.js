@@ -610,6 +610,34 @@ async function loadDateContext(client, ciId) {
   return r.rows[0] || null;
 }
 
+// Can the linked purchase invoice legally be dragged along by a CI date change?
+// Only the money test lives here — whether the DATE it would land on is allowed
+// is a separate question, answered by validateInvoiceDate on the PI itself.
+function piCanFollow(ctx) {
+  return !!ctx.pi_id && Number(ctx.pi_amount_paid || 0) === 0;
+}
+
+/**
+ * What sits upstream of this customer invoice for the chain rule.
+ *
+ * Normally that is the purchase invoice: the customer's bill cannot predate the
+ * hub's bill for the same job. But when the PI is moving in the SAME request,
+ * its current date is about to stop being true — the PI is about to become
+ * whatever the CI becomes. Holding the CI to the PI's old date then makes the
+ * pair unable to travel backwards together, and since there is no endpoint that
+ * moves a purchase invoice on its own, the job has no way out at all.
+ *
+ * The real constraint in that case is the estimate, which validateInvoiceDate
+ * already applies as the fallback for a customer invoice. Returning null hands
+ * it that job — and keeps the error message pointing at the estimate, which is
+ * the document the user would actually have to fix.
+ *
+ * The chain still holds after the move: estimate <= PI(new) = CI(new) <= today.
+ */
+function chainFloorFor(ctx, piWillFollow) {
+  return piWillFollow ? null : ctx.pi_invoice_date;
+}
+
 // Runs the warranty preflight for a proposed date.
 async function computeWarrantyImpact(client, ciId, currentDate, newDate, today) {
   const items = await client.query(WARRANTY_ITEMS_SQL, [ciId]);
@@ -628,6 +656,12 @@ function invoiceDatePreflight(req, res, next) {
     const id = idParam.parse(req.params.id);
     const newDate = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'invoice_date must be YYYY-MM-DD')
       .parse(req.query.invoice_date);
+    // The dialog's "also move the purchase invoice" checkbox, echoed back here
+    // so the preview answers the question the user is actually asking. Without
+    // it the preflight would show a hard failure for a date the PATCH would
+    // accept, and the Save button would sit disabled over a legal change.
+    const wantMovePi = req.query.move_purchase_invoice === 'true' ||
+                       req.query.move_purchase_invoice === '1';
 
     const ctx = await loadDateContext(pool, id);
     if (!ctx) return res.status(404).json({ error: 'Customer invoice not found' });
@@ -635,6 +669,7 @@ function invoiceDatePreflight(req, res, next) {
     const today = istToday();
     const settings = await loadInvoiceDateSettings();
     const warranty = await computeWarrantyImpact(pool, id, ctx.invoice_date, newDate, today);
+    const piFollows = wantMovePi && piCanFollow(ctx);
 
     const check = validateInvoiceDate({
       invoiceDate: newDate,
@@ -642,8 +677,9 @@ function invoiceDatePreflight(req, res, next) {
       estimateDate: ctx.estimate_date || toIstDate(ctx.estimate_created_at),
       piDate: ctx.pi_invoice_date,
       // Hard chain rule, not just the soft PI_AFTER_CI warning: a customer
-      // invoice cannot predate the hub's bill for the same job.
-      chainBefore: ctx.pi_invoice_date,
+      // invoice cannot predate the hub's bill for the same job — unless that
+      // bill is moving with it. See chainFloorFor.
+      chainBefore: chainFloorFor(ctx, piFollows),
       earliestPayment: ctx.earliest_payment,
       maxExistingDate: ctx.max_existing_date,
       settings,
@@ -654,13 +690,43 @@ function invoiceDatePreflight(req, res, next) {
     });
 
     const hubPaid = Number(ctx.pi_amount_paid || 0) > 0;
+
+    // If the PI is coming along, its own move has to be legal too — and it is
+    // checked against ITS current date, so a rule the CI passes can still fail
+    // here. A PI on 31 March following a CI from 2 April to 1 April would cross
+    // a financial year even though the CI never left one. The PATCH refuses
+    // that outright, so the preflight has to show it rather than let the user
+    // click Save into a 409.
+    const piMoveCheck = piFollows
+      ? validateInvoiceDate({
+          invoiceDate: newDate,
+          currentDate: ctx.pi_invoice_date,
+          documentType: 'purchase_invoice',
+          chainBefore: ctx.estimate_date || toIstDate(ctx.estimate_created_at),
+          settings,
+          canBackdate: hasPerm(req, 'BACKDATE_INVOICE'),
+          canOverride: false,
+          today,
+        })
+      : null;
+
     res.json({
       current_date: ctx.invoice_date,
       proposed_date: newDate,
       today,
-      ok: check.ok,
+      ok: check.ok && (!piMoveCheck || piMoveCheck.ok),
       unchanged: !!check.unchanged,
-      errors: check.errors,
+      // The PI's failures are folded into the same list rather than a separate
+      // field, so the dialog renders them without knowing they exist — but
+      // re-worded, because "Purchase invoice date is before its estimate" makes
+      // no sense to someone who is looking at a customer invoice.
+      errors: [
+        ...check.errors,
+        ...(piMoveCheck?.errors || []).map(e => ({
+          ...e,
+          message: `Moving the purchase invoice with it is not allowed: ${e.message}`,
+        })),
+      ],
       warnings: check.warnings,
       requires_override: check.errors.some(e => e.overridable),
       requires_reason: newDate !== ctx.invoice_date,
@@ -674,6 +740,9 @@ function invoiceDatePreflight(req, res, next) {
         id: ctx.pi_id,
         invoice_date: ctx.pi_invoice_date,
         can_follow: !hubPaid,
+        // What it would become — so the checkbox can say so instead of leaving
+        // the user to infer that "also move it" means "to this same date".
+        would_become: piFollows ? newDate : null,
         blocked_reason: hubPaid
           ? 'The hub has already been paid for this job, so its purchase invoice date is frozen.'
           : null,
@@ -813,14 +882,21 @@ function updateInvoiceDate(req, res, next) {
       const settings = await loadInvoiceDateSettings();
       const warranty = await computeWarrantyImpact(client, id, ctx.invoice_date, body.invoice_date, today);
 
+      // Decided BEFORE validation, because it changes what the floor is. This
+      // is the whole fix: the cascade lives ~40 lines further down, so checking
+      // the CI against the PI's soon-to-be-stale date made the two unable to
+      // move back together.
+      const piFollows = body.move_purchase_invoice && piCanFollow(ctx);
+
       const check = validateInvoiceDate({
         invoiceDate: body.invoice_date,
         currentDate: ctx.invoice_date,
         estimateDate: ctx.estimate_date || toIstDate(ctx.estimate_created_at),
         piDate: ctx.pi_invoice_date,
         // Hard chain rule, not just the soft PI_AFTER_CI warning: a customer
-        // invoice cannot predate the hub's bill for the same job.
-        chainBefore: ctx.pi_invoice_date,
+        // invoice cannot predate the hub's bill for the same job — unless that
+        // bill is moving with it. See chainFloorFor.
+        chainBefore: chainFloorFor(ctx, piFollows),
         earliestPayment: ctx.earliest_payment,
         maxExistingDate: ctx.max_existing_date,
         settings,
@@ -852,11 +928,44 @@ function updateInvoiceDate(req, res, next) {
       // ── The purchase invoice, if asked ─────────────────────────────────
       let piResult = null;
       if (body.move_purchase_invoice && ctx.pi_id) {
-        if (Number(ctx.pi_amount_paid || 0) > 0) {
+        if (!piCanFollow(ctx)) {
           // Refusing only the PI half, not the whole request: the customer
-          // invoice date may still be perfectly correct to fix.
+          // invoice date may still be perfectly correct to fix. Note this
+          // branch cannot have relaxed the floor above — piCanFollow gates
+          // both — so the CI was still validated against the PI's real date.
           piResult = { moved: false, reason: 'Hub has already been paid; the purchase invoice date is frozen.' };
         } else {
+          // The PI's own move must be legal too, and it is judged against ITS
+          // current date — so a rule the CI passed can still fail here. A PI on
+          // 31 March following a CI from 2 April to 1 April crosses a financial
+          // year the CI never left.
+          //
+          // This one ROLLS BACK rather than skipping the PI like the frozen-hub
+          // branch above, and it has to: the CI's floor was relaxed on the
+          // promise that the PI would follow. Writing the CI anyway would leave
+          // the customer invoice dated before the hub's bill — the exact state
+          // the chain rule exists to prevent, and one no endpoint can repair.
+          const piCheck = validateInvoiceDate({
+            invoiceDate: body.invoice_date,
+            currentDate: ctx.pi_invoice_date,
+            documentType: 'purchase_invoice',
+            chainBefore: ctx.estimate_date || toIstDate(ctx.estimate_created_at),
+            settings,
+            canBackdate: hasPerm(req, 'BACKDATE_INVOICE'),
+            canOverride: body.override && hasPerm(req, 'OVERRIDE_INVOICE_DATE_LIMITS'),
+            today,
+          });
+          if (!piCheck.ok) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              ...validationError(piCheck),
+              error: `The purchase invoice cannot move to ${body.invoice_date}: ` +
+                     `${piCheck.errors[0]?.message} ` +
+                     'Untick "also move the purchase invoice" to leave it where it is — ' +
+                     'though the invoice date will then be limited by it.',
+            });
+          }
+
           await client.query(
             `UPDATE purchase_invoices
                 SET invoice_date          = $1::date,
