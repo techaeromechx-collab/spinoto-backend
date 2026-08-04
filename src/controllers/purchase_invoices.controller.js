@@ -1,4 +1,5 @@
 'use strict';
+const crypto   = require('crypto');
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
@@ -7,6 +8,26 @@ const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
 const { istToday, validateInvoiceDate, validationError } = require('../utils/invoiceDate');
+const { buildSearchSql } = require('../utils/listSearch');
+const { logActivity } = require('../services/activityLog.service');
+
+// What the purchase-invoice search box looks at.
+//
+// The columns are listed as separate OR branches rather than wrapped in
+// COALESCE(a.customer_name, est_ctx.customer_name). COALESCE hides the column
+// from the planner, so no index on either table could ever be used; two plain
+// branches let Postgres bitmap-OR the trigram indexes from migration 104.
+// The behaviour is also slightly better — a job whose appointment and estimate
+// carry different spellings of the name now matches either.
+const PI_SEARCH = {
+  textColumns: [
+    'a.customer_name', 'est_ctx.customer_name',
+    'a.mobile',        'est_ctx.mobile',
+    'a.vehicle_number','est_ctx.vehicle_number',
+  ],
+  idColumn: 'pi.id',
+  idPrefixes: ['pi', 'p'],
+};
 
 // Books lock + backdating window. Same one-row read as the other controllers.
 async function loadDateSettings() {
@@ -109,6 +130,7 @@ async function _getItems(purchaseInvoiceId) {
 async function _getHubPayments(purchaseInvoiceId) {
   const r = await pool.query(
     `SELECT hp.id, hp.amount, hp.method, hp.reference_no, hp.paid_at, hp.notes,
+            hp.payment_batch_id,
             u.name AS created_by_name
      FROM hub_payments hp
      LEFT JOIN users u ON u.id = hp.created_by
@@ -153,11 +175,8 @@ function listPurchaseInvoices(req, res, next) {
     const offset = (page - 1) * limit;
     const conditions = [], params = [];
 
-    if (req.query.search) {
-      params.push(`%${req.query.search}%`);
-      const n = params.length;
-      conditions.push(`(COALESCE(a.customer_name, est_ctx.customer_name) ILIKE $${n} OR COALESCE(a.mobile, est_ctx.mobile) ILIKE $${n} OR COALESCE(a.vehicle_number, est_ctx.vehicle_number) ILIKE $${n})`);
-    }
+    const searchSql = buildSearchSql({ search: req.query.search, params, ...PI_SEARCH });
+    if (searchSql) conditions.push(searchSql);
     if (req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
@@ -694,7 +713,12 @@ function addHubPayment(req, res, next) {
       amount:       z.coerce.number().positive(),
       method:       z.enum(['cash','upi','card','bank_transfer','other','app_payment']).default('bank_transfer'),
       reference_no: z.string().trim().max(100).optional().nullable(),
-      paid_at:      z.string().optional().nullable(),
+      // Was a bare z.string(): any text at all, so a hub payment could be
+      // dated 2019 or 2099 and nothing stopped it. The UI never sent the field,
+      // which is the only reason it never bit — but the edit endpoint below
+      // makes this reachable, and a strict edit beside a wide-open create is
+      // worse than neither. Same shape the customer-invoice side enforces.
+      paid_at:      z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'paid_at must be YYYY-MM-DD').optional().nullable(),
       notes:        z.string().trim().max(500).optional().nullable(),
     }).parse(req.body);
 
@@ -712,6 +736,14 @@ function addHubPayment(req, res, next) {
     const balance = parseFloat(pi.grand_total) - parseFloat(pi.amount_paid);
     if (data.amount > balance + 0.01) {
       return res.status(400).json({ error: `Payment ₹${data.amount} exceeds outstanding balance ₹${balance.toFixed(2)}` });
+    }
+
+    // Same rules the edit endpoint applies, so a date that cannot be set by
+    // editing cannot be smuggled in at creation either.
+    if (data.paid_at) {
+      const invRow = await pool.query(`SELECT invoice_date::text AS invoice_date FROM purchase_invoices WHERE id = $1`, [id]);
+      const bad = await checkHubPaymentDate(data.paid_at, { invoiceDate: invRow.rows[0]?.invoice_date });
+      if (bad) return res.status(409).json(bad);
     }
 
     const client = await pool.connect();
@@ -759,6 +791,22 @@ function addHubPayment(req, res, next) {
     full.rows[0].items        = await _getItems(id);
     full.rows[0].hub_payments = await _getHubPayments(id);
     full.rows[0].schedule     = await _getPaymentSchedule(id);
+
+    // The counterpart to the DELETE log — a trail that only records removals
+    // tells you a payment vanished but not that it ever arrived.
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'CREATE',
+      entity: 'hub_payment',
+      entityId: id,
+      description:
+        `Hub payment recorded on PI-${String(id).padStart(6, '0')}: ` +
+        `₹${Number(data.amount).toFixed(2)} via ${data.method}` +
+        (data.reference_no ? ` (ref ${data.reference_no})` : '') +
+        ` — invoice now ${full.rows[0].payment_status}`,
+    });
+
     res.status(201).json({ item: full.rows[0] });
   });
 }
@@ -859,14 +907,32 @@ function deleteHubPayment(req, res, next) {
   handle(req, res, next, async () => {
     const id    = idParam.parse(req.params.id);
     const payId = idParam.parse(req.params.payId);
-    const r = await pool.query(
-      `DELETE FROM hub_payments WHERE id=$1 AND purchase_invoice_id=$2`, [payId, id]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Payment not found' });
 
     const client = await pool.connect();
+    let deleted = null;
     try {
       await client.query('BEGIN');
+
+      // The DELETE is INSIDE the transaction. It used to run on the pool first,
+      // with the recalc in a separate transaction afterwards — so if the recalc
+      // threw, the payment row was already gone while purchase_invoices.
+      // amount_paid still counted it. The invoice would show money paid with no
+      // record of it, and nothing to reverse.
+      //
+      // RETURNING because the row is needed for the audit log below and this is
+      // the last moment it exists.
+      const r = await client.query(
+        `DELETE FROM hub_payments
+          WHERE id = $1 AND purchase_invoice_id = $2
+      RETURNING amount, method, reference_no, paid_at`,
+        [payId, id]
+      );
+      if (r.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Payment not found' });
+      }
+      deleted = r.rows[0];
+
       await _recalcHubPaymentStatus(client, id);
 
       // Recalculate split installment statuses after deletion
@@ -901,7 +967,306 @@ function deleteHubPayment(req, res, next) {
     full.rows[0].items        = await _getItems(id);
     full.rows[0].hub_payments = await _getHubPayments(id);
     full.rows[0].schedule     = await _getPaymentSchedule(id);
+
+    // Money leaving the record with nothing to show for it is exactly what an
+    // audit trail is for — and deleting a hub payout also unblocks deleting the
+    // customer payment behind it, so this is the first link in a chain that can
+    // erase a whole job's money. Logged AFTER commit: a failed log must not roll
+    // back a delete that already succeeded.
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'DELETE',
+      entity: 'hub_payment',
+      entityId: payId,
+      description:
+        `Hub payment deleted on PI-${String(id).padStart(6, '0')}: ` +
+        `₹${Number(deleted.amount).toFixed(2)} via ${deleted.method}` +
+        (deleted.reference_no ? ` (ref ${deleted.reference_no})` : '') +
+        ` — invoice now ${full.rows[0].payment_status}, ₹${Number(full.rows[0].amount_paid || 0).toFixed(2)} of ₹${Number(full.rows[0].grand_total).toFixed(2)} paid`,
+    });
+
     res.json({ item: full.rows[0] });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared date rules for a hub payment.
+//
+// The invoice-side framework (utils/invoiceDate.validateInvoiceDate) does not
+// apply here: it enforces a chain of DOCUMENT dates — estimate ≤ purchase
+// invoice ≤ customer invoice — and a payment is not a document in that chain.
+// What it shares is the two rules that exist to protect the books.
+//
+// Returns null when the date is fine, or an { error, code } to send back.
+// ─────────────────────────────────────────────────────────────────────────────
+const PAID_AT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+async function checkHubPaymentDate(paidAt, { invoiceDate }) {
+  if (!PAID_AT_RE.test(paidAt)) {
+    return { error: 'Payment date must be a calendar date in YYYY-MM-DD form.', code: 'INVALID_FORMAT' };
+  }
+  // Rejects 2026-02-31, which passes the regex but is not a real day.
+  const [y, m, d] = paidAt.split('-').map(Number);
+  const probe = new Date(Date.UTC(y, m - 1, d));
+  if (probe.getUTCMonth() + 1 !== m || probe.getUTCDate() !== d) {
+    return { error: `${paidAt} is not a real calendar date.`, code: 'INVALID_FORMAT' };
+  }
+
+  const today = istToday();
+  if (paidAt > today) {
+    return { error: `Payment date cannot be in the future (today is ${today} IST).`, code: 'FUTURE_DATE' };
+  }
+
+  // A payout cannot predate the bill it settles.
+  if (invoiceDate && paidAt < invoiceDate) {
+    return {
+      error: `Payment date ${paidAt} is before the purchase invoice date (${invoiceDate}).`,
+      code: 'BEFORE_INVOICE',
+    };
+  }
+
+  // The books lock. This is the rule the payment path never had — a hub payout
+  // could be dated into a period already filed with the tax authority.
+  const settings = await loadDateSettings();
+  const lockedThrough = settings.books_locked_through;
+  if (lockedThrough && paidAt <= lockedThrough) {
+    return {
+      error: `The books are closed through ${lockedThrough}. A payment cannot be dated inside a period that may already have been filed.`,
+      code: 'PERIOD_LOCKED',
+    };
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/purchase-invoices/:id/payments/:payId
+//   Correct the date on one hub payment. Amount, method and reference are not
+//   editable — those are what the payment WAS, and changing them silently would
+//   make the record disagree with the bank statement behind it. A wrong amount
+//   is a delete and a re-entry.
+//
+//   Nothing is recalculated: paid_at drives no total. amount_paid,
+//   payment_status and the split installments all derive from `amount`, and the
+//   payout due date is anchored to CUSTOMER invoice payments in a different
+//   table entirely (utils/payoutSchedule.syncPayoutDueDate).
+// ─────────────────────────────────────────────────────────────────────────────
+function updateHubPaymentDate(req, res, next) {
+  handle(req, res, next, async () => {
+    const id    = idParam.parse(req.params.id);
+    const payId = idParam.parse(req.params.payId);
+    const { paid_at } = z.object({ paid_at: z.string().trim() }).parse(req.body);
+
+    const row = await pool.query(
+      `SELECT hp.id, hp.paid_at::text AS paid_at, hp.amount, hp.payment_batch_id,
+              pi.invoice_date::text AS invoice_date
+         FROM hub_payments hp
+         JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
+        WHERE hp.id = $1 AND hp.purchase_invoice_id = $2`,
+      [payId, id]
+    );
+    if (!row.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+    const pay = row.rows[0];
+
+    // A row inside a batch must be moved with its batch, not on its own —
+    // otherwise one bank transfer ends up displaying two different dates and
+    // the grouped history header disagrees with its own children.
+    if (pay.payment_batch_id) {
+      return res.status(409).json({
+        error: 'This payment is part of a bulk payment. Change the date on the bulk payment so every invoice in it stays consistent.',
+        code: 'IN_BATCH',
+        batch_id: pay.payment_batch_id,
+      });
+    }
+
+    const bad = await checkHubPaymentDate(paid_at, { invoiceDate: pay.invoice_date });
+    if (bad) return res.status(409).json(bad);
+
+    const old = String(pay.paid_at).slice(0, 10);
+    if (old === paid_at) {
+      return res.status(400).json({ error: 'That is already the payment date.', code: 'UNCHANGED' });
+    }
+
+    // paid_at is timestamptz; ::date on a bare YYYY-MM-DD keeps it at IST
+    // midnight rather than inheriting the server's clock.
+    await pool.query(`UPDATE hub_payments SET paid_at = $1::date WHERE id = $2`, [paid_at, payId]);
+
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'UPDATE',
+      entity: 'hub_payment',
+      entityId: payId,
+      description:
+        `Hub payment date changed on PI-${String(id).padStart(6, '0')}: ` +
+        `${old} → ${paid_at} (₹${Number(pay.amount).toFixed(2)})`,
+    });
+
+    const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    full.rows[0].items        = await _getItems(id);
+    full.rows[0].hub_payments = await _getHubPayments(id);
+    full.rows[0].schedule     = await _getPaymentSchedule(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/purchase-invoices/payment-batch/:batchId
+//   Move a whole bulk payment to a different date — every invoice in it, in one
+//   statement, so the rows cannot diverge.
+//
+//   The date is checked against the LATEST invoice date in the batch: the
+//   payment has to be valid for every invoice it settles, and the latest one is
+//   the binding constraint.
+// ─────────────────────────────────────────────────────────────────────────────
+function updateHubPaymentBatchDate(req, res, next) {
+  handle(req, res, next, async () => {
+    const batchId = String(req.params.batchId || '').trim();
+    if (!batchId || batchId.length > 64 || !/^[A-Za-z0-9_-]+$/.test(batchId)) {
+      return res.status(400).json({ error: 'Invalid batch id' });
+    }
+    const { paid_at } = z.object({ paid_at: z.string().trim() }).parse(req.body);
+
+    const rows = await pool.query(
+      `SELECT hp.id, hp.amount, hp.purchase_invoice_id,
+              hp.paid_at::text AS paid_at,
+              pi.invoice_date::text AS invoice_date
+         FROM hub_payments hp
+         JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
+        WHERE hp.payment_batch_id = $1
+        ORDER BY hp.id`,
+      [batchId]
+    );
+    if (rows.rowCount === 0) return res.status(404).json({ error: 'Payment batch not found' });
+
+    // Latest invoice date wins — the payment must not predate ANY of the
+    // invoices it settles, so the newest is the one that binds.
+    const latestInvoiceDate = rows.rows
+      .map(r => r.invoice_date)
+      .filter(Boolean)
+      .sort()
+      .pop() || null;
+
+    const bad = await checkHubPaymentDate(paid_at, { invoiceDate: latestInvoiceDate });
+    if (bad) return res.status(409).json(bad);
+
+    const old = String(rows.rows[0].paid_at).slice(0, 10);
+    if (old === paid_at) {
+      return res.status(400).json({ error: 'That is already the payment date.', code: 'UNCHANGED' });
+    }
+
+    // One statement, so the rows in a batch can never end up with different
+    // dates. No transaction needed — a single UPDATE is already atomic.
+    const upd = await pool.query(
+      `UPDATE hub_payments SET paid_at = $1::date WHERE payment_batch_id = $2`,
+      [paid_at, batchId]
+    );
+
+    const total = rows.rows.reduce((s, r) => s + Number(r.amount), 0);
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'UPDATE',
+      entity: 'hub_payment',
+      entityId: null,
+      description:
+        `Bulk hub payment date changed: ${old} → ${paid_at} — ` +
+        `₹${total.toFixed(2)} across ${upd.rowCount} invoice(s): ` +
+        rows.rows.map(r => `PI-${String(r.purchase_invoice_id).padStart(6, '0')}`).join(', '),
+    });
+
+    res.json({ ok: true, updated: upd.rowCount, paid_at });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/purchase-invoices/payment-batch/:batchId
+//
+// Reverse a whole bulk payment — every row it created, across every invoice it
+// touched. The per-invoice delete above still exists and still works on a single
+// row inside a batch; this is for when the transfer itself was wrong rather than
+// one invoice's share of it.
+//
+// All of it in ONE transaction: a batch half-reversed is worse than either
+// state, because the remaining rows still look like a complete payment.
+// ─────────────────────────────────────────────────────────────────────────────
+function deleteHubPaymentBatch(req, res, next) {
+  handle(req, res, next, async () => {
+    const batchId = String(req.params.batchId || '').trim();
+    // Same shape base64url produces. Rejecting here means an attacker-shaped
+    // value never reaches a query.
+    if (!batchId || batchId.length > 64 || !/^[A-Za-z0-9_-]+$/.test(batchId)) {
+      return res.status(400).json({ error: 'Invalid batch id' });
+    }
+
+    const client = await pool.connect();
+    let rows = [];
+    try {
+      await client.query('BEGIN');
+
+      const r = await client.query(
+        `DELETE FROM hub_payments
+          WHERE payment_batch_id = $1
+      RETURNING purchase_invoice_id, amount, method, reference_no`,
+        [batchId]
+      );
+      if (r.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Payment batch not found' });
+      }
+      rows = r.rows;
+
+      // Every invoice the batch touched needs recalculating, not just one.
+      // Set, because a batch could in principle carry two rows for the same
+      // invoice and recalculating it twice would be wasted work.
+      const piIds = [...new Set(rows.map(x => x.purchase_invoice_id))];
+      for (const piId of piIds) {
+        await _recalcHubPaymentStatus(client, piId);
+
+        const pi = await client.query(
+          `SELECT amount_paid, payout_schedule FROM purchase_invoices WHERE id = $1`, [piId]
+        );
+        if (pi.rows[0]?.payout_schedule === 'split') {
+          const schedule = await client.query(
+            `SELECT id, amount_due FROM pi_payment_schedule WHERE purchase_invoice_id=$1 ORDER BY installment_no`,
+            [piId]
+          );
+          let remaining = parseFloat(pi.rows[0].amount_paid);
+          for (const inst of schedule.rows) {
+            const due     = parseFloat(inst.amount_due);
+            const paidAmt = Math.min(remaining, due);
+            const instStatus = paidAmt <= 0 ? 'pending' : paidAmt >= due ? 'paid' : 'partially_paid';
+            await client.query(
+              `UPDATE pi_payment_schedule SET paid_amount=$1, status=$2, updated_at=NOW() WHERE id=$3`,
+              [paidAmt.toFixed(2), instStatus, inst.id]
+            );
+            remaining = Math.max(0, remaining - paidAmt);
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally { client.release(); }
+
+    const total = rows.reduce((sum, x) => sum + Number(x.amount), 0);
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'DELETE',
+      entity: 'hub_payment',
+      entityId: null,
+      description:
+        `Bulk hub payment reversed via ${rows[0].method}` +
+        (rows[0].reference_no ? ` (ref ${rows[0].reference_no})` : '') +
+        `: ₹${total.toFixed(2)} across ${rows.length} invoice(s) — ` +
+        rows.map(x => `PI-${String(x.purchase_invoice_id).padStart(6, '0')} ₹${Number(x.amount).toFixed(2)}`).join(', '),
+    });
+
+    res.json({ ok: true, deleted: rows.length, total });
   });
 }
 
@@ -1233,7 +1598,7 @@ function listHubPayments(req, res, next) {
     const r = await pool.query(
       `SELECT
          hp.id, hp.amount, hp.method, hp.reference_no, hp.notes, hp.paid_at,
-         hp.purchase_invoice_id,
+         hp.purchase_invoice_id, hp.payment_batch_id,
          pi.public_token AS purchase_invoice_token,
          pi.grand_total AS pi_grand_total,
          pi.amount_paid AS pi_amount_paid,
@@ -1301,6 +1666,10 @@ function bulkPayment(req, res, next) {
     if (!method) return res.status(400).json({ error: 'Payment method is required.' });
 
     const client = await pool.connect();
+    // One id shared by every row this call creates. The rows stay per-invoice
+    // (migration 105 explains why they must), but the history groups on this and
+    // shows the single payment the user actually made.
+    const batchId = crypto.randomBytes(12).toString('base64url');
     try {
       await client.query('BEGIN');
 
@@ -1321,15 +1690,32 @@ function bulkPayment(req, res, next) {
         if (payAmt <= 0) continue;
 
         await client.query(
-          `INSERT INTO hub_payments (purchase_invoice_id, hub_id, amount, method, reference_no, paid_at, notes, created_by)
-           VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7)`,
-          [pi.id, pi.hub_id, payAmt.toFixed(2), method, reference_no||null, notes||null, req.user?.id||null]
+          `INSERT INTO hub_payments (purchase_invoice_id, hub_id, amount, method, reference_no, paid_at, notes, created_by, payment_batch_id)
+           VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7,$8)`,
+          [pi.id, pi.hub_id, payAmt.toFixed(2), method, reference_no||null, notes||null, req.user?.id||null, batchId]
         );
         await _recalcHubPaymentStatus(client, pi.id);
         results.push({ pi_id: pi.id, amount: payAmt });
       }
 
       await client.query('COMMIT');
+
+      // One line for the batch, not one per invoice: this was a single decision
+      // by the user and reads as one in the log. The per-PI split is in the
+      // description so a specific invoice is still findable.
+      logActivity({
+        userId: req.user?.id,
+        userName: req.user?.name,
+        action: 'CREATE',
+        entity: 'hub_payment',
+        entityId: null,
+        description:
+          `Bulk hub payment via ${method}` +
+          (reference_no ? ` (ref ${reference_no})` : '') +
+          `: ₹${results.reduce((s, r) => s + r.amount, 0).toFixed(2)} across ${results.length} invoice(s) — ` +
+          results.map(r => `PI-${String(r.pi_id).padStart(6, '0')} ₹${r.amount.toFixed(2)}`).join(', '),
+      });
+
       res.json({ success: true, processed: results.length, payments: results });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -1561,4 +1947,4 @@ async function rejectPurchaseInvoiceApproval(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };

@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
-const { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
+const { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
 const router = express.Router();
 
 const canView     = requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS', 'VIEW_INVOICE', 'VIEW_PURCHASE_INVOICE');   // hub users: VIEW_INVOICE (or no perms = open)
@@ -17,6 +17,11 @@ router.get('/hub-payments',      canView, listHubPayments);
 router.get('/tech-rate-summary', canView,    getTechRateSummary);
 router.get('/export-payouts',    canView,    exportPayouts);
 router.post('/bulk-payment',     canPayment, bulkPayment);
+// Reverse a whole bulk payment. A literal path segment, so it must sit ABOVE
+// the '/:id' routes below — otherwise 'payment-batch' is matched as an :id and
+// idParam.parse throws a 400 on a perfectly valid request.
+router.delete('/payment-batch/:batchId', canPayment, deleteHubPaymentBatch);
+router.patch('/payment-batch/:batchId',  canPayment, updateHubPaymentBatchDate);
 router.post('/generate',     canGenerate, generatePurchaseInvoice);
 // by-token — resolves a shareable-URL token; must be before /:id
 router.get('/by-token/:token', canView,   getPurchaseInvoiceByToken);
@@ -31,4 +36,5 @@ router.post('/:id/recalculate',        canRecalculatePI, recalculatePurchaseInvo
 router.post('/:id/sync-from-estimate', canGenerate,      syncPurchaseInvoiceFromEstimate);
 router.post('/:id/payments',           canPayment, addHubPayment);
 router.delete('/:id/payments/:payId',  canPayment, deleteHubPayment);
+router.patch('/:id/payments/:payId',   canPayment, updateHubPaymentDate);
 module.exports = router;

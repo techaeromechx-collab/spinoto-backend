@@ -10,6 +10,19 @@ const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument
 const { validateInvoiceDate, validationError, istToday, toIstDate } = require('../utils/invoiceDate');
 const { warrantyImpact, WARRANTY_ITEMS_SQL } = require('../utils/warrantyPreflight');
 const { logActivity } = require('../services/activityLog.service');
+const { buildSearchSql } = require('../utils/listSearch');
+
+// What the customer-invoice search box looks at. Declared once so the list and
+// the CSV export cannot drift — they were already two copies of the same line,
+// and an export that disagrees with the list it was exported from is worse than
+// no export at all.
+//
+// 'ci' and 'inv' both accepted: the PDF says CI-000048, people say "invoice 48".
+const CI_SEARCH = {
+  textColumns: ['ci.customer_name', 'ci.mobile', 'ci.vehicle_number'],
+  idColumn: 'ci.id',
+  idPrefixes: ['ci', 'inv', 'invoice'],
+};
 
 const idParam = z.coerce.number().int().positive();
 
@@ -196,11 +209,8 @@ function listCustomerInvoices(req, res, next) {
       );
     }
 
-    if (req.query.search) {
-      params.push(`%${req.query.search}%`);
-      const n = params.length;
-      conditions.push(`(ci.customer_name ILIKE $${n} OR ci.mobile ILIKE $${n} OR ci.vehicle_number ILIKE $${n})`);
-    }
+    const searchSql = buildSearchSql({ search: req.query.search, params, ...CI_SEARCH });
+    if (searchSql) conditions.push(searchSql);
     if (req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
@@ -1545,11 +1555,8 @@ function exportCustomerInvoices(req, res, next) {
       );
     }
 
-    if (req.query.search) {
-      params.push(`%${req.query.search}%`);
-      const n = params.length;
-      conditions.push(`(ci.customer_name ILIKE $${n} OR ci.mobile ILIKE $${n} OR ci.vehicle_number ILIKE $${n})`);
-    }
+    const searchSql = buildSearchSql({ search: req.query.search, params, ...CI_SEARCH });
+    if (searchSql) conditions.push(searchSql);
     if (req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {

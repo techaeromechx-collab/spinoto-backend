@@ -27,6 +27,23 @@ const { getIO } = require('../socket');
 const idParam = z.coerce.number().int().positive();
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
 const { validateInvoiceDate, validationError, istToday, toIstDate } = require('../utils/invoiceDate');
+const { buildSearchSql } = require('../utils/listSearch');
+
+// What the estimate search box looks at. Split out of COALESCE for the same
+// planner reason as the purchase-invoice list — see PI_SEARCH.
+//
+// This page used to match the id with `CAST(e.id AS TEXT) ILIKE '%48%'`, which
+// also returned 148, 480 and 1148. Estimate numbers now go through the id
+// branch in buildSearchSql, so "EST-48" is an exact primary-key hit.
+const EST_SEARCH = {
+  textColumns: [
+    'a.customer_name',  'e.customer_name',
+    'a.vehicle_number', 'e.vehicle_number',
+    'a.mobile',         'e.mobile',
+  ],
+  idColumn: 'e.id',
+  idPrefixes: ['est', 'e', 'q'],
+};
 const { warrantyImpact, WARRANTY_ITEMS_SQL } = require('../utils/warrantyPreflight');
 
 const itemSchema = z.object({
@@ -815,16 +832,8 @@ function listEstimates(req, res, next) {
       }
     }
 
-    // Free-text search across customer name, vehicle number, mobile and
-    // estimate id (matches the search box placeholder on the Estimates page).
-    // Falls back to the estimate's own columns for standalone estimates.
-    if (req.query.search && req.query.search.trim()) {
-      params.push(`%${req.query.search.trim()}%`);
-      const n = params.length;
-      conditions.push(
-        `(COALESCE(a.customer_name, e.customer_name) ILIKE $${n} OR COALESCE(a.vehicle_number, e.vehicle_number) ILIKE $${n} OR COALESCE(a.mobile, e.mobile) ILIKE $${n} OR CAST(e.id AS TEXT) ILIKE $${n})`
-      );
-    }
+    const searchSql = buildSearchSql({ search: req.query.search, params, ...EST_SEARCH });
+    if (searchSql) conditions.push(searchSql);
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
