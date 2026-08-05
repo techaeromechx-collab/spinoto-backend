@@ -848,7 +848,8 @@ function listEstimates(req, res, next) {
       // Count needs the appointments join too — the search condition
       // references a.* columns.
       pool.query(
-        `SELECT COUNT(*)::int AS total
+        `SELECT COUNT(*)::int                      AS total,
+                COALESCE(SUM(e.grand_total), 0)    AS sum_total
          FROM estimates e
          LEFT JOIN appointments a ON a.id = e.appointment_id
          ${where}`,
@@ -859,6 +860,11 @@ function listEstimates(req, res, next) {
     return res.json({
       items: dataRes.rows,
       total: countRes.rows[0]?.total || 0,
+      // Only one figure here, deliberately. An estimate is a quote, not a
+      // receivable: the table has no amount_paid column, and money against the
+      // job is tracked on the customer invoice that follows it. A "received"
+      // number on this page would have to be invented.
+      totals: { amount: parseFloat(countRes.rows[0]?.sum_total || 0) },
       page,
       limit,
     });

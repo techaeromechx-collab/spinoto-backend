@@ -256,9 +256,40 @@ function listCustomerInvoices(req, res, next) {
       // The id tiebreaker matters: many invoices share a date, and without it
       // OFFSET pagination can repeat and skip rows between pages.
       pool.query(`${CI_SELECT} ${where} ORDER BY ci.invoice_date DESC, ci.id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
-      pool.query(`SELECT COUNT(*) FROM customer_invoices ci ${where}`, params),
+      // The sums ride along on the count query rather than running as a third
+      // statement: it already scans exactly the rows the filters select, so the
+      // totals cost nothing beyond three aggregates over a scan we were doing
+      // anyway. Crucially they are computed HERE and not from `items` — the
+      // page only holds `limit` rows, so summing client-side would report a
+      // different figure at 10/page than at 100/page.
+      pool.query(
+        `SELECT COUNT(*)                                AS count,
+                COALESCE(SUM(ci.grand_total), 0)        AS sum_total,
+                COALESCE(SUM(ci.amount_paid), 0)        AS sum_paid,
+                COALESCE(SUM(GREATEST(ci.grand_total - ci.amount_paid, 0)), 0) AS sum_due
+           FROM customer_invoices ci ${where}`,
+        params
+      ),
     ]);
-    res.json({ items: dataRes.rows, total: parseInt(countRes.rows[0].count, 10), page, limit });
+    const c = countRes.rows[0];
+    res.json({
+      items: dataRes.rows,
+      total: parseInt(c.count, 10),
+      // `due` is SUM(GREATEST(...)) in SQL — clamped PER INVOICE, then summed.
+      // Both the obvious alternatives are wrong:
+      //   SUM(grand_total - amount_paid)  — one customer's ₹200 overpayment
+      //     silently cancels ₹200 another customer still owes.
+      //   MAX(0, SUM(total) - SUM(paid))  — same netting, just hidden one level
+      //     up; it only shows as zero once the credits exceed the debts.
+      // Per-row clamping is the only version that answers "how much are we
+      // actually waiting on".
+      totals: {
+        amount: parseFloat(c.sum_total),
+        paid:   parseFloat(c.sum_paid),
+        due:    parseFloat(c.sum_due),
+      },
+      page, limit,
+    });
   });
 }
 

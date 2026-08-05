@@ -476,20 +476,55 @@ async function getDashboardStats(req, res, next) {
         isAll ? [] : [userIds]
       ),
 
-      // Hub performance — always system-wide (hub-level metric)
+      // ── Hub performance ──────────────────────────────────────────────────
+      // Customer invoices, not appointments: the card answers "which hub is
+      // bringing in the most business", and an appointment is only an
+      // intention until it is invoiced.
+      //
+      // Every status is aggregated in ONE pass with FILTER, rather than the
+      // frontend re-requesting per tab. Switching tabs then costs nothing —
+      // which matters because the only way to refetch this card is to refetch
+      // the entire dashboard payload (revenue, pipeline, follow-ups, the lot).
+      //
+      // Every hub comes back — the card scrolls rather than truncating, and
+      // the sort order depends on which tab is open (a hub ranked 9th by paid
+      // value can be 1st by approved value), so ordering here could not serve
+      // all four tabs anyway. The ORDER BY and LIMIT below are a safety cap
+      // only: if the hub table ever ran to thousands, this keeps the dashboard
+      // payload bounded and drops the least-earning rows first.
+      //
+      // Dates use invoice_date (not created_at) so a backdated invoice lands
+      // in the month the work belongs to — same basis as the CI list page.
       pool.query(
         `SELECT
+           h.id AS hub_id,
            h.hub_name,
-           COUNT(a.id)::int                AS appointment_count,
-           COALESCE(SUM(a.total_price), 0) AS total_value
+           -- The "All" tab: no FILTER, so it picks up every status the join
+           -- let through. Cancelled is excluded in the JOIN condition, which
+           -- is what keeps this equal to the sum of the four status tabs —
+           -- filtering it out here instead would make them disagree.
+           COUNT(ci.id)::int                                             AS all_count,
+           COALESCE(SUM(ci.grand_total), 0)                              AS all_value,
+           COUNT(ci.id) FILTER (WHERE ci.status = 'paid')::int           AS paid_count,
+           COALESCE(SUM(ci.grand_total) FILTER (WHERE ci.status = 'paid'), 0)
+                                                                         AS paid_value,
+           COUNT(ci.id) FILTER (WHERE ci.status = 'partially_paid')::int AS partially_paid_count,
+           COALESCE(SUM(ci.grand_total) FILTER (WHERE ci.status = 'partially_paid'), 0)
+                                                                         AS partially_paid_value,
+           COUNT(ci.id) FILTER (WHERE ci.status = 'approved')::int       AS approved_count,
+           COALESCE(SUM(ci.grand_total) FILTER (WHERE ci.status = 'approved'), 0)
+                                                                         AS approved_value,
+           COUNT(ci.id) FILTER (WHERE ci.status = 'generated')::int      AS generated_count,
+           COALESCE(SUM(ci.grand_total) FILTER (WHERE ci.status = 'generated'), 0)
+                                                                         AS generated_value
          FROM hubs h
-         LEFT JOIN appointments a ON a.hub_id = h.id
-           AND a.scheduled_date >= $1::date
-           AND a.status_id NOT IN (SELECT id FROM appointment_statuses WHERE slug IN ('no-show', 'cancelled'))
+         LEFT JOIN customer_invoices ci ON ci.hub_id = h.id
+           AND ci.invoice_date >= $1::date
+           AND ci.status <> 'cancelled'
          WHERE h.deleted_at IS NULL AND h.is_active = TRUE
          GROUP BY h.id, h.hub_name
-         ORDER BY appointment_count DESC
-         LIMIT 6`,
+         ORDER BY all_value DESC, h.id
+         LIMIT 50`,
         [hubStart]
       ),
 

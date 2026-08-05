@@ -208,9 +208,35 @@ function listPurchaseInvoices(req, res, next) {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const [dataRes, countRes] = await Promise.all([
       pool.query(`${PI_SELECT} ${where} ORDER BY pi.invoice_date DESC, pi.id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
-      pool.query(`SELECT COUNT(*) FROM purchase_invoices pi LEFT JOIN appointments a ON a.id = pi.appointment_id LEFT JOIN estimates est_ctx ON est_ctx.id = pi.estimate_id ${where}`, params),
+      // Sums ride along on the count query — same WHERE, same scan, no third
+      // statement. The joins stay because the search condition references
+      // a.* and est_ctx.* columns; they are LEFT joins on unique keys, so they
+      // cannot duplicate a pi row and inflate the totals.
+      pool.query(
+        `SELECT COUNT(*)                             AS count,
+                COALESCE(SUM(pi.grand_total), 0)     AS sum_total,
+                COALESCE(SUM(pi.amount_paid), 0)     AS sum_paid,
+                COALESCE(SUM(GREATEST(pi.grand_total - pi.amount_paid, 0)), 0) AS sum_due
+           FROM purchase_invoices pi
+           LEFT JOIN appointments a ON a.id = pi.appointment_id
+           LEFT JOIN estimates est_ctx ON est_ctx.id = pi.estimate_id ${where}`,
+        params
+      ),
     ]);
-    res.json({ items: dataRes.rows, total: parseInt(countRes.rows[0].count, 10), page, limit });
+    const c = countRes.rows[0];
+    res.json({
+      items: dataRes.rows,
+      total: parseInt(c.count, 10),
+      // Money owed TO the hubs, not to us. Clamped per invoice by the
+      // SUM(GREATEST(...)) above, for the same reason as on customer invoices:
+      // one over-paid hub must not mask what the others are still owed.
+      totals: {
+        amount: parseFloat(c.sum_total),
+        paid:   parseFloat(c.sum_paid),
+        due:    parseFloat(c.sum_due),
+      },
+      page, limit,
+    });
   });
 }
 
@@ -1524,12 +1550,12 @@ function listPayouts(req, res, next) {
          h.hub_name, h.payout_terms,
          COALESCE(a.customer_name, e.customer_name)   AS customer_name,
          COALESCE(a.vehicle_number, e.vehicle_number) AS vehicle_number,
-         (SELECT ci.id FROM customer_invoices ci
-          WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id
-          LIMIT 1) AS customer_invoice_id,
-         (SELECT ci.public_token FROM customer_invoices ci
-          WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id
-          LIMIT 1) AS customer_invoice_token,
+         ci.id            AS customer_invoice_id,
+         ci.public_token  AS customer_invoice_token,
+         ci.grand_total   AS ci_grand_total,
+         ci.amount_paid   AS ci_amount_paid,
+         ci.status        AS ci_status,
+         ci.ci_last_paid_at,
          CASE
            WHEN pi.payout_due_date IS NULL                                                         THEN 'awaiting_payment'
            WHEN pi.payout_due_date <  $1::date                                                     THEN 'overdue'
@@ -1542,6 +1568,29 @@ function listPayouts(req, res, next) {
        JOIN hubs h ON h.id = pi.hub_id
        LEFT JOIN appointments a ON a.id = pi.appointment_id
        LEFT JOIN estimates e ON e.id = pi.estimate_id
+       -- One LATERAL instead of the two correlated subqueries this used to run,
+       -- now that five CI columns are needed rather than two.
+       --
+       -- The ORDER BY is the point, not the performance. Those subqueries had a
+       -- bare LIMIT 1: when a legacy customer invoice's purchase_invoice_id
+       -- points at a DIFFERENT purchase invoice than its estimate's, the row
+       -- chosen was arbitrary — and each subquery could pick a different one, so
+       -- the id and the token could describe two different invoices. Preferring
+       -- the explicit link, then the lowest id, is the same fix
+       -- customer_invoices.controller.js already applies to the mirror-image
+       -- join (see its loadDateContext LATERAL).
+       LEFT JOIN LATERAL (
+         SELECT c.id, c.public_token, c.grand_total, c.amount_paid, c.status,
+                -- When the customer finished paying. This is the anchor
+                -- syncPayoutDueDate uses for the hub's due date, so the tooltip
+                -- explains the Due Date column beside it.
+                (SELECT MAX(p.paid_at) FROM customer_invoice_payments p
+                  WHERE p.customer_invoice_id = c.id) AS ci_last_paid_at
+           FROM customer_invoices c
+          WHERE c.purchase_invoice_id = pi.id OR c.estimate_id = pi.estimate_id
+          ORDER BY (c.purchase_invoice_id = pi.id) DESC, c.id
+          LIMIT 1
+       ) ci ON TRUE
        WHERE pi.status = 'approved' AND pi.payment_status != 'paid'
        ORDER BY pi.payout_due_date ASC NULLS LAST`,
       [today]
