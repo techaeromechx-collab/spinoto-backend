@@ -1,13 +1,20 @@
 const { Pool } = require('pg');
+const { pgSsl, describePgSsl } = require('./pgssl');
 
-const isProduction = process.env.NODE_ENV === 'production';
+// Whether to use TLS, and whether to verify the certificate, is decided in
+// config/pgssl.js — and db/migrate.js imports the SAME function.
+//
+// That sharing is the point. These two used to disagree: this file derived SSL
+// from NODE_ENV while the migrator hardcoded `rejectUnauthorized: false`. The
+// consequence is a deploy where `npm run db:migrate` reports success against a
+// database the server then cannot connect to.
+const sslConfig = pgSsl();
 
-// Verify the server certificate by default (Neon uses publicly-trusted CAs,
-// so this works out of the box). Set PGSSL_NO_VERIFY=true only for hosts
-// with self-signed certs — it disables MITM protection.
-const sslConfig = isProduction
-  ? { rejectUnauthorized: process.env.PGSSL_NO_VERIFY !== 'true' }
-  : false;
+// Said out loud once at boot. A TLS failure from node-postgres is famously
+// unhelpful ("the app will refuse to connect and you will not get a useful
+// error message", per this repo's own deploy runbook), so the one line that
+// makes it diagnosable is worth printing.
+console.log(`[pg] ssl: ${describePgSsl(sslConfig)}`);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

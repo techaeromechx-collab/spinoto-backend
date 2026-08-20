@@ -13,6 +13,8 @@ const { pool } = require('./config/db');
 const { ensureSeedPasswords } = require('./utils/seedPasswords');
 const { startScheduler } = require('./scheduler');
 const { startReminderPoller } = require('./services/appointmentReminders.service');
+const { startWhatsappOutbox } = require('./services/whatsappOutbox.service');
+const { startIntegrationSettings } = require('./services/integrationSettings.service');
 
 const authRoutes      = require('./routes/auth.routes');
 const meRoutes        = require('./routes/me.routes');
@@ -33,12 +35,15 @@ const leadNotesRoutes        = require('./routes/lead_notes.routes');
 const leadActivitiesRoutes   = require('./routes/lead_activities.routes');
 const departmentsRoutes          = require('./routes/departments.routes');
 const hubsRoutes                 = require('./routes/hubs.routes');
+const workshopsRoutes            = require('./routes/workshops.routes');
 const appointmentStatusesRoutes  = require('./routes/appointment_statuses.routes');
 const invoiceStatusesRoutes      = require('./routes/invoice_statuses.routes');
 const appointmentsRoutes         = require('./routes/appointments.routes');
 const customersRoutes            = require('./routes/customers.routes');
 const invoicesRoutes             = require('./routes/invoices.routes');
-const invoicePaymentsRoutes      = require('./routes/invoice_payments.routes');
+// invoice_payments.routes is deliberately not required — see the note at its
+// former mount below. Requiring it here would leave a router built and ready
+// for one line to re-enable by accident.
 const partsRoutes                = require('./routes/parts.routes');
 const estimatesRoutes            = require('./routes/estimates.routes');
 const settingsRoutes             = require('./routes/settings.routes');
@@ -49,6 +54,8 @@ const warrantyMasterRoutes       = require('./routes/warranty_master.routes');
 const warrantyClaimsRoutes       = require('./routes/warranty_claims.routes');
 const integrationsRoutes         = require('./routes/integrations.routes');
 const publicBookingRoutes        = require('./routes/public.booking.routes');
+const publicDocumentsRoutes      = require('./routes/public.documents.routes');
+const whatsappRoutes             = require('./routes/whatsapp.routes');
 // Read-only master data for outside systems. Key-authenticated, versioned
 // separately from the internal /api/* routes so its shape can stay stable
 // while those keep changing with the frontend.
@@ -59,6 +66,38 @@ const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
 const pushRoutes                 = require('./routes/push.routes');
 
 const app = express();
+
+// ── WHO THE CLIENT IS, FOR RATE LIMITING ─────────────────────────────────────
+//
+// Every rate limit in this application is keyed on req.ip, and req.ip is only
+// the real client when Express knows how many proxies sit in front of it.
+//
+// TRUST_PROXY is a HOP COUNT, not a boolean, and the number matters:
+//
+//   unset / 0  → no proxy. req.ip is the socket address and any
+//                X-Forwarded-For a caller sends is ignored. Correct for a
+//                directly-exposed server.
+//   1          → one trusted hop (Render, Railway, Fly, a single nginx).
+//   2          → e.g. Cloudflare in front of a platform proxy.
+//
+// Setting it too HIGH is the dangerous direction: Express then walks further
+// left into the forwarded chain than any trusted hop actually wrote, and reads
+// an address the caller supplied — which is what the limiter used to do
+// unconditionally, and which let one caller occupy an unlimited number of rate
+// buckets by sending a different value each request.
+//
+// Setting it too LOW is merely inconvenient: every request appears to come from
+// the proxy, so one bucket is shared by everybody. Safe, and loud.
+const TRUST_PROXY = Number(process.env.TRUST_PROXY || 0);
+if (TRUST_PROXY > 0) {
+  app.set('trust proxy', TRUST_PROXY);
+  console.log(`[http] trusting ${TRUST_PROXY} proxy hop(s) for client IP`);
+} else if (process.env.NODE_ENV === 'production') {
+  // Worth saying out loud: in production this almost always means the limits
+  // are counting the load balancer rather than the caller.
+  console.warn('[http] TRUST_PROXY is not set — rate limits will key on the '
+    + 'connecting address. If this server is behind a proxy, set TRUST_PROXY to the hop count.');
+}
 
 // ---- Middleware ----------------------------------------------------------
 // Response compression — negotiated via the client's Accept-Encoding header
@@ -111,7 +150,17 @@ app.use(cors({
   //     client has to read the name from this header and apply it itself.
   exposedHeaders: ['X-Page-Size', 'Content-Disposition'],
 }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({
+  limit: '2mb',
+  // Keep the raw bytes for signature verification.
+  //
+  // Interakt signs webhooks with HMAC-SHA256 over the EXACT body it sent.
+  // Re-serialising the parsed object would produce different bytes — key order,
+  // whitespace and number formatting all differ — and every signature check
+  // would fail. Only the WhatsApp webhook reads this; the cost elsewhere is one
+  // retained Buffer reference per request.
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // ---- Static: uploaded hub documents -------------------------------------
@@ -148,12 +197,36 @@ app.use('/api/lead-notes',       leadNotesRoutes);
 app.use('/api/lead-activities',  leadActivitiesRoutes);
 app.use('/api/departments',          departmentsRoutes);
 app.use('/api/hubs',                 hubsRoutes);
+app.use('/api/workshops',            workshopsRoutes);
 app.use('/api/appointment-statuses', appointmentStatusesRoutes);
 app.use('/api/invoice-statuses',     invoiceStatusesRoutes);
 app.use('/api/appointments',         appointmentsRoutes);
 app.use('/api/customers',            customersRoutes);
 app.use('/api/invoices',                    invoicesRoutes);
-app.use('/api/invoices/:id/payments',       invoicePaymentsRoutes);
+
+// NOT MOUNTED: /api/invoices/:id/payments (routes/invoice_payments.routes.js).
+//
+// It operated on `invoice_payments` (migration 023) — a table superseded by
+// customer_invoice_payments, which is the money ledger every other feature
+// reads. Nothing in the app reached these endpoints any more: InvoicesPage.jsx
+// is no longer imported by App.jsx and /invoices redirects to
+// /customer-invoices. But the routes stayed mounted, and they were materially
+// weaker than the ones that replaced them:
+//
+//   • EDIT_INVOICE alone authorised DELETING a payment, where the customer
+//     invoice equivalent requires its own DELETE_INVOICE_PAYMENT permission;
+//   • no hub scoping of any kind — no assertHubOwns, no hubScopeSql — so a hub
+//     login could read and delete payments belonging to any hub;
+//   • no status recalculation, so anything written here never reached an
+//     invoice's status, the hub payout schedule or a warranty claim;
+//   • no CHECK constraint on `method`, and no audit log;
+//   • a transaction leaked on the delete handler's 404 branch.
+//
+// Unreachable UI over a live, weakly-guarded door is the worst of both: nobody
+// exercises it, so nobody notices it. The router file and its controller are
+// left on disk — the table still holds historical rows, and deleting the code
+// that can read them is a separate decision from closing the door.
+// app.use('/api/invoices/:id/payments', require('./routes/invoice_payments.routes'));
 
 app.use('/api/parts',             partsRoutes);
 app.use('/api/estimates',         estimatesRoutes);
@@ -166,13 +239,51 @@ app.use('/api/api-keys',          apiKeysRoutes);
 // UNAUTHENTICATED — booking.spinoto.com. Rate-limited inside the router;
 // requires https://booking.spinoto.com in CORS_ORIGIN.
 app.use('/api/public/booking',    publicBookingRoutes);
+// UNAUTHENTICATED — customer invoice links (WhatsApp message + the QR already
+// printed on every invoice, which until now led to a login screen). Serves a
+// PDF built from a deliberately narrow SELECT; see the header of
+// public.documents.controller.js before touching it.
+app.use('/api/public/documents',  publicDocumentsRoutes);
 app.use('/api/call-outcomes',     callOutcomesRoutes);
+app.use('/api/whatsapp',          whatsappRoutes);
 app.use('/api/settings',   settingsRoutes);
 
 const purchaseInvoicesRouter = require('./routes/purchase_invoices.routes');
 const customerInvoicesRouter = require('./routes/customer_invoices.routes');
 app.use('/api/purchase-invoices', purchaseInvoicesRouter);
 app.use('/api/customer-invoices', customerInvoicesRouter);
+
+// Payments. The authenticated surface only — the public pay page and the
+// gateway webhook are mounted separately below, so nothing can be added to this
+// router and accidentally end up reachable without a session.
+const paymentsRouter = require('./routes/payments.routes');
+app.use('/api/payments', paymentsRouter);
+
+// Money OUT. Its own mount for the same reason it is its own router: sending
+// funds to a hub is gated on PAY_HUB_ONLINE, which nothing else in the system
+// grants. Authenticated — the RazorpayX webhook that reports the RESULT is
+// mounted with the other webhooks below.
+const hubPayoutsRouter = require('./routes/hub_payouts.routes');
+app.use('/api/hub-payouts', hubPayoutsRouter);
+
+// UNAUTHENTICATED — the payment gateway posts here. Its credential is the
+// HMAC-SHA256 signature over the request body, verified against
+// RAZORPAY_WEBHOOK_SECRET before anything else runs. The raw bytes it signs are
+// the ones express.json's verify hook parked on req.rawBody above; re-encoding
+// the parsed object would produce different bytes and fail every check.
+//
+// Without this endpoint, any customer whose browser closes before the checkout
+// callback fires has paid money we never record — which on a phone, mid
+// UPI app-switch, is a routine occurrence rather than an edge case.
+const paymentWebhookRoutes = require('./routes/webhooks.payments.routes');
+app.use('/api/webhooks', paymentWebhookRoutes);
+
+// UNAUTHENTICATED — the customer's pay-by-link page. Rate-limited inside the
+// router; returns a deliberately narrow projection of the invoice (number,
+// amount due, masked mobile) because a payment URL gets forwarded. See the
+// header of public.payments.controller.js.
+const publicPaymentsRoutes = require('./routes/public.payments.routes');
+app.use('/api/public/pay', publicPaymentsRoutes);
 
 app.use('/api/roles', rolesRoutes);
 app.use('/api/push',  pushRoutes);
@@ -228,5 +339,15 @@ const PORT = process.env.PORT || 4000;
     console.log(`Spinoto API listening on http://localhost:${PORT}`);
     startScheduler();
     startReminderPoller();
+    // Primes the DB-stored provider credentials (Interakt key, webhook
+    // secret, test number — migration 152) into the in-process cache and
+    // keeps them fresh. BEFORE the outbox starts, so its very first
+    // isConfigured() check can already see a database-stored key.
+    startIntegrationSettings(pool);
+    // Drains wa_messages. Safe to start unconditionally: with no API key it
+    // logs a warning and claims nothing, and with every template disabled it
+    // finds nothing to claim. Nothing reaches a customer until a template is
+    // explicitly enabled in Settings → WhatsApp.
+    startWhatsappOutbox();
   });
 })();

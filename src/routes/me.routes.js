@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const { z } = require('zod');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
+const { rateLimit } = require('../middleware/rateLimit.middleware');
 const { pool } = require('../config/db');
 
 // Values must be validated, not just key-whitelisted — otherwise empty names,
@@ -16,6 +17,16 @@ const profileSchema = z.object({
 });
 
 const router = express.Router();
+
+// The password change is a current_password ORACLE: it answers "is this the
+// right password?" one guess at a time, and it was previously unthrottled.
+// Keyed by user id rather than IP, so one person hammering it cannot lock a
+// colleague out from behind the same office NAT.
+const passwordLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyBy: req => String(req.user?.id || 'anon'),
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EXISTING — GET /api/me  (unchanged — no breaking change)
@@ -49,7 +60,7 @@ router.get('/', requireAuth, async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // EXISTING — PATCH /api/me/password  (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
-router.patch('/password', requireAuth, async (req, res, next) => {
+router.patch('/password', requireAuth, passwordLimit, async (req, res, next) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) {

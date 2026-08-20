@@ -25,3 +25,6 @@ node_modules/
 # Database / backups
 *.db
 *.sqlite
+
+# Scratch files staged for manual deletion (device_bash cannot rm)
+_to_delete/

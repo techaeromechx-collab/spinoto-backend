@@ -2,14 +2,24 @@ const fs   = require('fs');
 const path = require('path');
 const { Client } = require('pg');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
+const { pgSsl, describePgSsl } = require('../src/config/pgssl');
 
 const migrationsDir = path.join(__dirname, 'migrations');
 
 async function migrate() {
-  const isProduction = process.env.NODE_ENV === 'production';
+  // The SAME ssl decision the app makes — see src/config/pgssl.js.
+  //
+  // This used to be `isProduction ? { rejectUnauthorized: false } : false`,
+  // which is not what src/config/db.js did. Migrations would apply happily
+  // over an unverified connection and then the server would refuse to start
+  // against the very database that had just been migrated. One function now,
+  // imported by both, so they cannot drift apart again.
+  const ssl = pgSsl();
+  console.log(`[migrate] ssl: ${describePgSsl(ssl)}`);
+
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
-    ssl: isProduction ? { rejectUnauthorized: false } : false,
+    ssl,
   });
   await client.connect();
 

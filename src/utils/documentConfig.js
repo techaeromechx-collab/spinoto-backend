@@ -24,7 +24,19 @@
 
 const { z } = require('zod');
 
-const DOC_TYPES = ['estimate', 'customer_invoice', 'purchase_invoice'];
+// advance_receipt is the fourth, and it is not like the other three.
+//
+// It has no item table, no HSN summary and no per-line tax — it is one party,
+// one amount and the tax inside that amount. So it has ONE renderer rather than
+// eight themes (see templates/invoiceThemes/advanceReceipt.js), and the theme
+// setting is ignored for it. It still appears here because everything else the
+// config decides — title, terms, bank block, signature, footer, QR — applies to
+// it exactly as it does to a tax invoice.
+//
+// The refund voucher is the SAME document type with a different title and the
+// money going the other way. A separate type would duplicate every setting for
+// a document that differs by one word and a sign.
+const DOC_TYPES = ['estimate', 'customer_invoice', 'purchase_invoice', 'advance_receipt'];
 
 const VALID_THEMES = [
   'spinoto', 'simple', 'modern', 'luxury', 'stylish',
@@ -48,14 +60,39 @@ const DEFAULT_TITLES = {
   estimate:         'ESTIMATE',
   customer_invoice: 'TAX INVOICE',
   purchase_invoice: 'PURCHASE INVOICE',
+  // "RECEIPT VOUCHER" is the term the GST rules use for money taken before the
+  // supply. Not "ADVANCE RECEIPT", which reads as a receipt that arrived early.
+  advance_receipt:  'RECEIPT VOUCHER',
 };
+
+// The refund voucher shares advance_receipt's config and differs in what it is
+// called and what its footer can truthfully say. Kept beside the titles they
+// belong with rather than inside the adapter, so a company renaming its
+// documents finds them in one place.
+const ADVANCE_REFUND_TITLE = 'REFUND VOUCHER';
+
+// FIXED, not configurable, and it overrides the receipt's footer note even when
+// a company has customised that one.
+//
+// The receipt says the money will be adjusted against the final invoice. On a
+// refund that sentence is simply false — the money has gone back — and there is
+// no separate footer setting for the refund to inherit a correct one from. A
+// fixed true sentence beats an inherited wrong one. Give the refund its own
+// config block if this ever needs to be editable.
+const ADVANCE_REFUND_FOOTER = 'This amount has been refunded and will not appear on your invoice.';
 
 // Shown to a hub user viewing their own copy of a purchase invoice — the
 // document is a sale from their side. Mirrors the existing isHubUser swap.
-const HUB_VIEW_TITLES = { purchase_invoice: 'SELL INVOICE' };
+const HUB_VIEW_TITLES = { purchase_invoice: 'SALES INVOICE' };
 
+// advance_receipt's number is NOT built from these — it is the voucher_no
+// already issued and stored on the payment row, because a tax series has to be
+// consecutive and that can only be decided when the money is captured, not when
+// the document is printed. The entry exists so the settings screen shows the
+// series the numbers actually use.
 const DEFAULT_PREFIXES = {
   estimate: 'EST-', customer_invoice: 'CI-', purchase_invoice: 'PI-',
+  advance_receipt: 'ADV-',
 };
 const HUB_VIEW_PREFIXES = { purchase_invoice: 'SI-' };
 
@@ -102,8 +139,21 @@ const DEFAULT_DOC_BASE = {
   show_signature: false,
   signature_label: 'Authorised Signatory',
 
+  // Footer wording, per document type. null = inherit DEFAULT_GLOBAL.
+  // Deliberately NOT '' — an empty string is a real value, meaning "print no
+  // footer note on this document", and must survive rather than silently fall
+  // back to the global text.
+  footer_note: null,
+  footer_disclaimer: null,
+
   flags: {
     show_party_balance: false,
+    // The advance split on a customer invoice. ON by default, and safe to be:
+    // an invoice with no advance renders byte-identically either way, because
+    // the row only appears when there is one. Off, an invoice that consumed an
+    // advance says only "Paid", and the customer has no way to see that money
+    // they handed over weeks earlier is the reason the balance is what it is.
+    show_advance_line: true,
     free_item_qty: false,
     show_item_description: false,
     show_phone: true,
@@ -153,6 +203,12 @@ const DEFAULT_DOCUMENTS = {
     // An estimate is not a tax document and has no HSN column today.
     item_columns: { ...DEFAULT_DOC_BASE.item_columns, hsn: true },
     flags: { ...DEFAULT_DOC_BASE.flags },
+    // An estimate is a quote, not a bill: it thanks the customer for choosing
+    // us rather than for their business, and it must say the price can still
+    // move. The global wording ("does not require a physical signature") is an
+    // invoice statement and says nothing about the figure being provisional.
+    footer_note: 'Thank you for choosing us.',
+    footer_disclaimer: 'This is a computer generated estimate and is subject to change upon final inspection.',
   },
   customer_invoice: {
     header_fields: { ...DEFAULT_DOC_BASE.header_fields },
@@ -167,6 +223,26 @@ const DEFAULT_DOCUMENTS = {
     item_columns: { ...DEFAULT_DOC_BASE.item_columns, hsn: false },
     margin_columns: true,
     flags: { ...DEFAULT_DOC_BASE.flags, show_warranty: false },
+  },
+  advance_receipt: {
+    // No item table, so every item_column is inert here. Left at the base
+    // rather than zeroed, because a value nothing reads is not a setting — and
+    // blanking them would imply the renderer consults them.
+    flags: {
+      ...DEFAULT_DOC_BASE.flags,
+      // There is no job status to print: the money arrived before the work.
+      show_status: false,
+      // Warranty is promised by the invoice, not by a receipt for money taken
+      // in advance of it.
+      show_warranty: false,
+    },
+    // A receipt voucher confirms money received against a job still to be
+    // invoiced. Saying so on the document itself is what stops it being filed
+    // as the bill.
+    footer_note: 'Thank you — this amount will be adjusted against your final invoice.',
+    // "voucher", not "receipt voucher": the refund voucher shares this
+    // document type and this line, and it is not a receipt.
+    footer_disclaimer: 'This is a computer generated voucher and does not require a physical signature.',
   },
 };
 
@@ -197,9 +273,15 @@ const docSchema = z.object({
   }).partial(),
   show_signature: z.boolean(),
   signature_label: z.string().trim().max(60),
+  // nullable: null inherits the global wording, '' prints nothing.
+  footer_note:       z.string().trim().max(300).nullable(),
+  footer_disclaimer: z.string().trim().max(300).nullable(),
   margin_columns: z.boolean(),
   flags: z.object({
     show_party_balance:    z.boolean(),
+    // In the schema as well as the defaults. Omit it here and the toggle looks
+    // like it works and never saves — .partial() drops unknown keys silently.
+    show_advance_line:     z.boolean(),
     free_item_qty:         z.boolean(),
     show_item_description: z.boolean(),
     show_phone:            z.boolean(),
@@ -243,6 +325,7 @@ const documentConfigSchema = z.object({
     estimate:         docSchema,
     customer_invoice: docSchema,
     purchase_invoice: docSchema,
+    advance_receipt:  docSchema,
   }).partial(),
 }).partial().optional();
 
@@ -308,6 +391,13 @@ function resolveDocumentConfig(raw, docType = 'customer_invoice', viewerRole = '
     show_signature: typeof docSrc.show_signature === 'boolean' ? docSrc.show_signature : docDefaults.show_signature,
     signature_label: docSrc.signature_label || docDefaults.signature_label,
 
+    // typeof, not `||`: an operator who clears the footer for one document
+    // type means it, and `||` would hand them the global text straight back.
+    footer_note: typeof docSrc.footer_note === 'string'
+      ? docSrc.footer_note : (docDefaults.footer_note ?? null),
+    footer_disclaimer: typeof docSrc.footer_disclaimer === 'string'
+      ? docSrc.footer_disclaimer : (docDefaults.footer_disclaimer ?? null),
+
     // Only meaningful on a purchase invoice; harmless elsewhere.
     margin_columns: typeof docSrc.margin_columns === 'boolean'
       ? docSrc.margin_columns
@@ -370,6 +460,7 @@ module.exports = {
   DOC_TYPES, VALID_THEMES, INDUSTRY_TYPES,
   HUB_NAME_MODES, LOGO_SOURCES, PAGE_SIZES,
   DEFAULT_TITLES, DEFAULT_PREFIXES, DEFAULT_GLOBAL,
+  ADVANCE_REFUND_TITLE, ADVANCE_REFUND_FOOTER,
   documentConfigSchema, resolveDocumentConfig, resolveFullConfig, qrEnabled,
   MAX_CUSTOM,
 };

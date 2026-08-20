@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const { maskCustomerContact } = require('../middleware/maskMobile.middleware');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const {
   listEstimates,
@@ -30,6 +31,11 @@ const canRevise          = requirePermissionOrHub('REVISE_ESTIMATE',  'EDIT_ESTI
 const canExecute         = requirePermissionOrHub('EXECUTE_ESTIMATE', 'EDIT_ESTIMATE');
 
 router.use(requireAuth);
+// Customer mobile numbers are masked to 98382xxxxx for hub logins — see
+// middleware/maskMobile.middleware.js. Mounted at the router so every response
+// below is covered by default, including handlers added later.
+router.use(maskCustomerContact);
+
 
 router.get('/',                                    canView,    listEstimates);
 router.post('/',                                   canCreate,  createEstimate);

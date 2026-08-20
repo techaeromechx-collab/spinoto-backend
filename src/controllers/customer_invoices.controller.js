@@ -2,8 +2,17 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const { getRoundingFunction } = require('../utils/math');
-const { syncPayoutDueDate } = require('../utils/payoutSchedule');
+// syncPayoutDueDate is no longer required here: it moved inside
+// recalcInvoiceState along with the status recalculation it belongs to, so
+// every path that changes what an invoice has been paid re-anchors the hub
+// payout automatically instead of each caller remembering to.
+// readInvoiceBalance comes along too: the manual payment path used to size a
+// payment against customer_invoices.amount_paid, which is a CACHE of the
+// ledger. The gateway path has always read the ledger itself. Now both do.
+const { recalcInvoiceState, readInvoiceBalance } = require('../services/invoiceBalance.service');
+const { autoApplyForInvoice } = require('../services/advances.service');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 const { resolveClaimForEstimate, unresolveClaimForEstimate } = require('./warranty_claims.controller');
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
@@ -11,6 +20,10 @@ const { validateInvoiceDate, validationError, istToday, toIstDate } = require('.
 const { warrantyImpact, WARRANTY_ITEMS_SQL } = require('../utils/warrantyPreflight');
 const { logActivity } = require('../services/activityLog.service');
 const { buildSearchSql } = require('../utils/listSearch');
+const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
+const { maskMobile } = require('../utils/maskMobile');
+const { isHubUser } = require('../utils/hubScope');
+const maskFor = (req, v) => (isHubUser(req) ? maskMobile(v) : (v || ''));
 
 // What the customer-invoice search box looks at. Declared once so the list and
 // the CSV export cannot drift — they were already two copies of the same line,
@@ -88,10 +101,42 @@ const CI_SELECT = `
     ci.is_b2b, ci.b2b_company_name, ci.b2b_gst_number, ci.b2b_address,
     ('Spinoto ' || ar.name) AS hub_name, h.hub_name AS hub_full_name, h.gst_number AS hub_gst,
     (ci.grand_total - ci.amount_paid) AS balance,
-    (SELECT COUNT(*)::int FROM customer_invoice_payments cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
+    (SELECT COUNT(*)::int FROM invoice_payment_lines cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
     (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_token,
-    (SELECT COALESCE(pi.amount_paid, 0) FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id ORDER BY pi.id DESC LIMIT 1) AS linked_pi_amount_paid,
+    -- Must ask the SAME question as _hubPaidFor(), which is what actually
+    -- refuses the delete. The UI reads this to decide whether to warn before
+    -- deleting a payment; when it matched on estimate_id alone and the guard
+    -- matched on both links, an invoice joined through purchase_invoice_id got
+    -- no warning and then a 409 it had given the user no reason to expect.
+    -- (linked_purchase_invoice_id/_token above stay estimate-scoped on purpose:
+    --  they answer "which PI document", not "has the hub been paid".)
+    (SELECT COALESCE(MAX(pi.amount_paid), 0) FROM purchase_invoices pi
+      WHERE pi.id = ci.purchase_invoice_id OR pi.estimate_id = ci.estimate_id) AS linked_pi_amount_paid,
+
+    -- How much of amount_paid arrived BEFORE this invoice existed.
+    --
+    -- Not an addition to what was paid — a slice of it. The printed invoice
+    -- splits its Paid row into this and the remainder; adding it on top would
+    -- count the same money twice. See documentAdapter.fromCustomerInvoice.
+    --
+    -- Read from the allocations, not from the payment's own amount: an advance
+    -- of ₹2,000 split ₹1,500 here and ₹500 elsewhere has contributed ₹1,500 to
+    -- THIS invoice, and that is the figure that belongs on it.
+    (SELECT COALESCE(SUM(a.amount), 0)
+       FROM payment_allocations a
+       JOIN customer_invoice_payments p ON p.id = a.ledger_payment_id
+      WHERE a.customer_invoice_id = ci.id
+        AND p.payment_type = 'advance') AS advance_applied,
+
+    -- The receipt voucher numbers behind that figure, so the invoice and the
+    -- vouchers can be matched to each other without a person doing it by hand.
+    (SELECT string_agg(DISTINCT p.voucher_no, ', ' ORDER BY p.voucher_no)
+       FROM payment_allocations a
+       JOIN customer_invoice_payments p ON p.id = a.ledger_payment_id
+      WHERE a.customer_invoice_id = ci.id
+        AND p.payment_type = 'advance'
+        AND p.voucher_no IS NOT NULL) AS advance_vouchers,
 
     -- Vehicle details — from the linked appointment when present, otherwise
     -- (standalone estimate, no appointment) from the linked estimate's own
@@ -145,51 +190,60 @@ async function _getItems(ciId) {
 
 async function _getPayments(ciId) {
   const r = await pool.query(
-    `SELECT cip.id, cip.amount, cip.method, cip.reference_no, cip.paid_at, cip.notes,
+    // `source` and `txn_ref` are returned so the invoice screen can tell the
+    // two kinds of payment apart. A gateway row cannot be edited or deleted
+    // from here (see the payment handlers below), and a delete button that
+    // only ever produces a 409 is worse than no button — the customer's money
+    // is not in doubt, so the UI should say "refund" rather than offer an
+    // action that will be refused.
+    //
+    // This view has no plain id column — it would be ambiguous between the
+    // allocation and the payment behind it, so migration 134 named the two
+    // apart. This asked for cip.id and failed at runtime with "column cip.id
+    // does not exist". It wants the LEDGER row's id, because that is what the
+    // edit and delete handlers below take.
+    //
+    // payment_type and voucher_no (migration 138) are returned so the screen can
+    // render an applied advance as what it is. An advance's customer_invoice_id
+    // is NULL — the money was taken against the estimate, before this invoice
+    // existed — so the edit and delete handlers will not find it, and a pencil
+    // that always 404s is worse than no pencil.
+    `SELECT cip.payment_id AS id, cip.amount, cip.method, cip.reference_no,
+            cip.paid_at, cip.notes, cip.source, cip.payment_type, cip.voucher_no,
+            cip.payment_amount, pt.txn_ref,
             u.name AS created_by_name
-     FROM customer_invoice_payments cip
+     FROM invoice_payment_lines cip
      LEFT JOIN users u ON u.id = cip.created_by
+     LEFT JOIN payment_transactions pt ON pt.id = cip.payment_transaction_id
      WHERE cip.customer_invoice_id = $1 ORDER BY cip.paid_at ASC`,
     [ciId]
   );
   return r.rows;
 }
 
-async function _recalcStatus(client, ciId) {
-  const r = await client.query(
-    `SELECT ci.grand_total, ci.status AS current_status, ci.appointment_id, ci.estimate_id,
-            COALESCE(SUM(p.amount),0) AS paid
-     FROM customer_invoices ci
-     LEFT JOIN customer_invoice_payments p ON p.customer_invoice_id = ci.id
-     WHERE ci.id = $1 GROUP BY ci.grand_total, ci.status, ci.appointment_id, ci.estimate_id`,
-    [ciId]
-  );
-  const { grand_total, current_status, appointment_id, estimate_id, paid } = r.rows[0];
-  const amtPaid = parseFloat(paid);
-  const total   = parseFloat(grand_total);
+// Moved to services/invoiceBalance.service.js when gateway payments were added.
+//
+// It is the single place that decides an invoice's amount_paid and status, and
+// it is now called from three directions — manual payments here, verified
+// gateway captures in payments.service.js, and refunds. A second copy of this
+// logic is how an invoice ends up PAID on one screen and PARTIALLY PAID on
+// another, so the function moved rather than being duplicated.
+//
+// Behaviour is unchanged for every existing caller: the only difference is that
+// processed refunds are now subtracted, and with no refunds in the system that
+// is the same arithmetic it always did. The alias keeps the ~6 call sites in
+// this file reading exactly as they did.
+const _recalcStatus = recalcInvoiceState;
 
-  let status;
-  if (amtPaid >= total - 0.011 && total > 0) {
-    status = 'paid';
-  } else if (amtPaid > 0) {
-    status = 'partially_paid';
-  } else {
-    // Preserve 'approved' if company already approved — don't revert to 'generated'
-    status = current_status === 'approved' ? 'approved' : 'generated';
-  }
-
-  await client.query(
-    `UPDATE customer_invoices SET amount_paid=$1, status=$2, updated_at=NOW() WHERE id=$3`,
-    [amtPaid.toFixed(2), status, ciId]
-  );
-
-  // Hub payout due date is anchored to this CI's payment, not PI approval —
-  // resync on every payment add/delete. Handles both directions: reaching
-  // 'paid' sets the due date (next Tuesday after last payment), dropping back
-  // below 'paid' clears it again. See utils/payoutSchedule.js.
-  await syncPayoutDueDate(client, { customerInvoiceId: ciId });
-
-  return { status, appointment_id, estimate_id };
+/**
+ * Hub tenancy guard for the customer-invoice handlers whose own SELECT does not
+ * already carry hub_id. One extra round trip, only on hub-portal requests.
+ * Throws 404 (not 403) so ids can't be enumerated by status code.
+ */
+async function _assertCiHub(req, id, db = pool) {
+  if (!req.user?.hub_id) return;
+  const r = await db.query(`SELECT hub_id FROM customer_invoices WHERE id = $1`, [id]);
+  assertHubOwns(req, r.rows[0], 'hub_id', 'Customer invoice');
 }
 
 function listCustomerInvoices(req, res, next) {
@@ -200,9 +254,16 @@ function listCustomerInvoices(req, res, next) {
     const conditions = [], params = [];
 
     // ── User scoping ──────────────────────────────────────────────────────────
-    // Super admins and VIEW_INVOICE users see all. Others see only their own.
+    // Hub-portal logins are pinned to their own hub, checked BEFORE the
+    // permission tiers so granting one VIEW_INVOICE widens them within their
+    // hub rather than across every hub.
+    // Then: super admins and VIEW_INVOICE users see all; everyone else sees
+    // only invoices raised from estimates they created.
+    const hubScope = hubScopeSql(req, params, 'ci.hub_id');
     const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_INVOICE');
-    if (!isAll) {
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (!isAll) {
       params.push(req.user.id);
       conditions.push(
         `EXISTS (SELECT 1 FROM estimates e WHERE e.id = ci.estimate_id AND e.created_by = $${params.length})`
@@ -211,13 +272,14 @@ function listCustomerInvoices(req, res, next) {
 
     const searchSql = buildSearchSql({ search: req.query.search, params, ...CI_SEARCH });
     if (searchSql) conditions.push(searchSql);
-    if (req.query.hub_ids) {
+    // Skipped for hub logins — hubScope already pinned the hub above.
+    if (!hubScope && req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
         params.push(ids);
         conditions.push(`ci.hub_id = ANY($${params.length}::int[])`);
       }
-    } else if (req.query.hub_id) {
+    } else if (!hubScope && req.query.hub_id) {
       params.push(Number(req.query.hub_id));
       conditions.push(`ci.hub_id = $${params.length}`);
     }
@@ -299,8 +361,15 @@ function getCustomerInvoice(req, res, next) {
     const r  = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
     const item = r.rows[0];
+    // Scoping the list is not enough — without this a hub login could read any
+    // invoice by walking ids, and CI_SELECT carries the linked purchase-invoice
+    // fields, i.e. another hub's payout and this job's margin. 404 rather than
+    // 403 so the status code isn't an existence oracle. Covers /by-token/:token,
+    // which resolves the token then delegates here.
+    assertHubOwns(req, item, 'hub_id', 'Customer invoice');
     item.items    = await _getItems(id);
     item.payments = await _getPayments(id);
+    await _attachCustomerCredit(item);
     res.json({ item });
   });
 }
@@ -355,6 +424,48 @@ async function _attachPriceHistory(invoice, limitPerItem = 2) {
   for (const it of invoice.items) it.price_history = byDesc.get(it.description) || [];
 }
 
+/**
+ * Money this customer has already paid that is sitting on no invoice.
+ *
+ * ── WHY THE INVOICE HAS TO ASK ──────────────────────────────────────────────
+ * An advance taken against an estimate applies ITSELF when the invoice is
+ * generated — one estimate has one possible invoice, so there is no decision to
+ * make. Money taken on account has no such destination, so it waits.
+ *
+ * Waiting is fine. Waiting UNSEEN is not: the customer paid, gets billed the
+ * full amount, and the money they handed over sits in a list nobody opened.
+ * That is precisely the failure this whole feature was built to prevent, and
+ * on-account credit would quietly reintroduce it.
+ *
+ * So the invoice asks on every read, and the screen offers to apply it.
+ *
+ * Skipped once the invoice is settled — credit is only interesting where there
+ * is a balance for it to meet — and never computed for a cancelled one.
+ */
+async function _attachCustomerCredit(invoice) {
+  invoice.customer_credit = 0;
+  if (!invoice.mobile || invoice.status === 'cancelled') return;
+  if (Number(invoice.balance) <= 0.01) return;
+
+  const r = await pool.query(
+    // Less what has been applied AND less what has been given back. A refunded
+    // balance is not credit, and offering it here would put money the customer
+    // already has back on the screen as spendable.
+    `SELECT COALESCE(SUM(
+              p.amount
+                - COALESCE((SELECT SUM(a.amount) FROM payment_allocations a
+                             WHERE a.ledger_payment_id = p.id), 0)
+                - COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                             WHERE rf.ledger_payment_id = p.id
+                               AND rf.status IN ('pending', 'processed')), 0)
+            ), 0) AS credit
+       FROM customer_invoice_payments p
+      WHERE p.mobile = $1`,
+    [invoice.mobile]
+  );
+  invoice.customer_credit = Number(r.rows[0]?.credit || 0);
+}
+
 // Total outstanding across ALL of this customer's invoices — deliberately
 // different from invoice.balance, which is this one invoice's own balance.
 async function _attachPartyBalance(invoice) {
@@ -389,6 +500,7 @@ function getCustomerInvoicePdf(req, res, next) {
     const r  = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
     const invoice = r.rows[0];
+    assertHubOwns(req, invoice, 'hub_id', 'Customer invoice');
     invoice.items    = await _getItems(id);
     invoice.payments = await _getPayments(id);
 
@@ -408,6 +520,81 @@ function getCustomerInvoicePdf(req, res, next) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Payments against a customer invoice.
+//
+// THIS IS THE MONEY LEDGER, AND IT IS SHARED
+// ──────────────────────────────────────────
+// customer_invoice_payments holds BOTH the manual payments recorded here and
+// the gateway payments captured in services/payments.service.js. Around a dozen
+// other features read it: hub payout scheduling, warranty preflight, the
+// payouts list, the public invoice PDF, the appointment and estimate deletion
+// guards, the invoice-backdating floor and the invoice list.
+//
+// Two rules follow, and neither was enforced before:
+//
+//   1. A GATEWAY ROW IS NOT EDITABLE OR DELETABLE FROM HERE. It is money a bank
+//      confirmed, with a payment_transactions row pointing at it. Deleting one
+//      left that transaction stranded at 'captured' with no ledger row behind
+//      it — the two-sources-of-truth state migration 122 exists to prevent —
+//      and contradicted migration 124, which states plainly that gateway money
+//      is append-only and reversed by refund.
+//
+//   2. EVERY MUTATION IS LOGGED. A payment is the thing in this system someone
+//      is most likely to be asked to account for later, and a DELETE destroys
+//      the only evidence it ever existed: created_by and created_at go with the
+//      row. The log entry carries the amount, method and reference so the
+//      question "who removed a ₹1,996 cash payment, and when" has an answer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 400/404/409 that handle() turns into a clean response instead of a 500. */
+function payErr(status, message, extra = {}) {
+  return Object.assign(new Error(message), { status, ...extra });
+}
+
+/**
+ * How much the hub has already been paid for the job behind this invoice.
+ *
+ * ONE query, used by both the edit guard and the delete guard. They had
+ * drifted: edit matched a purchase invoice on `ci.purchase_invoice_id` OR
+ * `ci.estimate_id`, delete on `estimate_id` alone. So an invoice linked only
+ * through purchase_invoice_id was frozen against having its payment date
+ * moved, and NOT frozen against having the payment deleted outright — the
+ * narrower guard sitting on the more destructive operation. The broader match
+ * is the correct one for both.
+ *
+ * NULL = NULL is not true in SQL, so an invoice with neither link matches
+ * nothing and returns 0, which is the right answer: no PI, no payout.
+ */
+async function _hubPaidFor(db, ciId) {
+  const r = await db.query(
+    `SELECT COALESCE(MAX(pi.amount_paid), 0) AS hub_paid
+       FROM purchase_invoices pi
+       JOIN customer_invoices ci ON ci.id = $1
+      WHERE pi.id = ci.purchase_invoice_id
+         OR pi.estimate_id = ci.estimate_id`,
+    [ciId]
+  );
+  return Number(r.rows[0]?.hub_paid || 0);
+}
+
+/**
+ * A payment date the database can actually store.
+ *
+ * This was a bare z.string() interpolated into a ::timestamptz cast, so
+ * "yesterday" reached Postgres and came back as a 22007 — surfacing as a 500
+ * that reads like a server fault rather than a typo in a form.
+ *
+ * A future date is refused rather than clamped. paid_at is the anchor for the
+ * hub payout schedule (utils/payoutSchedule.js reads MAX(paid_at)), so a year
+ * typed wrong pushes a real payout to a real hub out by that much, silently.
+ */
+const paidAtSchema = z.string().trim()
+  .regex(/^\d{4}-\d{2}-\d{2}([T ].*)?$/, 'paid_at must be a date (YYYY-MM-DD)')
+  .refine(v => !Number.isNaN(new Date(v).getTime()), 'paid_at is not a real date')
+  .refine(v => v.slice(0, 10) <= istToday(), 'paid_at cannot be in the future')
+  .optional().nullable();
+
 function addPayment(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
@@ -415,43 +602,142 @@ function addPayment(req, res, next) {
       amount:       z.coerce.number().positive(),
       method:       z.enum(['cash','upi','card','bank_transfer','other','app_payment']).default('cash'),
       reference_no: z.string().trim().max(100).optional().nullable(),
-      paid_at:      z.string().optional().nullable(),
+      paid_at:      paidAtSchema,
       notes:        z.string().trim().max(500).optional().nullable(),
     }).parse(req.body);
 
-    const ciRow = await pool.query(`SELECT status, grand_total, amount_paid FROM customer_invoices WHERE id = $1`, [id]);
-    if (!ciRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
-    const ci = ciRow.rows[0];
-    if (['paid','cancelled'].includes(ci.status)) return res.status(400).json({ error: `Cannot add payment to a ${ci.status} invoice` });
-
-    const balance = parseFloat(ci.grand_total) - parseFloat(ci.amount_paid);
-    if (data.amount > balance + 0.01) {
-      return res.status(400).json({ error: `Payment amount ₹${data.amount} exceeds outstanding balance ₹${balance.toFixed(2)}` });
-    }
+    await _assertCiHub(req, id);
 
     const client = await pool.connect();
-    let recalcResult;
+    let recalcResult, payId, balanceBefore;
     try {
       await client.query('BEGIN');
-      await client.query(
-        `INSERT INTO customer_invoice_payments (customer_invoice_id, amount, method, reference_no, paid_at, notes, created_by)
-         VALUES ($1,$2,$3,$4,COALESCE($5::timestamptz, NOW()),$6,$7)`,
-        [id, data.amount, data.method, data.reference_no||null, data.paid_at||null, data.notes||null, req.user?.id||null]
+
+      // The lock comes FIRST, and the balance is read from the LEDGER.
+      //
+      // Both halves matter, and neither was here before. Without the row lock,
+      // two tills recording against the same invoice at the same moment both
+      // read the same amount_paid, both decide there is room, and the invoice
+      // quietly ends up overpaid with no error raised anywhere. And
+      // customer_invoices.amount_paid is a CACHE of the ledger — the
+      // authoritative balance is SUM(payments) − SUM(processed refunds), which
+      // is exactly what the customer would be charged if they paid online in
+      // the same second. The gateway path has always worked this way; this is
+      // the manual path catching up.
+      const lock = await client.query(
+        `SELECT id FROM customer_invoices WHERE id = $1 FOR UPDATE`, [id]);
+      if (!lock.rows[0]) throw payErr(404, 'Customer invoice not found');
+
+      const inv = await readInvoiceBalance(client, id);
+      if (['paid', 'cancelled'].includes(inv.status)) {
+        throw payErr(400, `Cannot add payment to a ${inv.status} invoice`);
+      }
+
+      balanceBefore = inv.balance;
+      if (data.amount > inv.balance + 0.01) {
+        throw payErr(400,
+          `Payment amount ₹${data.amount} exceeds outstanding balance ₹${inv.balance.toFixed(2)}`);
+      }
+
+      // hub_id is copied from the invoice AT THE MOMENT OF PAYMENT, not joined
+      // at read time. Re-assigning an invoice to a different hub later must not
+      // move money already collected, or the payout scheduled from it — see the
+      // header of migration 131.
+      //
+      // ── mobile AND vehicle_number ARE NOT OPTIONAL ───────────────────────
+      // They were missing from this INSERT, and the effect was silent. The
+      // customer Payments tab finds money with `WHERE p.mobile = $1`
+      // (payments.controller.listForCustomer), and NULL matches no number — so
+      // every payment recorded here was invisible on the customer's own screen
+      // while being perfectly correct on the invoice.
+      //
+      // It looked half-working rather than broken, because migration 135
+      // backfilled these columns once from the invoice. Payments taken before
+      // that migration appeared; every one taken after it did not, and nothing
+      // anywhere reported a problem.
+      //
+      // Both values are already in hand: readInvoiceBalance COALESCEs the
+      // invoice's own copies with the appointment's, which is the same source
+      // migration 135's backfill used.
+      const ins = await client.query(
+        `INSERT INTO customer_invoice_payments (customer_invoice_id, amount, method, reference_no, paid_at, notes, created_by, hub_id, mobile, vehicle_number)
+         VALUES ($1,$2,$3,$4,COALESCE($5::timestamptz, NOW()),$6,$7,$8,$9,$10)
+         RETURNING id`,
+        [id, data.amount, data.method, data.reference_no||null, data.paid_at||null, data.notes||null, req.user?.id||null,
+         inv.hub_id || null, inv.mobile || null, inv.vehicle_number || null]
       );
+      payId = ins.rows[0].id;
+
+      // The allocation, in the SAME transaction as the payment.
+      //
+      // A payment recorded here is money handed over against a specific
+      // invoice, so it is fully applied to that invoice immediately — the two
+      // rows are one act and neither is meaningful alone. A payment with no
+      // allocation is credit (money we are holding), which is a real state
+      // from Phase 2 onward but is never what this handler produces.
+      //
+      // recalcInvoiceState reads allocations, so writing this after it would
+      // recalculate a balance that does not yet include the payment just made.
+      await client.query(
+        `INSERT INTO payment_allocations (ledger_payment_id, customer_invoice_id, amount, created_by)
+         VALUES ($1,$2,$3,$4)`,
+        [payId, id, data.amount, req.user?.id || null]
+      );
+
       recalcResult = await _recalcStatus(client, id);
+
+      // Queue the "payment received" WhatsApp message, on THIS transaction —
+      // the receipt and the money commit or roll back together. AFTER recalc,
+      // so the balance_due the message carries already includes this payment.
+      // The dispatcher takes its own SAVEPOINT and never throws, and it
+      // requires the template to be enabled + auto_send in Settings, so this
+      // is a no-op until somebody switches it on.
+      //
+      // Keyed on the LEDGER row: two part-payments are two receipts, and a
+      // retried request that reached here twice would still be one row and one
+      // message. (invoice_paid, if this payment settles the invoice, fires
+      // separately inside recalcInvoiceState — different template, different
+      // question.)
+      await fireWhatsAppEvent(client, {
+        event: 'payment.received',
+        entityId: payId,
+        dedupeKey: `received:${payId}`,
+      });
+
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
       client.release();
     }
 
-    // Auto-advance appointment → CLOSED when CI is fully paid
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'CREATE',
+      entity: 'customer_invoice_payment',
+      entityId: payId,
+      description: `Recorded ₹${Number(data.amount).toFixed(2)} by ${data.method}`
+        + (data.reference_no ? ` (ref ${data.reference_no})` : '')
+        + ` against invoice #${id}${data.paid_at ? `, dated ${String(data.paid_at).slice(0, 10)}` : ''}`
+        + ` — balance was ₹${balanceBefore.toFixed(2)}, invoice is now ${recalcResult?.status}`,
+    });
+
+    // Side effects AFTER the commit, and swallowed.
+    //
+    // The payment is committed and the money is real. A failure to close the
+    // appointment or resolve a warranty claim is a follow-up task, not a reason
+    // to hand back a 500 that reads as "the payment did not save" and have
+    // somebody record it a second time. payments.service.js has always wrapped
+    // the identical two calls; the manual path did not.
     if (recalcResult?.status === 'paid') {
-      await advanceAppointmentStatus(recalcResult.appointment_id, 'closed');
-      // If this CI belongs to a warranty-redo estimate, resolve the claim
-      await resolveClaimForEstimate(recalcResult.estimate_id);
+      try {
+        await advanceAppointmentStatus(recalcResult.appointment_id, 'closed');
+        await resolveClaimForEstimate(recalcResult.estimate_id);
+      } catch (err) {
+        console.error('[customer_invoices] post-payment side effect failed for invoice', id, err.message);
+      }
     }
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
@@ -476,27 +762,37 @@ function updatePayment(req, res, next) {
       paid_at: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}/, 'paid_at must be a date (YYYY-MM-DD)'),
     }).parse(req.body);
 
+    await _assertCiHub(req, id);
+
     const payRow = await pool.query(
-      `SELECT p.id, p.paid_at::text AS paid_at,
-              (SELECT COALESCE(MAX(pi.amount_paid), 0)
-                 FROM purchase_invoices pi
-                 JOIN customer_invoices ci2 ON ci2.id = $2
-                WHERE pi.id = ci2.purchase_invoice_id
-                   OR pi.estimate_id = ci2.estimate_id) AS hub_paid
+      `SELECT p.id, p.paid_at::text AS paid_at, p.amount, p.method, p.source
          FROM customer_invoice_payments p
         WHERE p.id = $1 AND p.customer_invoice_id = $2`,
       [payId, id]
     );
     if (!payRow.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+    const pay = payRow.rows[0];
+
+    // A gateway payment's date is the gateway's, not ours.
+    //
+    // paid_at on a captured row is when the bank took the money. Editing it
+    // here would make the ledger disagree with payment_transactions and with
+    // the settlement report, and it would move the hub payout anchor to a date
+    // no money actually arrived on.
+    if (pay.source === 'gateway') {
+      return res.status(409).json({
+        error: 'This payment was taken online, so its date is set by the payment gateway and cannot be edited here.',
+        code: 'GATEWAY_PAYMENT_IMMUTABLE',
+      });
+    }
 
     // Once the hub has actually been paid, this date is frozen.
     //
-    // Deleting a payment after a hub payout was already blocked
-    // (see deletePayment); MOVING one was not, and it is the more dangerous of
-    // the two now that payment dates can be backdated. The payment date is the
-    // anchor for the payout schedule, so shifting it after the money has gone
-    // out makes the schedule disagree with what was actually paid, and when.
-    const hubPaid = Number(payRow.rows[0].hub_paid || 0);
+    // The payment date is the anchor for the payout schedule, so shifting it
+    // after the money has gone out makes the schedule disagree with what was
+    // actually paid, and when. deletePayment applies the same guard through the
+    // same helper — they used to ask two different questions.
+    const hubPaid = await _hubPaidFor(pool, id);
     if (hubPaid > 0) {
       return res.status(409).json({
         error: `Hub payout of ₹${hubPaid.toFixed(2)} has already been made for this job, so the payment date can no longer be changed.`,
@@ -507,8 +803,11 @@ function updatePayment(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // AND source = 'manual' belt-and-braces against the check above: this
+      // statement is the one that touches money, so the rule is stated where it
+      // cannot be skipped by an early return being moved.
       await client.query(
-        `UPDATE customer_invoice_payments SET paid_at = $1 WHERE id = $2`,
+        `UPDATE customer_invoice_payments SET paid_at = $1 WHERE id = $2 AND source = 'manual'`,
         [data.paid_at, payId]
       );
       // Amounts unchanged, but the payout due date is anchored to the LATEST
@@ -516,9 +815,19 @@ function updatePayment(req, res, next) {
       await _recalcStatus(client, id);
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally { client.release(); }
+
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'UPDATE',
+      entity: 'customer_invoice_payment',
+      entityId: payId,
+      description: `Moved the date of a ₹${Number(pay.amount).toFixed(2)} ${pay.method} payment on invoice #${id}`
+        + ` from ${String(pay.paid_at).slice(0, 10)} to ${data.paid_at}`,
+    });
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     full.rows[0].items    = await _getItems(id);
@@ -534,50 +843,108 @@ function deletePayment(req, res, next) {
 
     // Capture the pre-delete status — deleting a payment off a PAID invoice
     // must also walk back the side effects that firing 'paid' caused.
-    const prevRow = await pool.query(`SELECT status FROM customer_invoices WHERE id = $1`, [id]);
-    if (!prevRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
-    const prevStatus = prevRow.rows[0].status;
+    await _assertCiHub(req, id);
 
-    // HARD BLOCK: once the hub has actually been paid for this job, the
-    // customer payment can no longer be deleted — deleting it wouldn't
-    // reverse money already sent to the hub, leaving the company out of
-    // pocket with no record of why. Reverse the hub payment first.
-    const piRow = await pool.query(
-      `SELECT COALESCE(pi.amount_paid, 0) AS amount_paid
-         FROM purchase_invoices pi
-        WHERE pi.estimate_id = (SELECT estimate_id FROM customer_invoices WHERE id = $1)
-        ORDER BY pi.id DESC LIMIT 1`,
-      [id]
-    );
-    const hubPaid = piRow.rows[0] ? parseFloat(piRow.rows[0].amount_paid) : 0;
-    if (hubPaid > 0) {
-      return res.status(409).json({
-        error: `Hub payout of ₹${hubPaid.toFixed(2)} has already been made for this job — this payment can no longer be deleted. Reverse the hub payment on the Purchase Invoice first.`,
-      });
-    }
-
-    const r = await pool.query(`DELETE FROM customer_invoice_payments WHERE id=$1 AND customer_invoice_id=$2`, [payId, id]);
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Payment not found' });
-
-    let recalcResult = null;
+    let recalcResult = null, prevStatus = null, removed = null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // The DELETE and the recalc are ONE transaction.
+      //
+      // They were two. The DELETE ran on the pool and the BEGIN opened after
+      // it, so a recalc that threw left the row gone and amount_paid, status
+      // and payout_due_date all still counting it — an invoice reading PAID
+      // with no payment behind it, and a ROLLBACK with nothing to roll back
+      // because the delete had already committed itself.
+      const prevRow = await client.query(
+        `SELECT status FROM customer_invoices WHERE id = $1 FOR UPDATE`, [id]);
+      if (!prevRow.rows[0]) throw payErr(404, 'Customer invoice not found');
+      prevStatus = prevRow.rows[0].status;
+
+      // Read the row BEFORE deleting it. This is the only moment its amount,
+      // method and reference still exist anywhere — the audit entry below is
+      // written from this, and after the COMMIT there is nothing left to read.
+      const payRow = await client.query(
+        `SELECT id, amount, method, reference_no, paid_at::text AS paid_at, source, created_by
+           FROM customer_invoice_payments
+          WHERE id = $1 AND customer_invoice_id = $2`,
+        [payId, id]
+      );
+      if (!payRow.rows[0]) throw payErr(404, 'Payment not found');
+      removed = payRow.rows[0];
+
+      // HARD BLOCK 1: gateway money is not deleted, it is refunded.
+      //
+      // Deleting a captured payment strands its payment_transactions row at
+      // 'captured' with no ledger row behind it, and destroys the link an
+      // accountant reconciles against the Razorpay settlement. Migration 124
+      // states the rule; nothing enforced it until now.
+      if (removed.source === 'gateway') {
+        throw payErr(409,
+          'This payment was taken online and cannot be deleted. Refund it from the Payments screen instead — '
+          + 'that returns the money to the customer and leaves the record intact.',
+          { code: 'GATEWAY_PAYMENT_IMMUTABLE' });
+      }
+
+      // HARD BLOCK 2: once the hub has actually been paid for this job, the
+      // customer payment can no longer be deleted — deleting it wouldn't
+      // reverse money already sent to the hub, leaving the company out of
+      // pocket with no record of why. Reverse the hub payment first.
+      //
+      // Same helper as updatePayment. This guard used to match a purchase
+      // invoice on estimate_id alone while the edit guard also matched
+      // purchase_invoice_id, so an invoice linked only that way was frozen
+      // against a date change and NOT against deletion.
+      const hubPaid = await _hubPaidFor(client, id);
+      if (hubPaid > 0) {
+        throw payErr(409,
+          `Hub payout of ₹${hubPaid.toFixed(2)} has already been made for this job — this payment can no longer be deleted. `
+          + 'Reverse the hub payment on the Purchase Invoice first.',
+          { code: 'HUB_ALREADY_PAID' });
+      }
+
+      await client.query(
+        `DELETE FROM customer_invoice_payments
+          WHERE id = $1 AND customer_invoice_id = $2 AND source = 'manual'`,
+        [payId, id]
+      );
+
       recalcResult = await _recalcStatus(client, id);
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally { client.release(); }
+
+    // The row is gone; this is now the only record that it existed.
+    logActivity({
+      userId: req.user?.id,
+      userName: req.user?.name,
+      action: 'DELETE',
+      entity: 'customer_invoice_payment',
+      entityId: payId,
+      description: `Deleted a ₹${Number(removed.amount).toFixed(2)} ${removed.method} payment`
+        + (removed.reference_no ? ` (ref ${removed.reference_no})` : '')
+        + ` dated ${String(removed.paid_at).slice(0, 10)} from invoice #${id}`
+        + ` — invoice was ${prevStatus}, now ${recalcResult?.status}`,
+    });
 
     // Invoice dropped BELOW paid → reverse the paid side effects:
     //  1. reopen the appointment (closed → invoice-approved)
     //  2. un-resolve a redo warranty claim, if this CI belongs to one
     // (payout due dates are already cleared inside _recalcStatus via
     //  syncPayoutDueDate — it always reflects the CI's current paid state)
+    //
+    // Swallowed, as on the add path: the deletion is committed either way, and
+    // a 500 here would invite someone to delete it again.
     if (prevStatus === 'paid' && recalcResult?.status !== 'paid') {
-      await advanceAppointmentStatus(recalcResult.appointment_id, 'invoice-approved');
-      await unresolveClaimForEstimate(recalcResult.estimate_id);
+      try {
+        await advanceAppointmentStatus(recalcResult.appointment_id, 'invoice-approved');
+        await unresolveClaimForEstimate(recalcResult.estimate_id);
+      } catch (err) {
+        console.error('[customer_invoices] post-delete side effect failed for invoice', id, err.message);
+      }
     }
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
@@ -624,9 +991,9 @@ async function loadDateContext(client, ciId) {
             e.estimate_date::text          AS estimate_date,
             e.original_estimate_date::text AS estimate_original_date,
             e.created_at                   AS estimate_created_at,
-            (SELECT MIN(p.paid_at)::text FROM customer_invoice_payments p
+            (SELECT MIN(p.paid_at)::text FROM invoice_payment_lines p
               WHERE p.customer_invoice_id = ci.id)             AS earliest_payment,
-            (SELECT COUNT(*)::int FROM customer_invoice_payments p
+            (SELECT COUNT(*)::int FROM invoice_payment_lines p
               WHERE p.customer_invoice_id = ci.id)             AS payment_count,
             (SELECT MAX(invoice_date)::text FROM customer_invoices)  AS max_existing_date,
             pi.id                          AS pi_id,
@@ -701,6 +1068,8 @@ function invoiceDatePreflight(req, res, next) {
     // so the preview answers the question the user is actually asking. Without
     // it the preflight would show a hard failure for a date the PATCH would
     // accept, and the Save button would sit disabled over a legal change.
+    await _assertCiHub(req, id);
+
     const wantMovePi = req.query.move_purchase_invoice === 'true' ||
                        req.query.move_purchase_invoice === '1';
 
@@ -879,6 +1248,8 @@ function updateInvoiceDate(req, res, next) {
       // Decision 5: the PI follows, but only when explicitly asked.
       move_purchase_invoice: z.coerce.boolean().optional().default(false),
     }).parse(req.body);
+
+    await _assertCiHub(req, id);
 
     const client = await pool.connect();
     try {
@@ -1096,6 +1467,9 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const est = estRow.rows[0];
+    // A hub login may only invoice its own hub's work. Guarded on the ESTIMATE's
+    // hub, since that is what the new invoice will inherit.
+    assertHubOwns(req, est, 'hub_id', 'Estimate');
     if (est.status !== 'work_completed') {
       return res.status(400).json({
         error: `Estimate must be work_completed to generate a customer invoice (current: ${est.status})`,
@@ -1258,6 +1632,11 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       grandTotal = roundFn(grandTotal - txDiscountAmount);
     }
 
+    // What the advance auto-apply put onto this invoice, so the response can
+    // tell the user their customer's ₹2,000 has already been accounted for
+    // rather than leaving them to notice it in the totals.
+    let appliedAdvances = [];
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -1352,6 +1731,22 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           `UPDATE customer_invoices SET status = 'paid', amount_paid = 0, updated_at = NOW() WHERE id = $1`,
           [ciId]
         );
+      } else {
+        // Any advance already received against this estimate lands on the
+        // invoice now, in the SAME transaction that created it.
+        //
+        // Inside the transaction on purpose. Outside it, a failure between the
+        // two would leave an invoice showing the full amount due while the
+        // customer's money sat as unapplied credit — and the customer is
+        // standing at the counter having already paid it.
+        //
+        // Unambiguous by construction: migration 075 enforces one customer
+        // invoice per estimate, so an advance recorded against this estimate
+        // has exactly one possible destination and it is this row. There is no
+        // "which invoice did they mean?" for this to get wrong.
+        appliedAdvances = await autoApplyForInvoice(client, {
+          estimateId: estimate_id, customerInvoiceId: ciId, userId: req.user?.id || null,
+        });
       }
 
       await client.query('COMMIT');
@@ -1365,9 +1760,16 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       }
 
       const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [ciId]);
-      full.rows[0].items    = await _getItems(ciId);
-      full.rows[0].payments = [];
-      res.status(201).json({ item: full.rows[0] });
+      full.rows[0].items = await _getItems(ciId);
+      // Not [] any more. An invoice generated from an estimate that already
+      // had an advance against it is born with a payment on it, and returning
+      // an empty list would show a full balance due for a moment before the
+      // screen refreshed.
+      full.rows[0].payments = await _getPayments(ciId);
+      res.status(201).json({
+        item: full.rows[0],
+        applied_advances: appliedAdvances,
+      });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -1384,9 +1786,10 @@ function approveCustomerInvoice(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
     const r  = await pool.query(
-      `SELECT status, appointment_id FROM customer_invoices WHERE id = $1`, [id]
+      `SELECT status, appointment_id, hub_id FROM customer_invoices WHERE id = $1`, [id]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    assertHubOwns(req, r.rows[0], 'hub_id', 'Customer invoice');
     if (r.rows[0].status !== 'generated') {
       return res.status(400).json({
         error: `Only 'generated' invoices can be approved. Current status: ${r.rows[0].status}`,
@@ -1399,6 +1802,24 @@ function approveCustomerInvoice(req, res, next) {
 
     // Auto-advance appointment status
     await advanceAppointmentStatus(r.rows[0].appointment_id, 'invoice-approved');
+
+    // Queue the "Invoice / Bill" WhatsApp message.
+    //
+    // On APPROVAL, not on generation. A generated invoice is still internal and
+    // can be corrected; approving it is the moment someone decides the customer
+    // should see it — and the message carries a link to that invoice, so
+    // sending it earlier would show the customer a document still being edited.
+    //
+    // Which template(s) fire is the 'invoice.approved' automation rows
+    // (Settings → WhatsApp → Automations, migration 151).
+    // fireWhatsAppEventDetached owns the connection, transaction and logging;
+    // failures are swallowed there — a messaging problem must not make an
+    // approved invoice look unapproved.
+    await fireWhatsAppEventDetached(pool, {
+      event: 'invoice.approved',
+      entityId: id,
+      dedupeKey: `approved:${id}`,
+    });
 
     const full = await pool.query(`${CI_SELECT} WHERE ci.id = $1`, [id]);
     full.rows[0].items    = await _getItems(id);
@@ -1422,8 +1843,9 @@ function updateCustomerInvoiceNotes(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = updateNotesSchema.parse(req.body);
 
-    const cur = await pool.query(`SELECT id FROM customer_invoices WHERE id = $1`, [id]);
+    const cur = await pool.query(`SELECT id, hub_id FROM customer_invoices WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    assertHubOwns(req, cur.rows[0], 'hub_id', 'Customer invoice');
 
     await pool.query(
       `UPDATE customer_invoices SET notes = $1, updated_at = NOW() WHERE id = $2`,
@@ -1486,8 +1908,9 @@ function updateCustomerInvoiceExtras(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = extrasSchema.parse(req.body);
 
-    const cur = await pool.query(`SELECT id FROM customer_invoices WHERE id = $1`, [id]);
+    const cur = await pool.query(`SELECT id, hub_id FROM customer_invoices WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    assertHubOwns(req, cur.rows[0], 'hub_id', 'Customer invoice');
 
     const client = await pool.connect();
     try {
@@ -1577,9 +2000,14 @@ function exportCustomerInvoices(req, res, next) {
   handle(req, res, next, async () => {
     const conditions = [], params = [];
 
-    // Same user-scoping rule as listCustomerInvoices
+    // Same user-scoping rule as listCustomerInvoices — including the hub pin.
+    // The CSV builds its own WHERE, so a scoping change made only in the list
+    // handler would leave this route as an open door.
+    const hubScope = hubScopeSql(req, params, 'ci.hub_id');
     const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_INVOICE');
-    if (!isAll) {
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (!isAll) {
       params.push(req.user.id);
       conditions.push(
         `EXISTS (SELECT 1 FROM estimates e WHERE e.id = ci.estimate_id AND e.created_by = $${params.length})`
@@ -1588,13 +2016,13 @@ function exportCustomerInvoices(req, res, next) {
 
     const searchSql = buildSearchSql({ search: req.query.search, params, ...CI_SEARCH });
     if (searchSql) conditions.push(searchSql);
-    if (req.query.hub_ids) {
+    if (!hubScope && req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
         params.push(ids);
         conditions.push(`ci.hub_id = ANY($${params.length}::int[])`);
       }
-    } else if (req.query.hub_id) {
+    } else if (!hubScope && req.query.hub_id) {
       params.push(Number(req.query.hub_id));
       conditions.push(`ci.hub_id = $${params.length}`);
     }
@@ -1637,7 +2065,7 @@ function exportCustomerInvoices(req, res, next) {
       const [payRes, discRes] = await Promise.all([
         pool.query(
           `SELECT customer_invoice_id, MAX(paid_at) AS last_payment_date
-           FROM customer_invoice_payments WHERE customer_invoice_id = ANY($1::int[])
+           FROM invoice_payment_lines WHERE customer_invoice_id = ANY($1::int[])
            GROUP BY customer_invoice_id`,
           [ids]
         ),
@@ -1666,10 +2094,25 @@ function exportCustomerInvoices(req, res, next) {
     };
 
     const headers = [
-      'Invoice #', 'Date', 'Customer Name', 'Mobile', 'Vehicle Number', 'Make/Model',
+      'Invoice #', 'Date', 'Customer Name', 'Mobile', 'Vehicle Number', 'Vehicle Type', 'Make/Model',
       'Hub', 'Subtotal (ex-GST)', 'Discount', 'GST', 'Grand Total', 'Paid',
       'Payment Date', 'Balance', 'Status', 'B2B Company / GST Number',
     ];
+
+    // The same 2W/4W shorthand the list badge shows, so a CSV filtered to 2W
+    // and the screen it came from say the same word.
+    //
+    // The badge on screen is a binary — anything not containing '2' renders as
+    // 4W. That is fine for a coloured chip and wrong for a column people will
+    // COUNTIF on: a "3 Wheeler" would be silently tallied as a car. So the
+    // fall-through here keeps the raw type name instead of guessing, and a
+    // vehicle with no type at all stays blank rather than becoming a 4W.
+    const shortVehicleType = (name) => {
+      if (!name) return '';
+      if (name.includes('2')) return '2W';
+      if (name.includes('4')) return '4W';
+      return name;
+    };
 
     const rows = r.rows.map(inv => {
       const grandTotal = parseFloat(inv.grand_total ?? 0);
@@ -1685,8 +2128,13 @@ function exportCustomerInvoices(req, res, next) {
         // trip, which is what used to shift this a day on an IST server.
         inv.invoice_date || '',
         inv.customer_name || '',
-        inv.mobile || '',
+        // Masked for a hub, exactly as it is on screen. A CSV is the one place
+        // a full contact list would actually be useful to walk away with, so
+        // leaving this unmasked would undo the whole exercise. res.json
+        // wrapping cannot reach here — this builds a string, not JSON.
+        maskFor(req, inv.mobile),
         inv.vehicle_number || '',
+        shortVehicleType(inv.vehicle_type_name),
         makeModel,
         inv.hub_full_name || inv.hub_name || '',
         parseFloat(inv.subtotal_ex_gst ?? 0).toFixed(2),
@@ -1719,6 +2167,12 @@ function getVehicleHistory(req, res, next) {
     const vnum = (req.params.vnum || '').trim().toUpperCase();
     if (!vnum) return res.json({ items: [], vehicle_number: vnum });
 
+    // A registration number is a trivially guessable key, and the unfiltered
+    // history spans every hub that has ever touched the vehicle. A hub sees
+    // only the visits it performed.
+    const params = [vnum];
+    const hubScope = hubScopeSql(req, params, 'ci.hub_id');
+
     const r = await pool.query(`
       SELECT
         ci.id,
@@ -1745,13 +2199,13 @@ function getVehicleHistory(req, res, next) {
       LEFT JOIN areas ar ON ar.id = h.area_id
       LEFT JOIN customer_invoice_items cii ON cii.customer_invoice_id = ci.id
       WHERE UPPER(REPLACE(COALESCE(ci.vehicle_number, a.vehicle_number, ''), ' ', ''))
-            = UPPER(REPLACE($1, ' ', ''))
+            = UPPER(REPLACE($1, ' ', ''))${hubScope ? ` AND ${hubScope}` : ''}
       GROUP BY ci.id, a.customer_name, a.mobile, a.vehicle_number, ar.name, h.hub_name
       -- Service history is a customer-facing chronology, so it follows the
       -- invoice date rather than when the row was keyed in.
       ORDER BY ci.invoice_date DESC, ci.id DESC
       LIMIT 50
-    `, [vnum]);
+    `, params);
 
     res.json({ items: r.rows, vehicle_number: vnum });
   });
@@ -1767,9 +2221,10 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
     const id = idParam.parse(req.params.id);
 
     const ciRow = await pool.query(
-      `SELECT id, estimate_id, status, created_at FROM customer_invoices WHERE id = $1`, [id]
+      `SELECT id, estimate_id, status, created_at, hub_id FROM customer_invoices WHERE id = $1`, [id]
     );
     if (!ciRow.rows[0]) return res.status(404).json({ error: 'Customer invoice not found' });
+    assertHubOwns(req, ciRow.rows[0], 'hub_id', 'Customer invoice');
     const ci = ciRow.rows[0];
 
     if (ci.status === 'paid') {

@@ -1,4 +1,5 @@
 const { z } = require('zod');
+const { fireWhatsAppEvent } = require('../services/whatsappAutomations.service');
 const { pool } = require('../config/db');
 const {
   fireHighPriorityAlert,
@@ -62,6 +63,83 @@ function handle(req, res, next, fn) {
 // =====================================================================
 
 // Full SELECT fragment reused by list + get
+/* ── The shared WhatsApp queue ────────────────────────────────────────────────
+   An auto-created WhatsApp lead has created_by NULL — no user made it — and,
+   until routing assigns it, assigned_to NULL too. Every scope filter below keys
+   off exactly those two columns, so without this the queue would be invisible
+   to everyone except full-access users: the leads the CRM works hardest to
+   capture would be the only ones an advisor cannot see.
+
+   Scoped as tightly as it can be — WhatsApp source, unassigned only. The moment
+   somebody owns it the lead leaves this clause and obeys the normal rules
+   again. No parameter, so it can be concatenated into any of the three filters
+   without disturbing their $n numbering. */
+const SHARED_SQL =
+  " OR (LOWER(TRIM(COALESCE(l.lead_source,''))) = 'whatsapp' AND l.assigned_to IS NULL)";
+
+/* ── The last thing that happened to this lead ────────────────────────────────
+   Two sources, because the timeline on the detail page has two: structured
+   events in lead_activities (status changed, reassigned, converted) and free
+   notes in lead_notes. Reading only the first would show "Status -> Junk" from
+   Tuesday on a lead somebody wrote a note on this morning, which is worse than
+   showing nothing - it looks current and is not.
+
+   LATERAL with LIMIT 1 on each side: both tables are indexed on
+   (lead_id, created_at) by migration 039, so this is two index seeks per row,
+   not a scan.
+
+   ── Why these are constants and not written out twice ───────────────────────
+
+   They used to be inline in LEAD_SELECT only, and the list view - which is the
+   ONLY place the Recent Activity column is rendered - had its own separate
+   SELECT that never got them. So the column was fed by nothing: it appeared for
+   a moment after a status change, because the PATCH response comes from
+   LEAD_SELECT and the row is merged into the table in the browser, and it went
+   blank again on the next refresh.
+
+   Two SELECTs over the same table drifting apart is the kind of thing that is
+   invisible in review and obvious to whoever uses the screen. One definition,
+   used by both. */
+const ACTIVITY_COLS = `
+    act.type       AS last_activity_type,
+    act.old_value  AS last_activity_old,
+    act.new_value  AS last_activity_new,
+    act.created_at AS last_activity_at,
+    actor.name     AS last_activity_by`;
+
+const ACTIVITY_JOIN = `
+  LEFT JOIN LATERAL (
+    SELECT * FROM (
+      (SELECT a2.type, a2.old_value, a2.new_value, a2.created_at, a2.created_by
+         FROM lead_activities a2
+        WHERE a2.lead_id = l.id
+        ORDER BY a2.created_at DESC
+        LIMIT 1)
+      UNION ALL
+      -- Trimmed here rather than in the browser: the column shows a few words,
+      -- and shipping a 2,000-character note to render 40 of them is bandwidth
+      -- spent on text nobody sees.
+      (SELECT 'note_added', NULL, LEFT(n.note, 80), n.created_at, n.created_by
+         FROM lead_notes n
+        WHERE n.lead_id = l.id
+        ORDER BY n.created_at DESC
+        LIMIT 1)
+    -- NOT aliased "both". That is a reserved word in Postgres (TRIM(BOTH ...))
+    -- and the whole query then fails to parse with a syntax error pointing 3,000
+    -- characters away from anything that looks related.
+    --
+    -- The inner alias is a2, not a: the list query already joins areas AS a, and
+    -- reusing the letter inside the LATERAL is legal but reads as though the two
+    -- are related.
+    --
+    -- No backticks in here either: this SQL lives in a JS template literal, and
+    -- a backtick in a comment ends the literal several hundred lines early.
+    ) recent
+    ORDER BY recent.created_at DESC
+    LIMIT 1
+  ) act ON TRUE
+  LEFT JOIN users actor ON actor.id = act.created_by`;
+
 const LEAD_SELECT = `
   SELECT
     l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
@@ -79,6 +157,7 @@ const LEAD_SELECT = `
        FROM segments sg WHERE sg.id = ANY(l.segment_ids)) AS segment_names,
     u.id    AS created_by_id,
     u.name  AS created_by_name,
+${ACTIVITY_COLS},
     au.id   AS assigned_to_id,
     au.name AS assigned_to_name,
     l.assigned_to,
@@ -103,6 +182,7 @@ const LEAD_SELECT = `
   LEFT JOIN body_types    bt ON bt.id = l.body_type_id
   LEFT JOIN users         u  ON u.id  = l.created_by
   LEFT JOIN users         au ON au.id = l.assigned_to
+${ACTIVITY_JOIN}
 `;
 
 function listLeads(req, res, next) {
@@ -125,11 +205,11 @@ function listLeads(req, res, next) {
         const teamIds = teamRows.rows.map(r => r.id);
         teamIds.push(user.id); // include manager's own leads as well
         params.push(teamIds);
-        conditions.push(`l.created_by = ANY($${params.length})`);
+        conditions.push(`(l.created_by = ANY($${params.length})${SHARED_SQL})`);
       } else {
         // VIEW_OWN_LEADS — leads they created OR are assigned to
         params.push(user.id);
-        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length})`);
+        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`);
       }
     }
 
@@ -141,6 +221,62 @@ function listLeads(req, res, next) {
     if (status) {
       params.push(status);
       conditions.push(`l.status = $${params.length}`);
+    }
+
+    // ── Source filter ──────────────────────────────────────────────────────
+    //
+    // New. The list had search and status only, so "show me just the WhatsApp
+    // leads" was not expressible — which matters now that leads arrive from the
+    // inbound webhook and need to be told apart from the ones staff typed.
+    //
+    // TRIM everywhere. The client mirrors this grouping in LeadsPage.jsx and
+    // trims before comparing; without it here a source stored as '  WhatsApp  '
+    // — which free-text entry allows — lands under WhatsApp in the browser and
+    // under Other on the server, and the same filter returns two different
+    // answers depending on which one you asked.
+    //
+    // Grouped rather than an exact match, because lead_source is free text
+    // (VARCHAR(80), no FK) with years of values in it. 'Manual' is not a stored
+    // value at all — it is the ABSENCE of a campaign source, which is what a
+    // lead typed in by an advisor looks like. Encoding that here keeps the
+    // chips honest rather than offering a filter that returns nothing.
+    const source = (req.query.source || '').trim();
+    if (source && source.toLowerCase() !== 'all') {
+      const key = source.toLowerCase();
+      if (key === 'whatsapp') {
+        params.push('whatsapp');
+        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
+      } else if (key === 'website') {
+        params.push('website');
+        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
+      } else if (key === 'meta ads' || key === 'meta_ads' || key === 'meta') {
+        // Meta covers what people have historically typed for the same thing.
+        conditions.push(
+          `LOWER(TRIM(COALESCE(l.lead_source, ''))) IN ('meta ads','meta','facebook','instagram','facebook ads','instagram ads','social media')`
+        );
+      } else if (key === 'manual') {
+        // Typed by a person: no source, or one of the walk-up channels.
+        conditions.push(
+          `(l.lead_source IS NULL OR TRIM(l.lead_source) = ''
+            OR LOWER(TRIM(l.lead_source)) IN ('manual','walk-in','walk in','phone call','referral'))`
+        );
+      } else if (key === 'other') {
+        // Everything the four chips above do not claim. Defined as the
+        // complement so a source nobody thought of still appears SOMEWHERE
+        // instead of being invisible in every filter.
+        conditions.push(
+          `(l.lead_source IS NOT NULL AND TRIM(l.lead_source) <> ''
+            AND LOWER(TRIM(l.lead_source)) NOT IN (
+              'whatsapp','website','meta ads','meta','facebook','instagram',
+              'facebook ads','instagram ads','social media',
+              'manual','walk-in','walk in','phone call','referral'))`
+        );
+      } else {
+        // Anything else is treated as an exact source name, so the filter keeps
+        // working if a new one is added to lead_sources without touching this.
+        params.push(key);
+        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
+      }
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -189,7 +325,7 @@ function listLeads(req, res, next) {
           WHERE le.lead_id = l.id AND le.is_done = FALSE
           ORDER BY le.due_date ASC, le.due_at ASC NULLS LAST
           LIMIT 1
-        ) AS next_follow_up_time
+        ) AS next_follow_up_time,${ACTIVITY_COLS}
       FROM leads l
       LEFT JOIN states        s  ON s.id  = l.state_id
       LEFT JOIN cities        c  ON c.id  = l.city_id
@@ -199,7 +335,7 @@ function listLeads(req, res, next) {
       LEFT JOIN vehicle_models md ON md.id = l.model_id
       LEFT JOIN body_types    bt ON bt.id = l.body_type_id
       LEFT JOIN users         u  ON u.id  = l.created_by
-      LEFT JOIN users         au ON au.id = l.assigned_to
+      LEFT JOIN users         au ON au.id = l.assigned_to${ACTIVITY_JOIN}
     `;
 
     const r = await pool.query(`${LIST_SELECT} ${where} ORDER BY l.created_at DESC`, params);
@@ -232,11 +368,11 @@ function getLead(req, res, next) {
         );
         const teamIds = [user.id, ...teamRows.rows.map(r => r.id)];
         params.push(teamIds);
-        whereClause += ` AND l.created_by = ANY($${params.length})`;
+        whereClause += ` AND (l.created_by = ANY($${params.length})${SHARED_SQL})`;
       } else {
         // VIEW_OWN_LEADS — leads created by or assigned to this user
         params.push(user.id);
-        whereClause += ` AND (l.created_by = $${params.length} OR l.assigned_to = $${params.length})`;
+        whereClause += ` AND (l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`;
       }
     }
 
@@ -493,6 +629,35 @@ function updateLead(req, res, next) {
            VALUES ($1, 'status_changed', $2, $3, $4, $5)`,
           [id, prevLead?.status || null, coreData.status, actNote, req.user.id]
         );
+
+        // ── WhatsApp on lead status change ───────────────────────────────
+        //
+        // Inside this `if`, so it fires on the TRANSITION only — saving a lead
+        // without touching its status must not re-message the customer.
+        //
+        // Matched on the status NAME, because leads.status stores a name rather
+        // than an id. Which template (if any) is configured for which status
+        // lives in Settings → WhatsApp, so changing when a customer hears from
+        // you needs no deploy.
+        //
+        // On the caller's transaction: the message and the status change commit
+        // together. fireWhatsAppEvent savepoints all of its work and never
+        // throws, so nothing here can stop the lead being saved.
+        //
+        // Since migration 151 the lookup is wa_automations
+        // (event 'lead.status_changed', match_value = status name) rather than
+        // the deprecated trigger_lead_status column — managed in
+        // Settings → WhatsApp → Automations.
+        await fireWhatsAppEvent(client, {
+          event: 'lead.status_changed',
+          matchValue: coreData.status,
+          entityId: id,
+          // Status in the key, so moving Call No Ans. (Day 1) → (Day 2) →
+          // (Day 3) sends once per step rather than being collapsed into one
+          // — three separate attempts to reach someone is three events, not a
+          // repeat of the same one.
+          dedupeKey: `leadstatus:${coreData.status}`,
+        });
       }
 
       // ── Log assignment change ───────────────────────────────────────────
@@ -777,11 +942,11 @@ function exportLeads(req, res, next) {
         const teamIds = teamRows.rows.map(r => r.id);
         teamIds.push(user.id);
         params.push(teamIds);
-        conditions.push(`l.created_by = ANY($${params.length})`);
+        conditions.push(`(l.created_by = ANY($${params.length})${SHARED_SQL})`);
       } else {
         // VIEW_OWN_LEADS — leads they created OR are assigned to
         params.push(user.id);
-        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length})`);
+        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`);
       }
     }
 
@@ -985,6 +1150,200 @@ function bulkAssign(req, res, next) {
   });
 }
 
+// ── Bulk Status ───────────────────────────────────────────────────────────────
+//
+// Set one status on many leads at once, from the selection bar on the Leads page.
+//
+// ── Why this is not a loop over PATCH /api/leads/:id ────────────────────────
+//
+// It very nearly is, and on purpose: a bulk change must leave the same trail a
+// hand-made one does, or the timeline lies about how a lead got where it is.
+// So each lead here gets its own activity row, its own follow-up close, and its
+// own WhatsApp automation event — exactly what updateLead does.
+//
+// What it does NOT reuse is updateLead itself. That function reads req.params,
+// writes a response, and opens its own transaction; calling it fifty times over
+// would mean fifty transactions that can half-fail, and one HTTP response per
+// lead. This is one transaction: either the whole selection moves or none of it
+// does, which is the only outcome somebody who ticked fifty boxes can reason
+// about.
+//
+// ── What it refuses, and why ────────────────────────────────────────────────
+//
+// Three kinds of lead are skipped rather than changed, and the count of each
+// comes back so the frontend can say so instead of silently doing less than it
+// was asked:
+//
+//   already converted   An appointment exists. Its status is the appointment's
+//                       business now, not the lead list's.
+//   locked status       is_locked means "this is where the lead ended". The
+//                       single-lead dropdown renders those as a dead badge; the
+//                       same rule has to hold here or bulk becomes the way to
+//                       get around it.
+//   already there       Nothing to do. Counted separately from a skip, because
+//                       "8 changed, 2 already Contacted" is not a failure.
+//
+// And one status is refused outright for the whole request: a status flagged
+// converts_to_appointment. Applying it opens an appointment form per lead —
+// vehicle, service, date, bay — which is per-lead data nobody can supply from a
+// checkbox. Rejecting it is honest; applying the name without the appointment
+// would leave leads marked converted with nothing to show for it.
+function bulkStatus(req, res, next) {
+  handle(req, res, next, async () => {
+    const schema = z.object({
+      lead_ids:    z.array(z.coerce.number().int().positive()).min(1).max(500),
+      status:      z.string().trim().min(1).max(100),
+      lost_reason: z.string().trim().max(120).optional().nullable(),
+    });
+    const { lead_ids, status, lost_reason } = schema.parse(req.body);
+
+    // The status must exist. Matched case-insensitively because leads.status
+    // stores the NAME, and a rename in Settings should not be able to strand a
+    // request that was in flight.
+    const stRes = await pool.query(
+      `SELECT name, is_locked, converts_to_appointment
+         FROM lead_statuses
+        WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+        LIMIT 1`,
+      [status]
+    );
+    const target = stRes.rows[0];
+    if (!target) {
+      return res.status(400).json({ error: `There is no status called "${status}".` });
+    }
+    if (target.converts_to_appointment) {
+      return res.status(400).json({
+        error: `"${target.name}" creates an appointment, which needs details for each lead. Open the leads one at a time to use it.`,
+      });
+    }
+
+    // Canonical spelling from the table, not whatever the client sent — so the
+    // string written to leads.status always matches lead_statuses.name exactly
+    // and the colour lookup on the list keeps working.
+    const statusName = target.name;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // One read decides everything: current status, whether that status is
+      // locked, and whether an appointment already exists. FOR UPDATE so two
+      // people bulk-changing overlapping selections queue rather than race.
+      const rows = (await client.query(
+        `SELECT l.id,
+                l.status                                   AS cur,
+                COALESCE(ls.is_locked, FALSE)              AS cur_locked,
+                EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) AS converted
+           FROM leads l
+           LEFT JOIN lead_statuses ls ON LOWER(TRIM(ls.name)) = LOWER(TRIM(l.status))
+          WHERE l.id = ANY($1)
+          ORDER BY l.id
+          FOR UPDATE OF l`,
+        [lead_ids]
+      )).rows;
+
+      const skippedConverted = rows.filter(r => r.converted).length;
+      const skippedLocked    = rows.filter(r => !r.converted && r.cur_locked).length;
+      const unchanged        = rows.filter(r =>
+        !r.converted && !r.cur_locked &&
+        String(r.cur || '').trim().toLowerCase() === statusName.trim().toLowerCase()).length;
+
+      const changeable = rows.filter(r =>
+        !r.converted && !r.cur_locked &&
+        String(r.cur || '').trim().toLowerCase() !== statusName.trim().toLowerCase());
+
+      if (!changeable.length) {
+        await client.query('ROLLBACK');
+        return res.json({
+          updated: 0,
+          skipped_converted: skippedConverted,
+          skipped_locked: skippedLocked,
+          unchanged,
+          status: statusName,
+        });
+      }
+
+      const ids = changeable.map(r => r.id);
+
+      await client.query(
+        `UPDATE leads
+            SET status = $1,
+                ${lost_reason ? 'lost_reason = $3,' : ''}
+                updated_at = NOW()
+          WHERE id = ANY($2)`,
+        lost_reason ? [statusName, ids, lost_reason] : [statusName, ids]
+      );
+
+      // Any status change closes the open follow-ups — the same rule
+      // updateLead applies. A follow-up scheduled against the status you just
+      // left is not a reminder any more, it is noise.
+      await client.query(
+        `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+          WHERE lead_id = ANY($1) AND is_done = FALSE`,
+        [ids]
+      );
+
+      // One activity row per lead, carrying the status it came FROM — which is
+      // why the previous values were read above rather than thrown away.
+      const actNote = lost_reason ? `Lost reason: ${lost_reason}` : null;
+      for (const r of changeable) {
+        await client.query(
+          `INSERT INTO lead_activities (lead_id, type, old_value, new_value, note, created_by)
+           VALUES ($1, 'status_changed', $2, $3, $4, $5)`,
+          [r.id, r.cur || null, statusName, actNote, req.user.id]
+        );
+      }
+
+      // The customer-facing half. Same event and the same dedupe key
+      // updateLead uses, so a lead moved in bulk and a lead moved by hand
+      // cannot both send the same message twice.
+      //
+      // On this transaction: the messages and the status commit together.
+      // fireWhatsAppEvent savepoints its own work and never throws, so a
+      // provider outage cannot stop the statuses being saved.
+      for (const r of changeable) {
+        await fireWhatsAppEvent(client, {
+          event: 'lead.status_changed',
+          matchValue: statusName,
+          entityId: r.id,
+          dedupeKey: `leadstatus:${statusName}`,
+        });
+      }
+
+      await client.query('COMMIT');
+
+      logActivity({
+        userId:      req.user?.id,
+        userName:    req.user?.name,
+        action:      'UPDATE',
+        entity:      'lead',
+        description: `Bulk set status "${statusName}" on ${ids.length} lead(s): IDs ${ids.join(', ')}`,
+      });
+
+      // After the commit, never inside it: these fan out to push services and
+      // must not be able to hold a transaction open or roll one back.
+      const conversionStatuses = ['won', 'converted', 'closed won'];
+      if (conversionStatuses.includes(statusName.toLowerCase())) {
+        for (const id of ids) fireLeadConversionAlert(id, req.user.id).catch(() => {});
+      }
+
+      res.json({
+        updated: ids.length,
+        skipped_converted: skippedConverted,
+        skipped_locked: skippedLocked,
+        unchanged,
+        status: statusName,
+        ids,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+}
+
 // ── Bulk Delete ───────────────────────────────────────────────────────────────
 function bulkDelete(req, res, next) {
   handle(req, res, next, async () => {
@@ -1026,7 +1385,25 @@ async function checkMobile(req, res, next) {
          FROM leads l
          LEFT JOIN users          u   ON u.id  = l.created_by
          LEFT JOIN lead_statuses  ls  ON LOWER(ls.name) = LOWER(l.status)
-        WHERE l.mobile = $1
+        -- Matched on the last TEN DIGITS, not on the stored string.
+        --
+        -- This used to be a plain l.mobile = $1 compare, and leads.mobile is
+        -- free text with no normalisation anywhere — so the same person saved as
+        -- '+91 97241 90308' did not warn against a typed '9724190308'. The
+        -- warning existed and quietly did nothing for every number that was not
+        -- typed identically twice.
+        --
+        -- Since migration 155 that also breaks a NEW case: leads created by the
+        -- inbound WhatsApp webhook are stored in E.164 ('+919111100001'), so an
+        -- advisor typing '9111100001' would see no warning and open a second
+        -- lead for someone already in the pipeline and already talking to them.
+        --
+        -- Same expression as waInboundLead.service.js and the index migration
+        -- 155 added (idx_leads_mobile_national), so this is an index scan rather
+        -- than a full table scan, and the two definitions of "same number"
+        -- cannot disagree.
+        WHERE RIGHT(regexp_replace(COALESCE(l.mobile, ''), '\\D', '', 'g'), 10)
+              = RIGHT(regexp_replace($1, '\\D', '', 'g'), 10)
           ${excludeId ? 'AND l.id != $2' : ''}
           -- Exclude leads that already have an appointment created from them
           AND NOT EXISTS (
@@ -1043,5 +1420,5 @@ async function checkMobile(req, res, next) {
 }
 
 module.exports = {
-  listLeads, getLead, getLeadByToken, createLead, updateLead, deleteLead, lookupPrice, exportLeads, getStageStats, bulkAssign, bulkDelete, checkMobile,
+  listLeads, getLead, getLeadByToken, createLead, updateLead, deleteLead, lookupPrice, exportLeads, getStageStats, bulkAssign, bulkStatus, bulkDelete, checkMobile,
 };

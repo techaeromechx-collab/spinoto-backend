@@ -30,6 +30,13 @@ const {
   listVehicleOptions, listFuelOptions,
 } = require('../services/bookingCatalog.service');
 const { createBookingAppointment } = require('../services/bookingAppointment.service');
+// Order creation and signature verification used to live inline in this file.
+// They moved to services/gateway/ when invoice payments were added, so there is
+// ONE implementation of each rather than two that drift apart — a timing fix
+// applied to one copy of a signature check and not the other is exactly the
+// kind of bug that survives review. Behaviour here is unchanged: the same mock
+// order ids, the same key_id the booking SPA already recognises, the same HMAC.
+const { getGateway } = require('../services/gateway');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -40,9 +47,9 @@ const OTP_FIXED = process.env.BOOKING_OTP_FIXED || '1234';
 const SMS_WEBHOOK_URL = process.env.SMS_WEBHOOK_URL || '';
 const TOKEN_TTL = process.env.BOOKING_TOKEN_TTL || '30m';
 
-const RZP_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
-const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
-const RZP_LIVE = Boolean(RZP_KEY_ID && RZP_KEY_SECRET);
+// Razorpay credentials are no longer read here. They are read in exactly one
+// place — services/gateway/razorpay.adapter.js — which is what keeps the secret
+// out of every other file's reach. `RZP_LIVE` became gateway.isConfigured().
 
 // Comma-separated pincode PREFIXES, e.g. "38,39". Empty ⇒ serviceable
 // everywhere (the hubs table carries no geography, so there is nothing else
@@ -147,17 +154,44 @@ const sendOtp = handler(async (req, res) => {
   }).parse(req.body || {});
 
   const live = Boolean(SMS_WEBHOOK_URL);
+
+  // ── The fixed code must never be reachable on a live server ──────────────
+  //
+  // Without SMS_WEBHOOK_URL there is no way to deliver a real code, so this
+  // endpoint used to fall back to BOOKING_OTP_FIXED — '1234' by default — and
+  // say so in a console.warn. A warning is not a control. It scrolls past on
+  // boot, and the observable behaviour is a public booking site where anyone
+  // can verify anybody's mobile number: enter a number, type 1234, and you are
+  // through as them.
+  //
+  // So in production this now FAILS CLOSED. Nobody can book until SMS is
+  // configured, which is the correct trade: a booking form that is temporarily
+  // out of order is a bad afternoon, and an OTP that is always '1234' is a
+  // security hole with no expiry.
+  //
+  // The escape hatch is deliberate and deliberately awkward to type. Someone
+  // demoing on a production build can set BOOKING_OTP_ALLOW_FIXED=true and
+  // will be reminded on every request that they have done so.
+  if (!live && process.env.NODE_ENV === 'production') {
+    if (process.env.BOOKING_OTP_ALLOW_FIXED !== 'true') {
+      console.error(
+        '[booking] SMS_WEBHOOK_URL is unset in production — refusing to send a ' +
+        'fixed OTP. Set SMS_WEBHOOK_URL, or BOOKING_OTP_ALLOW_FIXED=true if you ' +
+        'genuinely intend every code to be BOOKING_OTP_FIXED.'
+      );
+      return res.status(503).json({
+        error: 'OTP delivery is not configured. Please contact us to book.',
+      });
+    }
+    console.warn(
+      '[booking] ⚠ BOOKING_OTP_ALLOW_FIXED=true in production — every OTP is ' +
+      'the fixed code BOOKING_OTP_FIXED. Anyone can verify any mobile number.'
+    );
+  }
+
   const code = live
     ? String(crypto.randomInt(1000, 10000))
     : OTP_FIXED;
-
-  if (!live && process.env.NODE_ENV === 'production') {
-    console.warn(
-      '[booking] ⚠ SMS_WEBHOOK_URL is unset in production — every OTP is the ' +
-      'fixed code BOOKING_OTP_FIXED. Anyone can verify any mobile number. ' +
-      'Configure SMS_WEBHOOK_URL before taking real bookings.'
-    );
-  }
 
   await pool.query(
     `INSERT INTO booking_otps (mobile, code_hash, expires_at, attempts, sent_at)
@@ -330,25 +364,20 @@ const createOrderSchema = z.object({
   utm: z.record(z.string(), z.any()).optional().nullable(),
 }).passthrough();
 
-/** Creates a real Razorpay order, or a mock one when keys are not configured. */
-async function openRazorpayOrder({ amountPaise, receipt, notes }) {
-  if (!RZP_LIVE) {
-    // The SPA recognises 'rzp_test_mock' and runs its simulated checkout, so
-    // the whole flow stays testable before the merchant account exists.
-    return { id: `order_mock_${receipt}`, key_id: 'rzp_test_mock' };
-  }
-  const auth = Buffer.from(`${RZP_KEY_ID}:${RZP_KEY_SECRET}`).toString('base64');
-  const r = await fetch('https://api.razorpay.com/v1/orders', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Basic ${auth}` },
-    body: JSON.stringify({ amount: amountPaise, currency: 'INR', receipt, notes }),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok || !data.id) {
-    console.error('[booking] Razorpay order failed:', r.status, data);
-    throw fail(502, 'Could not start the payment. Please try again in a moment.');
-  }
-  return { id: data.id, key_id: RZP_KEY_ID };
+/**
+ * Creates a real gateway order, or a mock one when keys are not configured.
+ *
+ * Now a thin call into the shared adapter. Two contract details the booking SPA
+ * depends on are preserved by the adapter and must stay that way:
+ *   - mock order ids are `order_mock_<receipt>`
+ *   - the mock key_id is `rzp_test_mock`, which the SPA matches on to run its
+ *     simulated checkout
+ *
+ * The adapter takes RUPEES, not paise — the conversion (and its rounding, which
+ * matters to the last paisa) lives on the far side of the boundary now.
+ */
+async function openGatewayOrder({ amountRupees, receipt, notes }) {
+  return getGateway().createOrder({ amount: amountRupees, receipt, notes });
 }
 
 const createOrder = handler(async (req, res) => {
@@ -396,8 +425,8 @@ const createOrder = handler(async (req, res) => {
     source: 'booking.spinoto.com',
   };
 
-  const rzp = await openRazorpayOrder({
-    amountPaise,
+  const rzp = await openGatewayOrder({
+    amountRupees: pkg.price,
     receipt: orderRef,
     notes: { package: pkg.id, mobile },
   });
@@ -420,16 +449,12 @@ const createOrder = handler(async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. POST /verify-payment → the appointment
 // ─────────────────────────────────────────────────────────────────────────────
+// HMAC-SHA256 over "order_id|payment_id", compared in constant time. The
+// implementation moved to services/gateway/razorpay.adapter.js; the rule it
+// enforces is unchanged and is the reason this public endpoint is safe — no
+// signature, no appointment, whatever the browser claims happened.
 function signatureValid(orderId, paymentId, signature) {
-  if (!RZP_LIVE) return true;   // mock checkout — nothing was really charged
-  if (!signature) return false;
-  const expected = crypto
-    .createHmac('sha256', RZP_KEY_SECRET)
-    .update(`${orderId}|${paymentId}`)
-    .digest('hex');
-  const a = Buffer.from(expected, 'utf8');
-  const b = Buffer.from(String(signature), 'utf8');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return getGateway().verifyPaymentSignature({ orderId, paymentId, signature });
 }
 
 const verifyPayment = handler(async (req, res) => {

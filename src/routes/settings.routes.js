@@ -4,7 +4,7 @@ const express = require('express');
 const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
-const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
+const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const c = require('../controllers/settings.controller');
 
 const router = express.Router();
@@ -52,7 +52,11 @@ const uploadLogo      = imageUploader('company-logo', 'logo');
 const uploadSignature = imageUploader('company-signature', 'sig');
 
 // Readable by anyone who generates or views invoices/estimates (needed for PDF header)
-router.get('/company', requireAuth, requirePermission('MANAGE_MASTER_DATA','VIEW_INVOICE','CREATE_INVOICE','EDIT_INVOICE','VIEW_ESTIMATE','CREATE_ESTIMATE','EDIT_ESTIMATE'), c.getCompany);
+// requirePermissionOrHub on the READ only. A hub needs the company identity to
+// render the Bill To party on its own sales invoice; the controller hands hub
+// callers a narrowed payload (identity fields, no document_config, no bank
+// details). Every write below stays requirePermission.
+router.get('/company', requireAuth, requirePermissionOrHub('MANAGE_MASTER_DATA','VIEW_INVOICE','CREATE_INVOICE','EDIT_INVOICE','VIEW_ESTIMATE','CREATE_ESTIMATE','EDIT_ESTIMATE'), c.getCompany);
 
 // Only users with MANAGE_MASTER_DATA (or super admin) can write company settings
 router.put('/company', requireAuth, requirePermission('MANAGE_MASTER_DATA'), c.upsertCompany);
@@ -62,6 +66,16 @@ router.put('/company', requireAuth, requirePermission('MANAGE_MASTER_DATA'), c.u
 // granted without also handing over company_name and gstin, which the route
 // above still writes behind its super-admin check.
 router.put('/company/document-config', requireAuth, requirePermission('MANAGE_DOCUMENT_SETTINGS'), c.upsertDocumentConfig);
+
+// The GST rate printed on advance receipts, and the kill switch for taking
+// payment with no job at all.
+//
+// MANAGE_GATEWAY_SETTINGS, deliberately NOT the MANAGE_MASTER_DATA that guards
+// /company above: this is a tax rate on a customer-facing document, and the same
+// reasoning that keeps refunds and gateway credentials out of general staff
+// hands applies to it. Reading the current value needs no new route — it is
+// already served by GET /api/payments/account-credit/rate.
+router.put('/advance-rate', requireAuth, requirePermission('MANAGE_GATEWAY_SETTINGS'), c.upsertAdvanceRate);
 
 // Invoice logo — separate endpoint so a routine company-details save can
 // never accidentally clear it (controller also enforces super-admin-only)

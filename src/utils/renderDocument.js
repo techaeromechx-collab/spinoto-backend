@@ -14,6 +14,9 @@
 
 const { pool } = require('../config/db');
 const { getTheme } = require('../templates/invoiceThemes/registry');
+// Not in the registry: the registry maps a user-selectable theme key to a
+// module, and this one is never selectable. See resolveRender below.
+const advanceReceipt = require('../templates/invoiceThemes/advanceReceipt');
 const { buildDocument } = require('../templates/documentAdapter');
 const { resolveDocumentConfig, qrEnabled } = require('./documentConfig');
 const { renderHtmlToPdf } = require('./pdf');
@@ -60,6 +63,20 @@ function viewerRoleFor(user) {
 function resolveRender(company, docType, user, { themeOverride, share } = {}) {
   const viewerRole = viewerRoleFor(user);
   const cfg = resolveDocumentConfig(company.document_config, docType, viewerRole);
+
+  // The advance receipt has ONE renderer, and the theme setting does not apply
+  // to it — there is no item table to style. Decided here rather than at each
+  // call site so a caller cannot accidentally hand a receipt voucher to an
+  // invoice theme, which would render a tax document with an empty item table
+  // and a "Balance Due" row for a job that has not been invoiced.
+  //
+  // themeOverride is honoured for nothing on this document, including the
+  // settings live preview: previewing a receipt voucher under "advanced_gst"
+  // would show a layout it will never actually print in.
+  if (docType === 'advance_receipt') {
+    return { cfg, theme: advanceReceipt, themeKey: 'advance_receipt', viewerRole };
+  }
+
   const shareTheme = share ? cfg.flags.auto_share_theme : null;
   const themeKey = themeOverride || shareTheme || cfg.theme;
   return { cfg, theme: getTheme(themeKey), themeKey, viewerRole };

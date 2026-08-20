@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node src/server.js",
     "db:migrate": "node db/migrate.js",
-    "dev": "npm run db:migrate && nodemon src/server.js"
+    "dev": "npm run db:migrate && nodemon src/server.js",
+    "test": "node test/run.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

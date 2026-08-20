@@ -7,9 +7,11 @@ const { getRoundingFunction } = require('../utils/math');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
-const { istToday, validateInvoiceDate, validationError } = require('../utils/invoiceDate');
+const { istToday, validateInvoiceDate, validationError, financialYear } = require('../utils/invoiceDate');
 const { buildSearchSql } = require('../utils/listSearch');
 const { logActivity } = require('../services/activityLog.service');
+const { hubScopeSql, assertHubOwns, isHubUser } = require('../utils/hubScope');
+const { recalcHubInvoiceState } = require('../services/hubBalance.service');
 
 // What the purchase-invoice search box looks at.
 //
@@ -82,6 +84,14 @@ const PI_SELECT = `
     pi.amount_paid,
     pi.payment_status,
     h.hub_name, h.gst_number AS hub_gst,
+    -- Supplier identity for the document. The snapshot columns (migration 120)
+    -- are authoritative; the live hubs join stays only so invoices raised
+    -- before the snapshot existed still render. hub_state_name feeds the
+    -- state-code fallback for a hub with no GSTIN.
+    pi.hub_legal_name, pi.hub_address, pi.hub_gstin, pi.hub_has_gst,
+    pi.supplier_state_code, pi.place_of_supply_code, pi.place_of_supply_name,
+    pi.invoice_number,
+    hub_state.name AS hub_state_name,
     -- Customer / vehicle context — from the linked appointment when present,
     -- otherwise from the linked estimate's own standalone columns.
     COALESCE(a.customer_name, est_ctx.customer_name)   AS customer_name,
@@ -105,6 +115,7 @@ const PI_SELECT = `
 
   FROM purchase_invoices pi
   JOIN hubs h ON h.id = pi.hub_id
+  LEFT JOIN states hub_state ON hub_state.id = h.state_id
   LEFT JOIN appointments   a    ON a.id    = pi.appointment_id
   LEFT JOIN estimates      est_ctx ON est_ctx.id = pi.estimate_id
   LEFT JOIN vehicle_types  vt   ON vt.id   = COALESCE(a.vehicle_type_id, est_ctx.vehicle_type_id)
@@ -116,7 +127,26 @@ const PI_SELECT = `
   LEFT JOIN users ab ON ab.id = pi.approved_by
 `;
 
-async function _getItems(purchaseInvoiceId) {
+/**
+ * Line items for a purchase invoice.
+ *
+ * ── THE MARGIN IS REDACTED FOR HUB LOGINS ───────────────────────────────────
+ * `customer_rate` is what Spinoto charged the customer and `commission_percent`
+ * is the take; `hub_rate` is what the hub is paid. The difference is the
+ * company's margin on that hub's work.
+ *
+ * getPurchaseInvoicePdf and renderDocument.viewerRoleFor already go out of their
+ * way to suppress exactly these two columns for a hub viewer, with a comment
+ * saying why. This JSON endpoint handed them over anyway — so a hub partner with
+ * devtools open on their own portal read, per line, what the customer paid
+ * alongside what they get, ready for the next rate negotiation. The PDF being
+ * careful is worth nothing while the API that renders it is not.
+ *
+ * Redacted rather than 403'd: a hub is entitled to its own invoice, just not to
+ * the other side of it. `hub_rate`, `gst_amount` and `total_payable` — what the
+ * hub is actually owed — stay.
+ */
+async function _getItems(purchaseInvoiceId, { forHub = false } = {}) {
   const r = await pool.query(
     `SELECT id, estimate_item_id, item_type, description, quantity,
             customer_rate, commission_percent, hub_rate,
@@ -124,20 +154,48 @@ async function _getItems(purchaseInvoiceId) {
      FROM purchase_invoice_items WHERE purchase_invoice_id = $1 ORDER BY id`,
     [purchaseInvoiceId]
   );
-  return r.rows;
+  if (!forHub) return r.rows;
+  return r.rows.map(({ customer_rate, commission_percent, ...rest }) => rest);
 }
 
 async function _getHubPayments(purchaseInvoiceId) {
   const r = await pool.query(
     `SELECT hp.id, hp.amount, hp.method, hp.reference_no, hp.paid_at, hp.notes,
             hp.payment_batch_id,
+            -- Set ⇒ this row was produced by a gateway transfer and cannot be
+            -- deleted by hand. Returned so the UI hides the action rather than
+            -- offering a button that 409s — see deleteHubPayment.
+            hp.hub_payout_id,
+            hpo.payout_ref, hpo.status AS payout_status, hpo.utr AS payout_utr,
             u.name AS created_by_name
      FROM hub_payments hp
+     LEFT JOIN hub_payouts hpo ON hpo.id = hp.hub_payout_id
      LEFT JOIN users u ON u.id = hp.created_by
      WHERE hp.purchase_invoice_id = $1 ORDER BY hp.paid_at ASC`,
     [purchaseInvoiceId]
   );
   return r.rows;
+}
+
+/**
+ * Is money already on its way to this invoice through the gateway?
+ *
+ * Recording a payment by hand while a transfer is in flight is how a hub gets
+ * paid twice: the manual row settles the invoice, the payout confirms an hour
+ * later and writes its own row, and the invoice is now overpaid with no obvious
+ * culprit. The reverse ordering is guarded in payouts.service.js, which refuses
+ * to start a payout on an invoice that already has one open.
+ */
+async function _openPayoutFor(db, purchaseInvoiceId) {
+  const r = await db.query(
+    `SELECT p.payout_ref
+       FROM hub_payout_lines l
+       JOIN hub_payouts p ON p.id = l.hub_payout_id
+      WHERE l.purchase_invoice_id = $1
+        AND p.status IN ('created','queued','processing')
+      LIMIT 1`,
+    [purchaseInvoiceId]);
+  return r.rows[0]?.payout_ref || null;
 }
 
 async function _getPaymentSchedule(purchaseInvoiceId) {
@@ -149,24 +207,97 @@ async function _getPaymentSchedule(purchaseInvoiceId) {
   return r.rows;
 }
 
+/**
+ * Derives amount_paid, payment_status AND the installment waterfall.
+ *
+ * The body moved to services/hubBalance.service.js. It was written out longhand
+ * in four handlers in this file, and gateway payouts would have made a fifth —
+ * at which point the odds of all five staying identical are nil. They already
+ * were not: bulkPayment recalculated the invoice but skipped the waterfall, so a
+ * bulk payment against a split schedule left pi_payment_schedule showing
+ * installments as unpaid that had in fact been paid. Routing every caller
+ * through one function fixes that as a side effect of removing the duplication.
+ *
+ * Kept as a named wrapper rather than replacing the call sites, so the four
+ * existing handlers read exactly as they did.
+ */
 async function _recalcHubPaymentStatus(client, purchaseInvoiceId) {
-  const r = await client.query(
-    `SELECT pi.grand_total, COALESCE(SUM(hp.amount), 0) AS paid
-     FROM purchase_invoices pi
-     LEFT JOIN hub_payments hp ON hp.purchase_invoice_id = pi.id
-     WHERE pi.id = $1 GROUP BY pi.grand_total`,
-    [purchaseInvoiceId]
-  );
-  const { grand_total, paid } = r.rows[0];
-  const amtPaid = parseFloat(paid);
-  const total   = parseFloat(grand_total);
-  const status  = amtPaid <= 0 ? 'pending' : amtPaid >= total - 0.011 ? 'paid' : 'partially_paid';
-  await client.query(
-    `UPDATE purchase_invoices SET amount_paid=$1, payment_status=$2, updated_at=NOW() WHERE id=$3`,
-    [amtPaid.toFixed(2), status, purchaseInvoiceId]
-  );
+  return recalcHubInvoiceState(client, purchaseInvoiceId);
 }
 
+
+/**
+ * GST on the hub's side of a purchase invoice.
+ *
+ * A purchase invoice IS the hub's sales invoice — the hub supplies, Spinoto
+ * buys. A hub that is not GST-registered cannot charge tax and will not remit
+ * it, so its document is a Bill of Supply and its payout must be the bare hub
+ * amount.
+ *
+ * Until this existed, hubs.has_gst was never consulted anywhere in this file:
+ * every line added gst_percent regardless, and grand_total — the figure hub
+ * payments settle against — carried it. Unregistered hubs were being PAID that
+ * tax, and any input credit claimed against them had no GSTIN to match.
+ *
+ * `hasGst !== false` on purpose: rows predating the snapshot column have NULL
+ * and must keep behaving exactly as they do today. Only an explicit false
+ * suppresses tax.
+ */
+function hubGst(hubAmount, gstPct, hasGst, roundFn) {
+  if (hasGst === false) return 0;
+  return roundFn(hubAmount * gstPct / 100);
+}
+
+/**
+ * Claim the next number in this hub's own invoice series.
+ *
+ * A supplier's invoice numbers have to be consecutive within a financial year.
+ * The old number was "SI-" + purchase_invoices.id — one global counter shared
+ * by every hub — so a single hub's invoices read SI-000101, SI-000105,
+ * SI-000123. An auditor reads those gaps as suppressed invoices, and the hub
+ * cannot explain them, because they are other hubs' documents.
+ *
+ * Same mechanism as generateAppointmentCode (migration 084): one counter row
+ * per (hub, period), claimed with INSERT … ON CONFLICT DO UPDATE … RETURNING,
+ * so two concurrent approvals can never take the same number. Financial year
+ * rather than month, because that is the period GST numbering is scoped to.
+ *
+ * Keyed on invoice_date, not created_at — a backdated invoice belongs to the
+ * financial year of the supply.
+ *
+ * MUST be called on the approval transaction's client, so a rollback releases
+ * the number instead of leaving a hole in the series.
+ */
+async function claimHubInvoiceNumber(client, { hubId, hubCode, invoiceDate }) {
+  const fyStart = financialYear(invoiceDate);
+  const fy = `${String(fyStart).slice(2)}-${String(fyStart + 1).slice(2)}`; // 25-26
+
+  const r = await client.query(
+    `INSERT INTO hub_invoice_sequences (hub_id, financial_year, last_seq)
+     VALUES ($1, $2, 1)
+     ON CONFLICT (hub_id, financial_year)
+     DO UPDATE SET last_seq = hub_invoice_sequences.last_seq + 1, updated_at = NOW()
+     RETURNING last_seq`,
+    [hubId, fy]
+  );
+  const seq = r.rows[0].last_seq;
+  // hub_code can legitimately be null on an old hub that predates migration
+  // 084; 'HUB' keeps the series well-formed rather than producing "/25-26/1".
+  return `${hubCode || 'HUB'}/${fy}/${String(seq).padStart(4, '0')}`;
+}
+
+/**
+ * Hub tenancy guard for the purchase-invoice write paths.
+ *
+ * Costs one extra round trip, and only on hub-portal requests — for staff and
+ * super admins it returns immediately. Throws 404 (not 403) so ids can't be
+ * enumerated by status code.
+ */
+async function _assertPiHub(req, id, db = pool) {
+  if (!req.user?.hub_id) return;
+  const r = await db.query(`SELECT hub_id FROM purchase_invoices WHERE id = $1`, [id]);
+  assertHubOwns(req, r.rows[0], 'hub_id', 'Purchase invoice');
+}
 
 function listPurchaseInvoices(req, res, next) {
   handle(req, res, next, async () => {
@@ -175,15 +306,24 @@ function listPurchaseInvoices(req, res, next) {
     const offset = (page - 1) * limit;
     const conditions = [], params = [];
 
+    // Hub-portal logins are pinned to their own hub. This list previously had
+    // no scoping of ANY kind — not a hub check, not the permission tier the
+    // other list endpoints carry — so whatever ?hub_ids= the client sent was
+    // the entire filter, and omitting it returned every hub's payouts, rates
+    // and commission. Deliberately still no permission tier for staff: adding
+    // one here would change admin behaviour, which this change must not do.
+    const hubScope = hubScopeSql(req, params, 'pi.hub_id');
+    if (hubScope) conditions.push(hubScope);
+
     const searchSql = buildSearchSql({ search: req.query.search, params, ...PI_SEARCH });
     if (searchSql) conditions.push(searchSql);
-    if (req.query.hub_ids) {
+    if (!hubScope && req.query.hub_ids) {
       const ids = req.query.hub_ids.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
         params.push(ids);
         conditions.push(`pi.hub_id = ANY($${params.length}::int[])`);
       }
-    } else if (req.query.hub_id) {
+    } else if (!hubScope && req.query.hub_id) {
       params.push(Number(req.query.hub_id));
       conditions.push(`pi.hub_id = $${params.length}`);
     }
@@ -246,7 +386,14 @@ function getPurchaseInvoice(req, res, next) {
     const r  = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const item = r.rows[0];
-    item.items        = await _getItems(id);
+    // Scoping the list is not enough — this is the highest-value record in the
+    // system to read across tenants (hub rates, commission, amounts paid), and
+    // ids are sequential. 404 rather than 403 so the status code isn't an
+    // existence oracle. Covers /by-token/:token, which delegates here.
+    assertHubOwns(req, item, 'hub_id', 'Purchase invoice');
+    // isHubUser, not a permission check: a hub login can legitimately hold
+    // VIEW_INVOICE, so the question is who is asking, not what they may do.
+    item.items        = await _getItems(id, { forHub: isHubUser(req) });
     item.hub_payments = await _getHubPayments(id);
     item.schedule     = await _getPaymentSchedule(id);
     res.json({ item });
@@ -271,7 +418,10 @@ function getPurchaseInvoicePdf(req, res, next) {
     const r  = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const invoice = r.rows[0];
-    invoice.items        = await _getItems(id);
+    // The hub view suppresses the margin columns, but it must still be THIS
+    // hub's invoice — otherwise a hub could read another hub's agreed rates.
+    assertHubOwns(req, invoice, 'hub_id', 'Purchase invoice');
+    invoice.items        = await _getItems(id, { forHub: isHubUser(req) });
     invoice.hub_payments = await _getHubPayments(id);
 
     const company = await loadCompany();
@@ -395,12 +545,36 @@ function generatePurchaseInvoice(req, res, next) {
       return res.status(400).json({ error: `Estimate must be work_completed to generate invoice (current: ${est.status})` });
     }
 
-    // Fetch hub rates — commission takes priority over tech rates
+    // Fetch hub rates — commission takes priority over tech rates.
+    // Also the supplier identity: this document is the hub's tax invoice, so
+    // its name, address, GSTIN and registration state are snapshotted onto the
+    // invoice row (migration 120) rather than joined live at render. A hub
+    // that moves premises or corrects its GSTIN must not rewrite invoices it
+    // has already been given.
     const hubRow = await pool.query(
-      `SELECT commission_percent, tech_rate_service, tech_rate_parts FROM hubs WHERE id = $1`,
+      `SELECT h.commission_percent, h.tech_rate_service, h.tech_rate_parts,
+              h.has_gst, h.gst_number, h.hub_name, h.company_name,
+              h.address_line1, h.address_line2, h.pincode,
+              c.name AS city_name, st.name AS state_name
+         FROM hubs h
+         LEFT JOIN cities c  ON c.id  = h.city_id
+         LEFT JOIN states st ON st.id = h.state_id
+        WHERE h.id = $1`,
       [est.hub_id]
     );
     const hub = hubRow.rows[0] || {};
+    const hubHasGst = hub.has_gst === true;
+    const hubGstin  = (hub.gst_number || '').trim() || null;
+    // One text blob, pre-joined, for the same reason the rest is snapshotted:
+    // reassembling it later from four columns re-introduces the live-join
+    // problem it exists to avoid.
+    const hubAddress = [
+      hub.address_line1, hub.address_line2,
+      [hub.city_name, hub.state_name, hub.pincode].filter(Boolean).join(', '),
+    ].filter(v => v && String(v).trim()).join('\n') || null;
+    // The registered state comes from the GSTIN's leading two digits — that is
+    // what the tax office sees, and it needs no address data to resolve.
+    const hubStateCode = hubGstin && /^\d{2}/.test(hubGstin) ? hubGstin.slice(0, 2) : null;
     const commissionPct      = hub.commission_percent != null ? Number(hub.commission_percent) : null;
     const techRateService    = hub.tech_rate_service  != null ? Number(hub.tech_rate_service)  : null;
     const techRateParts      = hub.tech_rate_parts    != null ? Number(hub.tech_rate_parts)    : null;
@@ -503,7 +677,7 @@ function generatePurchaseInvoice(req, res, next) {
 
       const hubAmount    = roundFn(hubRate * qty);
       const techDeductAmt = roundFn(basisRate * qty) - hubAmount; // deduction for display
-      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      const gstAmount    = hubGst(hubAmount, gstPct, hubHasGst, roundFn);
       const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
@@ -521,9 +695,13 @@ function generatePurchaseInvoice(req, res, next) {
            (estimate_id, appointment_id, hub_id, commission_percent, rate_mode,
             subtotal_ex_gst, total_gst, grand_total, created_by, public_token,
             invoice_date, original_invoice_date, backdate_reason, backdated_by, backdated_at,
-            updated_by)
+            updated_by,
+            -- Supplier identity frozen at issue (migration 120). Never
+            -- re-derived from hubs afterwards.
+            hub_legal_name, hub_address, hub_gstin, hub_has_gst, supplier_state_code)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-                 $11::date, $12::date, $13, $14, $15, $16) RETURNING id`,
+                 $11::date, $12::date, $13, $14, $15, $16,
+                 $17, $18, $19, $20, $21) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           useCommission ? commissionPct : 0,      // 0 when using tech_rate mode — column is NOT NULL
@@ -537,6 +715,11 @@ function generatePurchaseInvoice(req, res, next) {
           piInherited ? (req.user?.id || null) : null,
           piInherited ? new Date() : null,
           req.user?.id || null,
+          (hub.company_name || '').trim() || hub.hub_name || null,
+          hubAddress,
+          hubGstin,
+          hubHasGst,
+          hubStateCode,
         ]
       );
       const piId = piRow.rows[0].id;
@@ -574,6 +757,8 @@ function approvePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
 
+    await _assertPiHub(req, id);
+
     // Allow optional payout_schedule + per-item rate overrides at approval time
     const { payout_schedule, item_rates } = z.object({
       payout_schedule: z.enum(['lump_sum', 'split']).default('lump_sum'),
@@ -584,7 +769,7 @@ function approvePurchaseInvoice(req, res, next) {
     }).parse(req.body || {});
 
     const r = await pool.query(
-      `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id, pi.rate_mode,
+      `SELECT pi.status, pi.grand_total, pi.hub_id, pi.appointment_id, pi.rate_mode, pi.hub_has_gst,
               pi.created_at
        FROM purchase_invoices pi
        WHERE pi.id = $1`,
@@ -608,6 +793,48 @@ function approvePurchaseInvoice(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // ── Claim this invoice before doing anything with it ─────────────────
+      //
+      // The status was already checked above — on `pool`, outside this
+      // transaction, with no lock. That check cannot be trusted here, and the
+      // gap between it and this line is where the bug lived.
+      //
+      // Two approvals of the same purchase invoice racing — two staff on
+      // separate sessions, or one impatient retry after a slow response —
+      // BOTH passed that unlocked check. Both then reached
+      // claimHubInvoiceNumber, which is itself atomic, so each was handed a
+      // DIFFERENT number out of the hub's sequence. The final write used
+      // COALESCE, so the invoice kept only the first and never showed a
+      // duplicate — and the second number was attached to nothing at all.
+      //
+      // A burned number is a GAP in that hub's consecutive per-financial-year
+      // series, which is precisely what migration 121 exists to prevent:
+      //
+      //   "Gaps are exactly what a GST audit questions, because a missing
+      //    number looks like a suppressed invoice."
+      //
+      // FOR UPDATE makes the second request wait here rather than race. By the
+      // time it acquires the row, the first has committed and the status is no
+      // longer 'pending_approval', so it stops below — before claiming a
+      // number rather than after.
+      //
+      // The frontend's disabled button is not a substitute: it only guards one
+      // tab, and does nothing about a second session or a retried request.
+      const locked = await client.query(
+        `SELECT status FROM purchase_invoices WHERE id = $1 FOR UPDATE`, [id]);
+
+      if (!locked.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Purchase invoice not found' });
+      }
+      if (locked.rows[0].status !== 'pending_approval') {
+        await client.query('ROLLBACK');
+        // Deliberately the same message and status the pre-flight check gives,
+        // so whoever lost the race sees the ordinary "already approved" answer
+        // rather than something that reads like a fault.
+        return res.status(400).json({ error: `Invoice is already ${locked.rows[0].status}` });
+      }
 
       // ── Recalculate per-item rates if provided ───────────────────────────
       if (item_rates.length > 0) {
@@ -633,7 +860,7 @@ function approvePurchaseInvoice(req, res, next) {
           const techDeduct = roundFn(custRate * (takeRate / 100), 4);
           const hubRate    = roundFn(custRate - techDeduct, 4);
           const hubAmount  = roundFn(hubRate * qty);
-          const gstAmt     = roundFn(hubAmount * gstPct / 100);
+          const gstAmt     = hubGst(hubAmount, gstPct, pi.hub_has_gst, roundFn);
           const total      = roundFn(hubAmount + gstAmt);
 
           subtotalExGst += hubAmount;
@@ -677,14 +904,52 @@ function approvePurchaseInvoice(req, res, next) {
       // always have grand_total > 0 and are untouched by this.
       const zeroPayable = parseFloat(pi.grand_total) <= 0.011;
 
-      await client.query(
+      // The hub's invoice number is claimed HERE, at approval — not at
+      // generation. A draft that is rejected must not burn a number, and a
+      // supplier's series cannot have holes.
+      //
+      // COALESCE on the write: re-approving an invoice that already carries a
+      // number must never reassign it. Once a number is on a document the hub
+      // has been given, and possibly filed, it is fixed.
+      const piMeta = (await client.query(
+        `SELECT pi.invoice_number, pi.invoice_date::text AS invoice_date, h.hub_code
+           FROM purchase_invoices pi JOIN hubs h ON h.id = pi.hub_id
+          WHERE pi.id = $1`, [id]
+      )).rows[0] || {};
+      const invoiceNumber = piMeta.invoice_number
+        || await claimHubInvoiceNumber(client, {
+             hubId: pi.hub_id,
+             hubCode: piMeta.hub_code,
+             invoiceDate: piMeta.invoice_date || istToday(),
+           });
+
+      // `AND status = 'pending_approval'` as well as the lock above. The lock
+      // is what actually prevents the race; this is the assertion that says so
+      // in the SQL, and it is what would catch a future edit that moves the
+      // lock, drops it, or adds a second path into this write.
+      //
+      // COALESCE stays: it is now unreachable as a duplicate-guard, but it
+      // also protects an invoice that somehow already carries a number from
+      // having it rewritten, which is a different and still-worth-having
+      // property.
+      const approved = await client.query(
         `UPDATE purchase_invoices
          SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW(),
              payout_due_date=NULL, payout_schedule=$2,
-             payment_status=$4
-         WHERE id=$3`,
-        [req.user?.id || null, payout_schedule, id, zeroPayable ? 'paid' : 'pending']
+             payment_status=$4,
+             invoice_number = COALESCE(invoice_number, $5)
+         WHERE id=$3 AND status = 'pending_approval'`,
+        [req.user?.id || null, payout_schedule, id, zeroPayable ? 'paid' : 'pending', invoiceNumber]
       );
+
+      if (!approved.rowCount) {
+        // Unreachable while the lock above is in place. If it ever fires, the
+        // right thing is to abandon the transaction — which also releases the
+        // sequence number claimed a few lines up, since claiming it was part
+        // of this transaction and rolls back with it.
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Invoice was approved by someone else. Reload and try again.' });
+      }
 
       // If split: create 3 equal installments (1/3 each). due_date starts
       // NULL — filled in once the linked CI is fully paid (see below).
@@ -735,6 +1000,7 @@ function approvePurchaseInvoice(req, res, next) {
 function addHubPayment(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
+    await _assertPiHub(req, id);
     const data = z.object({
       amount:       z.coerce.number().positive(),
       method:       z.enum(['cash','upi','card','bank_transfer','other','app_payment']).default('bank_transfer'),
@@ -764,6 +1030,21 @@ function addHubPayment(req, res, next) {
       return res.status(400).json({ error: `Payment ₹${data.amount} exceeds outstanding balance ₹${balance.toFixed(2)}` });
     }
 
+    // Money already on its way through the gateway.
+    //
+    // Recording a payment by hand now settles the invoice, and the transfer
+    // confirms an hour later and writes its own row — the hub has been paid
+    // twice and the ledger shows an overpayment nobody can attribute. The
+    // mirror-image guard (starting a payout on an invoice that already has one
+    // open) lives in payouts.service.js, under a row lock.
+    const inFlight = await _openPayoutFor(pool, id);
+    if (inFlight) {
+      return res.status(409).json({
+        error: `A bank transfer (${inFlight}) is already on its way for this invoice. `
+             + `Wait for it to finish, or refresh it on the Payouts screen, before recording a payment by hand.`,
+      });
+    }
+
     // Same rules the edit endpoint applies, so a date that cannot be set by
     // editing cannot be smuggled in at creation either.
     if (data.paid_at) {
@@ -781,29 +1062,9 @@ function addHubPayment(req, res, next) {
         [id, pi.hub_id, data.amount, data.method, data.reference_no||null,
          data.paid_at||null, data.notes||null, req.user?.id||null]
       );
+      // Recalculates amount_paid, payment_status and the split-installment
+      // waterfall in one place — see hubBalance.service.js.
       await _recalcHubPaymentStatus(client, id);
-
-      // Update split installment statuses based on cumulative paid amount
-      const updatedPi = await client.query(
-        `SELECT amount_paid, payout_schedule FROM purchase_invoices WHERE id = $1`, [id]
-      );
-      if (updatedPi.rows[0].payout_schedule === 'split') {
-        const schedule = await client.query(
-          `SELECT id, amount_due FROM pi_payment_schedule WHERE purchase_invoice_id=$1 ORDER BY installment_no`,
-          [id]
-        );
-        let remaining = parseFloat(updatedPi.rows[0].amount_paid);
-        for (const inst of schedule.rows) {
-          const due = parseFloat(inst.amount_due);
-          const paidAmt = Math.min(remaining, due);
-          const instStatus = paidAmt <= 0 ? 'pending' : paidAmt >= due ? 'paid' : 'partially_paid';
-          await client.query(
-            `UPDATE pi_payment_schedule SET paid_amount=$1, status=$2, updated_at=NOW() WHERE id=$3`,
-            [paidAmt.toFixed(2), instStatus, inst.id]
-          );
-          remaining -= paidAmt;
-        }
-      }
 
       await client.query('COMMIT');
     } catch (err) {
@@ -843,9 +1104,10 @@ function recalculatePurchaseInvoice(req, res, next) {
 
     // Fetch the invoice
     const piRow = await pool.query(
-      `SELECT pi.id, pi.rate_mode, pi.hub_id, pi.created_at FROM purchase_invoices pi WHERE pi.id = $1`, [id]
+      `SELECT pi.id, pi.rate_mode, pi.hub_id, pi.created_at, pi.hub_has_gst FROM purchase_invoices pi WHERE pi.id = $1`, [id]
     );
     if (!piRow.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    assertHubOwns(req, piRow.rows[0], 'hub_id', 'Purchase invoice');
     const pi = piRow.rows[0];
 
     if (pi.rate_mode !== 'tech_rate') {
@@ -883,7 +1145,9 @@ function recalculatePurchaseInvoice(req, res, next) {
       const hubRate    = roundFn(custRate - techDeduct, 4);
 
       const hubAmount    = roundFn(hubRate * qty);
-      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      // Snapshot on the row, not hubs.has_gst — a hub that registered after this
+      // invoice was raised must not make it grow a tax line now.
+      const gstAmount    = hubGst(hubAmount, gstPct, piRow.rows[0].hub_has_gst, roundFn);
       const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
@@ -934,6 +1198,8 @@ function deleteHubPayment(req, res, next) {
     const id    = idParam.parse(req.params.id);
     const payId = idParam.parse(req.params.payId);
 
+    await _assertPiHub(req, id);
+
     const client = await pool.connect();
     let deleted = null;
     try {
@@ -947,41 +1213,42 @@ function deleteHubPayment(req, res, next) {
       //
       // RETURNING because the row is needed for the audit log below and this is
       // the last moment it exists.
+      // A row produced by a gateway transfer is NOT deletable here.
+      //
+      // Deleting it would leave hub_payouts saying 'processed' — money really
+      // did leave the company account — over a ledger that no longer contains
+      // it. The invoice would reopen and be paid a second time, and nothing on
+      // any screen would explain why. A transfer that has to be undone is undone
+      // at the bank, and arrives back as payout.reversed, which deletes these
+      // rows itself with the payout row updated to match.
+      //
+      // Checked inside the transaction, on the row being deleted, rather than in
+      // a pre-flight SELECT: a pre-flight check can be true and then stop being
+      // true before the DELETE runs.
       const r = await client.query(
         `DELETE FROM hub_payments
-          WHERE id = $1 AND purchase_invoice_id = $2
+          WHERE id = $1 AND purchase_invoice_id = $2 AND hub_payout_id IS NULL
       RETURNING amount, method, reference_no, paid_at`,
         [payId, id]
       );
       if (r.rowCount === 0) {
         await client.query('ROLLBACK');
+        // Two reasons for zero rows, and they need different sentences.
+        const why = await pool.query(
+          `SELECT hub_payout_id, (SELECT payout_ref FROM hub_payouts WHERE id = hp.hub_payout_id) AS payout_ref
+             FROM hub_payments hp WHERE hp.id = $1 AND hp.purchase_invoice_id = $2`,
+          [payId, id]);
+        if (why.rows[0]?.hub_payout_id) {
+          return res.status(409).json({
+            error: `This payment came from bank transfer ${why.rows[0].payout_ref} and cannot be deleted here. `
+                 + `If the transfer needs reversing, do it at the bank — the reversal is recorded automatically.`,
+          });
+        }
         return res.status(404).json({ error: 'Payment not found' });
       }
       deleted = r.rows[0];
 
       await _recalcHubPaymentStatus(client, id);
-
-      // Recalculate split installment statuses after deletion
-      const updatedPi = await client.query(
-        `SELECT amount_paid, payout_schedule FROM purchase_invoices WHERE id = $1`, [id]
-      );
-      if (updatedPi.rows[0].payout_schedule === 'split') {
-        const schedule = await client.query(
-          `SELECT id, amount_due FROM pi_payment_schedule WHERE purchase_invoice_id=$1 ORDER BY installment_no`,
-          [id]
-        );
-        let remaining = parseFloat(updatedPi.rows[0].amount_paid);
-        for (const inst of schedule.rows) {
-          const due     = parseFloat(inst.amount_due);
-          const paidAmt = Math.min(remaining, due);
-          const instStatus = paidAmt <= 0 ? 'pending' : paidAmt >= due ? 'paid' : 'partially_paid';
-          await client.query(
-            `UPDATE pi_payment_schedule SET paid_amount=$1, status=$2, updated_at=NOW() WHERE id=$3`,
-            [paidAmt.toFixed(2), instStatus, inst.id]
-          );
-          remaining = Math.max(0, remaining - paidAmt);
-        }
-      }
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1082,6 +1349,7 @@ function updateHubPaymentDate(req, res, next) {
   handle(req, res, next, async () => {
     const id    = idParam.parse(req.params.id);
     const payId = idParam.parse(req.params.payId);
+    await _assertPiHub(req, id);
     const { paid_at } = z.object({ paid_at: z.string().trim() }).parse(req.body);
 
     const row = await pool.query(
@@ -1146,6 +1414,25 @@ function updateHubPaymentDate(req, res, next) {
 //   payment has to be valid for every invoice it settles, and the latest one is
 //   the binding constraint.
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Batch variant of _assertPiHub: a payment batch spans several purchase
+ * invoices, so every one of them must belong to the caller's hub. Refusing the
+ * whole batch (rather than filtering it) is deliberate — a partial re-date or
+ * partial delete would silently split a batch the user thinks of as one payment.
+ */
+async function _assertBatchHub(req, batchId, db = pool) {
+  if (!req.user?.hub_id) return;
+  const r = await db.query(
+    `SELECT DISTINCT pi.hub_id
+       FROM hub_payments hp
+       JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
+      WHERE hp.payment_batch_id = $1`,
+    [batchId]
+  );
+  if (r.rowCount === 0) return; // no rows — the handler's own 404 path applies
+  for (const row of r.rows) assertHubOwns(req, row, 'hub_id', 'Payment batch');
+}
+
 function updateHubPaymentBatchDate(req, res, next) {
   handle(req, res, next, async () => {
     const batchId = String(req.params.batchId || '').trim();
@@ -1153,6 +1440,8 @@ function updateHubPaymentBatchDate(req, res, next) {
       return res.status(400).json({ error: 'Invalid batch id' });
     }
     const { paid_at } = z.object({ paid_at: z.string().trim() }).parse(req.body);
+
+    await _assertBatchHub(req, batchId);
 
     const rows = await pool.query(
       `SELECT hp.id, hp.amount, hp.purchase_invoice_id,
@@ -1226,14 +1515,36 @@ function deleteHubPaymentBatch(req, res, next) {
       return res.status(400).json({ error: 'Invalid batch id' });
     }
 
+    await _assertBatchHub(req, batchId);
+
     const client = await pool.connect();
     let rows = [];
     try {
       await client.query('BEGIN');
 
+      // ── A gateway payout reuses payment_batch_id ────────────────────────────
+      // Its payout_ref goes in that column so the existing history screen groups
+      // a multi-invoice transfer into the one line it actually was. What it must
+      // NOT inherit is this reversal: undoing a real bank transfer by deleting
+      // rows would leave hub_payouts saying 'processed' over a ledger that no
+      // longer holds the money, and every one of those invoices would be paid
+      // again. Refused, with the reason, before anything is deleted.
+      const gw = await client.query(
+        `SELECT DISTINCT p.payout_ref
+           FROM hub_payments hp JOIN hub_payouts p ON p.id = hp.hub_payout_id
+          WHERE hp.payment_batch_id = $1`,
+        [batchId]);
+      if (gw.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: `This batch is bank transfer ${gw.rows[0].payout_ref} and cannot be reversed here. `
+               + `If the transfer needs reversing, do it at the bank — the reversal is recorded automatically.`,
+        });
+      }
+
       const r = await client.query(
         `DELETE FROM hub_payments
-          WHERE payment_batch_id = $1
+          WHERE payment_batch_id = $1 AND hub_payout_id IS NULL
       RETURNING purchase_invoice_id, amount, method, reference_no`,
         [batchId]
       );
@@ -1249,27 +1560,6 @@ function deleteHubPaymentBatch(req, res, next) {
       const piIds = [...new Set(rows.map(x => x.purchase_invoice_id))];
       for (const piId of piIds) {
         await _recalcHubPaymentStatus(client, piId);
-
-        const pi = await client.query(
-          `SELECT amount_paid, payout_schedule FROM purchase_invoices WHERE id = $1`, [piId]
-        );
-        if (pi.rows[0]?.payout_schedule === 'split') {
-          const schedule = await client.query(
-            `SELECT id, amount_due FROM pi_payment_schedule WHERE purchase_invoice_id=$1 ORDER BY installment_no`,
-            [piId]
-          );
-          let remaining = parseFloat(pi.rows[0].amount_paid);
-          for (const inst of schedule.rows) {
-            const due     = parseFloat(inst.amount_due);
-            const paidAmt = Math.min(remaining, due);
-            const instStatus = paidAmt <= 0 ? 'pending' : paidAmt >= due ? 'paid' : 'partially_paid';
-            await client.query(
-              `UPDATE pi_payment_schedule SET paid_amount=$1, status=$2, updated_at=NOW() WHERE id=$3`,
-              [paidAmt.toFixed(2), instStatus, inst.id]
-            );
-            remaining = Math.max(0, remaining - paidAmt);
-          }
-        }
       }
 
       await client.query('COMMIT');
@@ -1304,6 +1594,8 @@ function deleteHubPaymentBatch(req, res, next) {
 function updatePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
+
+    await _assertPiHub(req, id);
 
     const { item_rates } = z.object({
       item_rates: z.array(z.object({
@@ -1346,7 +1638,7 @@ function updatePurchaseInvoice(req, res, next) {
         const techDeduct = roundFn(custRate * (takeRate / 100), 4);
         const hubRate    = roundFn(custRate - techDeduct, 4);
         const hubAmount  = roundFn(hubRate * qty);
-        const gstAmt     = roundFn(hubAmount * gstPct / 100);
+        const gstAmt     = hubGst(hubAmount, gstPct, pi.hub_has_gst, roundFn);
         const total      = roundFn(hubAmount + gstAmt);
 
         subtotalExGst += hubAmount;
@@ -1389,12 +1681,29 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
 
+    // A hub has no edit access to its own Sales Invoice. This route rewrites
+    // every line item and total from the estimate, and its only other guard is
+    // payment_status = 'paid' — so an APPROVED invoice, one that has already
+    // claimed a number from the hub's consecutive series and been handed to
+    // their accountant, could be rewritten from under it.
+    //
+    // Checked on the ROLE, not a permission code: a hub login can legitimately
+    // carry CREATE_INVOICE and would sail through requirePermission. The route
+    // gate is staff-only too; this is the guard that holds regardless of how
+    // the route is wired later.
+    if (isHubUser(req)) {
+      return res.status(403).json({
+        error: 'A Sales Invoice cannot be changed from the hub portal. Ask Spinoto to update it.',
+      });
+    }
+
     const piRow = await pool.query(
       `SELECT pi.id, pi.estimate_id, pi.hub_id, pi.rate_mode, pi.commission_percent,
-              pi.payment_status, pi.created_at
+              pi.payment_status, pi.created_at, pi.hub_has_gst
        FROM purchase_invoices pi WHERE pi.id = $1`,
       [id]
     );
+    if (piRow.rows[0]) assertHubOwns(req, piRow.rows[0], 'hub_id', 'Purchase invoice');
     if (!piRow.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = piRow.rows[0];
 
@@ -1474,7 +1783,7 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
       }
 
       const hubAmount    = roundFn(hubRate * qty);
-      const gstAmount    = roundFn(hubAmount * gstPct / 100);
+      const gstAmount    = hubGst(hubAmount, gstPct, pi.hub_has_gst, roundFn);
       const totalPayable = roundFn(hubAmount + gstAmount);
 
       subtotalExGst += hubAmount;
@@ -1540,6 +1849,8 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
 function listPayouts(req, res, next) {
   handle(req, res, next, async () => {
     const today = new Date().toISOString().split('T')[0];
+    const params = [today];
+    const hubScope = hubScopeSql(req, params, 'pi.hub_id');
 
     // Fetch all approved, unpaid PIs with their urgency bucket
     const r = await pool.query(
@@ -1584,16 +1895,16 @@ function listPayouts(req, res, next) {
                 -- When the customer finished paying. This is the anchor
                 -- syncPayoutDueDate uses for the hub's due date, so the tooltip
                 -- explains the Due Date column beside it.
-                (SELECT MAX(p.paid_at) FROM customer_invoice_payments p
+                (SELECT MAX(p.paid_at) FROM invoice_payment_lines p
                   WHERE p.customer_invoice_id = c.id) AS ci_last_paid_at
            FROM customer_invoices c
           WHERE c.purchase_invoice_id = pi.id OR c.estimate_id = pi.estimate_id
           ORDER BY (c.purchase_invoice_id = pi.id) DESC, c.id
           LIMIT 1
        ) ci ON TRUE
-       WHERE pi.status = 'approved' AND pi.payment_status != 'paid'
+       WHERE pi.status = 'approved' AND pi.payment_status != 'paid'${hubScope ? ` AND ${hubScope}` : ''}
        ORDER BY pi.payout_due_date ASC NULLS LAST`,
-      [today]
+      params
     );
 
     // Attach installment schedules for split invoices
@@ -1629,7 +1940,12 @@ function listHubPayments(req, res, next) {
     const conditions = [];
     const params     = [];
 
-    if (req.query.hub_id) {
+    // Hub pin first; the query-param filter is then skipped so a client cannot
+    // widen it back out to every hub's payment history.
+    const hubScope = hubScopeSql(req, params, 'pi.hub_id');
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (req.query.hub_id) {
       params.push(Number(req.query.hub_id));
       conditions.push(`pi.hub_id = $${params.length}`);
     }
@@ -1648,6 +1964,10 @@ function listHubPayments(req, res, next) {
       `SELECT
          hp.id, hp.amount, hp.method, hp.reference_no, hp.notes, hp.paid_at,
          hp.purchase_invoice_id, hp.payment_batch_id,
+         -- Set ⇒ produced by a bank transfer, and not deletable by hand. The UI
+         -- uses it to hide the delete action rather than render a button that
+         -- 409s; the refusal itself lives in deleteHubPayment.
+         hp.hub_payout_id, hpo.payout_ref, hpo.status AS payout_status,
          pi.public_token AS purchase_invoice_token,
          pi.grand_total AS pi_grand_total,
          pi.amount_paid AS pi_amount_paid,
@@ -1658,6 +1978,7 @@ function listHubPayments(req, res, next) {
        FROM hub_payments hp
        JOIN purchase_invoices pi ON pi.id = hp.purchase_invoice_id
        JOIN hubs h ON h.id = pi.hub_id
+       LEFT JOIN hub_payouts hpo ON hpo.id = hp.hub_payout_id
        LEFT JOIN appointments a ON a.id = pi.appointment_id
        LEFT JOIN estimates e ON e.id = pi.estimate_id
        LEFT JOIN users u ON u.id = hp.created_by
@@ -1686,6 +2007,18 @@ function listHubPayments(req, res, next) {
 // ── GET /api/purchase-invoices/tech-rate-summary ─────────────────────────────
 function getTechRateSummary(req, res, next) {
   handle(req, res, next, async () => {
+    // customer_rate - hub_rate IS the platform's take. Unscoped, this hands a
+    // hub partner the company-wide margin figure in a single number.
+    //
+    // Scoping it was not enough, and that was the bug: a scoped answer is the
+    // margin the company makes ON THAT HUB — the single most useful number a
+    // partner could take into a rate negotiation, served pre-summed. There is no
+    // version of this figure a hub should see, so the refusal is total.
+    if (isHubUser(req)) {
+      return res.status(403).json({ error: 'This summary is not available to hub logins.' });
+    }
+    const params = [];
+    const hubScope = hubScopeSql(req, params, 'pi.hub_id');
     const r = await pool.query(
       `SELECT
          SUM((pii.customer_rate - pii.hub_rate) * pii.quantity)                              AS total_ex_gst,
@@ -1693,7 +2026,8 @@ function getTechRateSummary(req, res, next) {
        FROM purchase_invoice_items pii
        JOIN purchase_invoices pi ON pi.id = pii.purchase_invoice_id
        WHERE pi.status = 'approved'
-         AND pi.rate_mode = 'tech_rate'`
+         AND pi.rate_mode = 'tech_rate'${hubScope ? ` AND ${hubScope}` : ''}`,
+      params
     );
     const row = r.rows[0];
     res.json({
@@ -1734,6 +2068,10 @@ function bulkPayment(req, res, next) {
         );
         if (!piRow.rows[0]) continue;
         const pi = piRow.rows[0];
+        // Silently skip anything outside the caller's hub, matching how this
+        // loop already skips unapproved and zero-balance invoices. `results`
+        // reports what was actually paid, so nothing is claimed that didn't run.
+        if (req.user?.hub_id && pi.hub_id !== req.user.hub_id) continue;
         const balance = parseFloat(pi.grand_total) - parseFloat(pi.amount_paid || 0);
         const payAmt  = Math.min(parseFloat(amount), balance); // never overpay
         if (payAmt <= 0) continue;
@@ -1796,7 +2134,12 @@ function exportPayouts(req, res, next) {
       const conditions = ["pi.status = 'approved'", "pi.payment_status != 'paid'"];
       const params = [];
 
-      if (hubId) {
+      // The CSV builds its own WHERE, so scoping applied only to listPayouts
+      // would leave this route as an open door.
+      const hubScope = hubScopeSql(req, params, 'pi.hub_id');
+      if (hubScope) {
+        conditions.push(hubScope);
+      } else if (hubId) {
         params.push(hubId);
         conditions.push(`pi.hub_id = $${params.length}`);
       }
@@ -1864,7 +2207,10 @@ function exportPayouts(req, res, next) {
       const conditions = [];
       const params = [];
 
-      if (hubId) {
+      const hubScope = hubScopeSql(req, params, 'pi.hub_id');
+      if (hubScope) {
+        conditions.push(hubScope);
+      } else if (hubId) {
         params.push(hubId);
         conditions.push(`pi.hub_id = $${params.length}`);
       }
@@ -1939,6 +2285,8 @@ function exportPayouts(req, res, next) {
 async function rejectPurchaseInvoiceApproval(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
+
+    await _assertPiHub(req, id);
 
     const r = await pool.query(
       `SELECT pi.status,

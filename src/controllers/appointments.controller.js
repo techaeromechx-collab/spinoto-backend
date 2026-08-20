@@ -16,6 +16,7 @@ const { pool } = require('../config/db');
 const { logActivity } = require('../services/activityLog.service');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
+const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
 
 // ─── Hub schedule validator ───────────────────────────────────────────────────
 // Returns { status, code, error } if the scheduled slot violates hub hours/days,
@@ -475,6 +476,26 @@ function createAppointment(req, res, next) {
         }
       }
 
+      // Queue the "Appointment Generated" WhatsApp message.
+      //
+      // INSIDE the transaction, before COMMIT, so the message and the
+      // appointment live or die together. A queued message for an appointment
+      // that then rolled back would tell a customer about a booking that does
+      // not exist.
+      //
+      // fireWhatsAppEvent savepoints its work and never throws, so nothing
+      // here can stop the appointment being created. Which template(s) fire —
+      // and whether any do — is the wa_automations row for
+      // 'appointment.created' (Settings → WhatsApp → Automations), and the
+      // dispatcher still requires the template to be enabled + auto-send.
+      await fireWhatsAppEvent(client, {
+        event: 'appointment.created',
+        entityId: apptId,
+        // An appointment is created once, so its identity is enough. A retried
+        // request that somehow reached here twice would produce one message.
+        dedupeKey: `created:${apptId}`,
+      });
+
       await client.query('COMMIT');
 
       // Return full record
@@ -490,6 +511,138 @@ function createAppointment(req, res, next) {
     } finally {
       client.release();
     }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/appointments/calendar?month=YYYY-MM  (or date_from / date_to)
+//
+// WHY THIS IS NOT JUST listAppointments WITH A BIG LIMIT
+// ─────────────────────────────────────────────────────
+// listAppointments caps page size at 100. A month grid has to show the WHOLE
+// month or its cells lie about what is booked — and a calendar that is
+// confidently wrong is worse than no calendar. This is bounded by the DATE
+// RANGE instead, which a month already is, so no limit is needed and none is
+// accepted. The range itself is capped at 62 days so the endpoint can never be
+// asked for a decade.
+//
+// It also returns twelve columns instead of APPT_SELECT's ~50. A cell shows a
+// name, a time, a plate and a status; it has no use for pickup addresses or
+// reschedule history. Note there is no `mobile` — a calendar does not need it,
+// which keeps this clear of the contact-masking rules entirely.
+function listAppointmentsCalendar(req, res, next) {
+  handle(req, res, next, async () => {
+    const month = (req.query.month || '').trim();
+    let dateFrom = (req.query.date_from || '').trim();
+    let dateTo   = (req.query.date_to   || '').trim();
+
+    // month=YYYY-MM is the convenient form; the grid also needs the tail of the
+    // previous month and the head of the next one, so the caller may widen it
+    // with explicit dates instead.
+    if (month) {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+        return res.status(400).json({ error: 'month must be YYYY-MM' });
+      }
+      const [y, m] = month.split('-').map(Number);
+      const first = new Date(Date.UTC(y, m - 1, 1));
+      const last  = new Date(Date.UTC(y, m, 0));       // day 0 of next month
+      dateFrom = first.toISOString().slice(0, 10);
+      dateTo   = last.toISOString().slice(0, 10);
+    }
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({ error: 'month, or both date_from and date_to, are required' });
+    }
+    for (const [label, v] of [['date_from', dateFrom], ['date_to', dateTo]]) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return res.status(400).json({ error: `${label} must be YYYY-MM-DD` });
+    }
+    if (dateTo < dateFrom) return res.status(400).json({ error: 'date_to is before date_from' });
+    const span = (Date.parse(dateTo) - Date.parse(dateFrom)) / 86400000;
+    if (span > 62) {
+      return res.status(400).json({ error: 'Range too wide — the calendar loads at most about two months at a time.' });
+    }
+
+    const conditions = [];
+    const params = [];
+
+    // Same three-tier scoping as listAppointments, in the same order and for
+    // the same reasons. A hub login is pinned to its own hub whatever the query
+    // string says — without this the calendar would be a way to read every
+    // hub's schedule.
+    const hubScope = hubScopeSql(req, params, 'a.hub_id');
+    const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_APPOINTMENT');
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (!isAll) {
+      params.push([req.user.id]);
+      conditions.push(
+        `EXISTS (
+          SELECT 1 FROM leads l
+          WHERE l.id = a.lead_id
+          AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+        )`
+      );
+    }
+
+    // Skipped for hub logins, exactly as in the list: hubScope already pinned
+    // the hub, and honouring the query string too would let a client widen it.
+    const hubIds = req.query.hub_ids || '';
+    const hubId  = req.query.hub_id  || '';
+    if (!hubScope && hubIds) {
+      const ids = hubIds.split(',').map(Number).filter(n => !isNaN(n));
+      if (ids.length > 0) {
+        params.push(ids);
+        conditions.push(`a.hub_id = ANY($${params.length}::int[])`);
+      }
+    } else if (!hubScope && hubId) {
+      params.push(Number(hubId));
+      conditions.push(`a.hub_id = $${params.length}`);
+    }
+    if (req.query.status_id) {
+      params.push(Number(req.query.status_id));
+      conditions.push(`a.status_id = $${params.length}`);
+    }
+    if ((req.query.search || '').trim()) {
+      params.push(`%${req.query.search.trim().toLowerCase()}%`);
+      const n = params.length;
+      conditions.push(
+        `(LOWER(COALESCE(a.customer_name,'')) LIKE $${n}
+          OR a.mobile LIKE $${n}
+          OR LOWER(COALESCE(a.vehicle_number,'')) LIKE $${n})`
+      );
+    }
+
+    params.push(dateFrom);
+    conditions.push(`a.scheduled_date >= $${params.length}`);
+    params.push(dateTo);
+    conditions.push(`a.scheduled_date <= $${params.length}`);
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // Ordered by the schedule, not by booking order: the client groups these
+    // into day cells and each cell should read top-to-bottom as the day runs.
+    const r = await pool.query(
+      `SELECT
+         a.id,
+         a.public_token,
+         TO_CHAR(a.scheduled_date, 'YYYY-MM-DD') AS scheduled_date,
+         a.scheduled_time,
+         a.customer_name,
+         a.vehicle_number,
+         a.status_id,
+         ast.name     AS status_name,
+         ast.color    AS status_color,
+         ast.bg_color AS status_bg,
+         a.hub_id,
+         h.hub_name
+       FROM appointments a
+       LEFT JOIN appointment_statuses ast ON ast.id = a.status_id
+       LEFT JOIN hubs h ON h.id = a.hub_id
+       ${where}
+       ORDER BY a.scheduled_date ASC, a.scheduled_time ASC NULLS LAST, a.id ASC`,
+      params
+    );
+
+    res.json({ items: r.rows, date_from: dateFrom, date_to: dateTo, total: r.rowCount });
   });
 }
 
@@ -514,10 +667,22 @@ function listAppointments(req, res, next) {
     const params = [];
 
     // ── User scoping ──────────────────────────────────────────────────────────
-    // Super admins and users with VIEW_APPOINTMENT see all.
-    // Others (e.g. CREATE_APPOINTMENT only) see appointments linked to their leads.
+    // Three tiers, and the ORDER MATTERS:
+    //
+    //   1. Hub-portal login  → their own hub, full stop. Checked FIRST so that
+    //      granting a hub user VIEW_APPOINTMENT widens them *within* their hub
+    //      rather than across every hub. Before this branch existed a hub login
+    //      had only two possible views: nothing at all (the leads fallback below
+    //      never matches, because hub users create no leads) or every hub's
+    //      appointments. Neither is what a hub partner should see.
+    //   2. Super admin / VIEW_APPOINTMENT → everything.
+    //   3. Otherwise (e.g. CREATE_APPOINTMENT only) → appointments linked to
+    //      leads they created or are assigned to.
+    const hubScope = hubScopeSql(req, params, 'a.hub_id');
     const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_APPOINTMENT');
-    if (!isAll) {
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (!isAll) {
       params.push([req.user.id]);
       conditions.push(
         `EXISTS (
@@ -537,13 +702,15 @@ function listAppointments(req, res, next) {
           OR LOWER(COALESCE(a.vehicle_number,'')) LIKE $${n})`
       );
     }
-    if (hubIds) {
+    // Skipped entirely for hub logins — hubScope above already pinned the hub,
+    // and honouring the query string as well would let a client widen it.
+    if (!hubScope && hubIds) {
       const ids = hubIds.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
         params.push(ids);
         conditions.push(`a.hub_id = ANY($${params.length}::int[])`);
       }
-    } else if (hubId) {
+    } else if (!hubScope && hubId) {
       params.push(Number(hubId));
       conditions.push(`a.hub_id = $${params.length}`);
     }
@@ -606,16 +773,23 @@ function listAppointments(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 function getStats(req, res, next) {
   handle(req, res, next, async () => {
+    // The hub predicate goes in the JOIN, not a WHERE: this is a LEFT JOIN and
+    // the point of the query is that every active status appears, with 0 for
+    // the ones this hub has nothing in. In a WHERE clause the NULL side of the
+    // join would be filtered out and empty statuses would vanish from the tabs.
+    const params = [];
+    const hubScope = hubScopeSql(req, params, 'a.hub_id');
     const rows = await pool.query(`
       SELECT
         ast.id, ast.name, ast.color, ast.bg_color,
         COUNT(a.id)::int AS count
       FROM appointment_statuses ast
-      LEFT JOIN appointments a ON a.status_id = ast.id
+      LEFT JOIN appointments a
+        ON a.status_id = ast.id${hubScope ? ` AND ${hubScope}` : ''}
       WHERE ast.is_active = TRUE
       GROUP BY ast.id
       ORDER BY ast.sort_order NULLS LAST, ast.id
-    `);
+    `, params);
     return res.json({ items: rows.rows });
   });
 }
@@ -629,6 +803,11 @@ function getAppointment(req, res, next) {
     const row = await pool.query(`${APPT_SELECT} WHERE a.id = $1`, [id]);
     if (!row.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     const appt = row.rows[0];
+    // Scoping the list is not enough — without this, a hub login can read any
+    // appointment by walking ids. 404 rather than 403 so the status code isn't
+    // an existence oracle. Covers /by-token/:token too: it resolves the token
+    // then delegates here.
+    assertHubOwns(req, appt, 'hub_id', 'Appointment');
     appt.services = await _getServices(id);
     return res.json({ item: appt });
   });
@@ -646,6 +825,18 @@ function getAppointmentByToken(req, res, next) {
     req.params.id = String(id);
     return getAppointment(req, res, next);
   });
+}
+
+/**
+ * Hub tenancy guard for the handlers whose own SELECT does not already carry
+ * hub_id. One extra round trip, only on hub-portal requests — for staff and
+ * super admins hubScope/assertHubOwns are no-ops and this returns immediately.
+ * Throws 404 (not 403) so ids can't be enumerated by status code.
+ */
+async function _assertApptHub(req, id) {
+  if (!req.user?.hub_id) return;
+  const r = await pool.query(`SELECT hub_id FROM appointments WHERE id = $1`, [id]);
+  assertHubOwns(req, r.rows[0], 'hub_id', 'Appointment');
 }
 
 async function checkIsTerminal(id) {
@@ -666,8 +857,24 @@ function updateAppointment(req, res, next) {
     const id = idParam.parse(req.params.id);
     const data = updateSchema.parse(req.body);
 
+    await _assertApptHub(req, id);
+
     if (await checkIsTerminal(id)) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
+    }
+
+    // ── What the status was, before we touch it ──────────────────────────
+    //
+    // Read here rather than inside the transaction because the messaging
+    // decision below needs the BEFORE value, and by the time the UPDATE has run
+    // there is nothing left to compare against.
+    //
+    // Only when a status change was actually requested — an ordinary edit that
+    // never mentions status_id must not pay for a query it will not use.
+    let prevStatusId = null;
+    if (data.status_id !== undefined) {
+      const prev = await pool.query('SELECT status_id FROM appointments WHERE id = $1', [id]);
+      prevStatusId = prev.rows[0]?.status_id ?? null;
     }
 
     if (data.status_id !== undefined) {
@@ -887,9 +1094,76 @@ function updateAppointment(req, res, next) {
       client.release();
     }
 
+    // ── A status changed BY HAND still tells the customer ──────────────────
+    //
+    // Every other route to a status change goes through advanceAppointmentStatus,
+    // which fires whatever template Settings → WhatsApp has pointed at that
+    // status. This handler is the exception: it writes status_id straight into
+    // its own UPDATE, alongside date, time, notes and everything else, so the
+    // helper never ran and the message never went.
+    //
+    // The result was a status that messaged the customer when the system
+    // reached it and stayed silent when a person picked it from the dropdown —
+    // same status, same customer, different outcome, for no reason anybody
+    // chose.
+    //
+    // Reusing fireStatusMessages rather than calling advanceAppointmentStatus:
+    // that helper would re-run the UPDATE we have just committed, and its
+    // IS DISTINCT FROM guard would then find nothing changed and return before
+    // messaging. The row is already correct; only the notification is missing.
+    //
+    // AFTER the commit, and never thrown. The status change is saved either
+    // way, and a WhatsApp outage must not turn a successful edit into an error.
+    if (data.status_id !== undefined && data.status_id !== prevStatusId) {
+      pool.query(
+        'SELECT slug FROM appointment_statuses WHERE id = $1 AND is_system = TRUE',
+        [data.status_id]
+      )
+        // Only system statuses carry a slug. A custom status added in Master
+        // Data has none, cannot be a trigger, and is not an error — there is
+        // simply nothing configured to fire.
+        .then(r => r.rows[0]?.slug && fireStatusMessages(id, r.rows[0].slug))
+        .catch(err =>
+          console.error(`[whatsapp] status message for appt #${id} failed:`, err.message));
+    }
+
     const row = await pool.query(`${APPT_SELECT} WHERE a.id = $1`, [id]);
     const appt = row.rows[0];
     appt.services = await _getServices(id);
+
+    // ── Tell the customer their appointment moved ──────────────────────────
+    //
+    // Fired here rather than through advanceAppointmentStatus, for two reasons
+    // that both make a SECOND reschedule silent:
+    //
+    //   1. That helper updates WHERE status_id IS DISTINCT FROM the new one and
+    //      returns early when nothing changed. An appointment already sitting
+    //      in 'rescheduled' is exactly that case, so moving it a second time
+    //      would never reach the messaging step at all.
+    //
+    //   2. Its dedupe key is the transition ('status:rescheduled'), and the
+    //      unique index on wa_messages is
+    //      (template_key, entity_type, entity_id, dedupe_key). One appointment
+    //      would therefore produce one reschedule message, ever.
+    //
+    // Rescheduling twice is ordinary. So the key is the NEW SLOT: a retried
+    // request carries the same date and time and collapses to one message,
+    // while a genuine second move produces a different key and sends again.
+    //
+    // AFTER the commit, and never thrown — a messaging failure must not undo a
+    // reschedule that has already been saved, and the customer's date has
+    // changed whether or not the message goes out.
+    if (isRescheduling) {
+      // fireWhatsAppEventDetached owns the connection/transaction/logging the
+      // hand-rolled block here used to. The templates come from the
+      // 'appointment.rescheduled' automation rows (migration 151).
+      await fireWhatsAppEventDetached(pool, {
+        event: 'appointment.rescheduled',
+        entityId: id,
+        dedupeKey: `reschedule:${appt.scheduled_date || ''}T${appt.scheduled_time || ''}`,
+      });
+    }
+
     return res.json({ item: appt });
   });
 }
@@ -919,6 +1193,10 @@ async function _getServices(apptId) {
 // POST /api/appointments/:id/at-workshop     — manual pickup flow step 2
 // ─────────────────────────────────────────────────────────────────────────────
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+// The messaging half of that helper, on its own. Used where the status row
+// has ALREADY been written and only the notification is outstanding.
+const { fireStatusMessages } = require('../helpers/advanceAppointmentStatus');
+const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 
 async function markVehiclePicked(req, res, next) {
   try {
@@ -926,8 +1204,9 @@ async function markVehiclePicked(req, res, next) {
     if (await checkIsTerminal(id)) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
     }
-    const r = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
+    const r = await pool.query(`SELECT id, hub_id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+    assertHubOwns(req, r.rows[0], 'hub_id', 'Appointment');
     if (!r.rows[0].pickup_required) {
       return res.status(400).json({ error: 'This appointment does not have pickup enabled' });
     }
@@ -944,8 +1223,9 @@ async function markAtWorkshop(req, res, next) {
     if (await checkIsTerminal(id)) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
     }
-    const r = await pool.query(`SELECT id, pickup_required FROM appointments WHERE id = $1`, [id]);
+    const r = await pool.query(`SELECT id, hub_id, pickup_required FROM appointments WHERE id = $1`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+    assertHubOwns(req, r.rows[0], 'hub_id', 'Appointment');
     if (!r.rows[0].pickup_required) {
       return res.status(400).json({ error: 'This appointment does not have pickup enabled' });
     }
@@ -981,7 +1261,7 @@ async function _collectAppointmentChain(apptId) {
     )).rows[0] || null;
     ci = (await pool.query(
       `SELECT ci.id, ci.status, ci.grand_total, COALESCE(ci.amount_paid,0) AS amount_paid,
-              (SELECT COUNT(*)::int FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id) AS payment_count
+              (SELECT COUNT(*)::int FROM invoice_payment_lines p WHERE p.customer_invoice_id = ci.id) AS payment_count
          FROM customer_invoices ci WHERE ci.estimate_id = $1 ORDER BY ci.id DESC LIMIT 1`, [est.id]
     )).rows[0] || null;
     if (ci) {
@@ -1000,11 +1280,12 @@ function deletePreview(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
     const appt = (await pool.query(
-      `SELECT a.id, a.appointment_code, a.lead_id, a.is_warranty_redo, a.warranty_claim_id,
+      `SELECT a.id, a.hub_id, a.appointment_code, a.lead_id, a.is_warranty_redo, a.warranty_claim_id,
               (SELECT COUNT(*)::int FROM appointments a2 WHERE a2.lead_id = a.lead_id AND a2.id <> a.id) AS other_appointments
          FROM appointments a WHERE a.id = $1`, [id]
     )).rows[0];
     if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+    assertHubOwns(req, appt, 'hub_id', 'Appointment');
 
     const { est, pi, ci, claims } = await _collectAppointmentChain(id);
 
@@ -1035,9 +1316,10 @@ function deleteAppointment(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
     const appt = (await pool.query(
-      `SELECT id, appointment_code, lead_id, is_warranty_redo, warranty_claim_id FROM appointments WHERE id = $1`, [id]
+      `SELECT id, hub_id, appointment_code, lead_id, is_warranty_redo, warranty_claim_id FROM appointments WHERE id = $1`, [id]
     )).rows[0];
     if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+    assertHubOwns(req, appt, 'hub_id', 'Appointment');
 
     const { est, pi, ci, claims } = await _collectAppointmentChain(id);
 
@@ -1145,6 +1427,7 @@ function deleteAppointment(req, res, next) {
 }
 
 module.exports = {
+  listAppointmentsCalendar,
   createAppointment,
   listAppointments,
   getStats,

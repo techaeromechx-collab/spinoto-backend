@@ -1,0 +1,47 @@
+-- Migration 132: mark the legacy `invoice_payments` table as retired.
+--
+-- WHAT THIS DOES NOT DO
+-- ─────────────────────
+-- It does not drop the table, and that is the decision, not an omission.
+--
+-- `invoice_payments` (migration 023) was the payment ledger for the original
+-- `invoices` table, before customer invoices existed. It has been superseded by
+-- customer_invoice_payments, which is what every feature in this system now
+-- reads: hub payouts, warranty preflight, the payouts list, the public invoice
+-- PDF, the appointment and estimate deletion guards, the invoice-backdating
+-- floor, and the payments module.
+--
+-- As of the change that ships with this migration, nothing can write to it:
+--   • routes/invoice_payments.routes.js is no longer mounted in server.js
+--   • pages/InvoicesPage.jsx is not imported by App.jsx, and /invoices
+--     redirects to /customer-invoices
+--
+-- So the door is closed. What remains is data.
+--
+-- WHY THE DATA STAYS
+-- ──────────────────
+-- These rows record money that customers actually handed over. They are the
+-- only evidence of it — there was no audit log on that path either. A workshop
+-- asked in three years to account for a payment taken in 2025 has nowhere else
+-- to look, and DROP TABLE is not reversible: this codebase has no
+-- down-migrations by design, so a mistaken drop is permanent.
+--
+-- The cost of keeping it is a table nobody queries. The cost of dropping it is
+-- a records question with no answer. That is not a close call.
+--
+-- A COMMENT rather than a rename, for the same reason a rename would be worse
+-- than it looks: anything still holding a reference — a hand-written report, a
+-- backup restore script, a psql session someone runs at year end — breaks on a
+-- rename and merely reads a note on a comment.
+--
+-- WHEN IT CAN ACTUALLY GO
+-- ───────────────────────
+-- Two conditions, both of which a human has to confirm:
+--   1. the rows have been exported somewhere durable, or the retention period
+--      the business is subject to has genuinely elapsed;
+--   2. `SELECT COUNT(*) FROM invoice_payments;` is checked at that moment
+--      rather than assumed from this comment.
+-- Until then this migration is the whole of the retirement.
+
+COMMENT ON TABLE invoice_payments IS
+  'RETIRED (migration 132). The payment ledger for the legacy `invoices` table, superseded by customer_invoice_payments. No code path reads or writes it: routes/invoice_payments.routes.js is unmounted and pages/InvoicesPage.jsx is unreachable. Rows are KEPT deliberately — they are the only record of money taken through the old flow, and that path had no audit log. Do not query this table for current figures; do not drop it without exporting first.';

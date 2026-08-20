@@ -22,11 +22,20 @@ const statusSchema = z.object({
   is_pipeline:             z.boolean().default(true),
   logs_call:               z.boolean().default(false),
   is_locked:               z.boolean().default(false),
+  // Its own flag, NOT is_pipeline — see migration 156. is_pipeline is about
+  // dashboard value; this is about where a new WhatsApp message lands.
+  is_closed:               z.boolean().default(false),
+  // Where a RETURNING customer's new lead starts (migration 161). Two flags
+  // because they are two different people: one said no and came back, the
+  // other has already paid you.
+  is_reenquiry:            z.boolean().default(false),
+  is_repeat_customer:      z.boolean().default(false),
 });
 
 const SELECT_COLS = `
   id, name, color, bg_color, sort_order, is_active, is_default,
-  needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, created_at
+  needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, is_closed,
+  is_reenquiry, is_repeat_customer, created_at
 `;
 
 function listStatuses(req, res, next) {
@@ -56,12 +65,24 @@ function createStatus(req, res, next) {
       if (data.is_default) {
         await client.query('UPDATE lead_statuses SET is_default = FALSE WHERE is_default = TRUE');
       }
+      // Same "only one may hold it" handling is_default already gets, for the
+      // two migration 161 flags. Cleared HERE rather than left to the partial
+      // unique index, which would be correct and would surface as a 500 with a
+      // Postgres constraint name in it — ticking a box somewhere else is a
+      // choice, not an error.
+      if (data.is_reenquiry) {
+        await client.query('UPDATE lead_statuses SET is_reenquiry = FALSE WHERE is_reenquiry');
+      }
+      if (data.is_repeat_customer) {
+        await client.query('UPDATE lead_statuses SET is_repeat_customer = FALSE WHERE is_repeat_customer');
+      }
       const r = await client.query(
         `INSERT INTO lead_statuses
-           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ${SELECT_COLS}`,
+           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, is_closed, is_reenquiry, is_repeat_customer)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING ${SELECT_COLS}`,
         [data.name, data.color, data.bg_color, nextOrder, data.is_active, data.is_default,
-         data.needs_follow_up, data.converts_to_appointment, data.is_pipeline, data.logs_call ?? false, data.is_locked ?? false]
+         data.needs_follow_up, data.converts_to_appointment, data.is_pipeline, data.logs_call ?? false, data.is_locked ?? false, data.is_closed ?? false,
+         data.is_reenquiry ?? false, data.is_repeat_customer ?? false]
       );
       await client.query('COMMIT');
       getIO().emit('invalidate', { topic: 'lead_statuses' });
@@ -88,8 +109,28 @@ function updateStatus(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // ── The old name, before it is gone ──────────────────────────────────
+      //
+      // Read inside the transaction and FOR UPDATE, because the rename below
+      // depends on it and a value read a moment earlier is a value that may
+      // already have changed.
+      const before = await client.query(
+        `SELECT name FROM lead_statuses WHERE id = $1 FOR UPDATE`, [id]);
+      if (!before.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Status not found' });
+      }
+      const oldName = before.rows[0].name;
+
       if (data.is_default === true) {
         await client.query('UPDATE lead_statuses SET is_default = FALSE WHERE is_default = TRUE AND id != $1', [id]);
+      }
+      if (data.is_reenquiry === true) {
+        await client.query('UPDATE lead_statuses SET is_reenquiry = FALSE WHERE is_reenquiry AND id != $1', [id]);
+      }
+      if (data.is_repeat_customer === true) {
+        await client.query('UPDATE lead_statuses SET is_repeat_customer = FALSE WHERE is_repeat_customer AND id != $1', [id]);
       }
 
       const fields = []; const params = [];
@@ -102,9 +143,76 @@ function updateStatus(req, res, next) {
         params
       );
       if (!r.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Status not found' }); }
+
+      // ── Carry the rename to the leads that are wearing it ────────────────
+      //
+      // leads.status stores the NAME, not the id — migration 013 turned the
+      // enum into VARCHAR(100) and nothing has referenced this table by key
+      // since. So renaming a status here used to orphan every lead holding the
+      // old string, and orphan them SILENTLY:
+      //
+      //   the board column and colour are matched on the name → grey, unsorted
+      //   is_locked is matched on the name                    → editable again
+      //   is_closed is matched on the name (migration 156)    → and this is the
+      //     one that costs money. A status with no matching row is treated as
+      //     OPEN by design, so renaming "Lost" quietly resurrects every Lost
+      //     lead, and the next WhatsApp message from one of those customers is
+      //     filed onto the dead lead instead of starting a fresh one — the
+      //     exact failure migration 156 was written to prevent.
+      //
+      // Same transaction as the rename, necessarily: the two are one change,
+      // and a crash between them leaves precisely the broken state above.
+      //
+      // Compared case-sensitively and exactly, because that is how the value
+      // was written. Changing only the capitalisation is still a rename worth
+      // carrying, so the guard is on identity, not on a normalised compare.
+      let relabelled = 0;
+      if (data.name && data.name !== oldName) {
+        const moved = await client.query(
+          `UPDATE leads SET status = $2, updated_at = NOW() WHERE status = $1`,
+          [oldName, data.name]);
+        relabelled = moved.rowCount;
+
+        // ── And the history, which is the same name wearing a different hat ──
+        //
+        // Nothing in this schema stores a status ID. The name IS the key, so a
+        // history row left on the old spelling does not preserve what was true
+        // then — it splits one status into two in every report that groups on
+        // it. getStageStats does exactly that, and after a rename it would show
+        // "Lost" and "Lost Lead" as two separate stages with half the sample
+        // each.
+        //
+        // Scoped by `type`, and that is not optional. lead_activities.new_value
+        // holds a service name on service_added rows and a USER's name on
+        // assigned_changed rows — an unscoped rewrite of a status called
+        // "Priya" would quietly edit somebody's assignment history.
+        await client.query(
+          `UPDATE lead_activities SET new_value = $2
+            WHERE new_value = $1 AND type IN ('status_changed', 'created')`,
+          [oldName, data.name]);
+        await client.query(
+          `UPDATE lead_activities SET old_value = $2
+            WHERE old_value = $1 AND type = 'status_changed'`,
+          [oldName, data.name]);
+
+        // Follow-ups are found by lead_id, so this is cosmetic — but a
+        // follow-up card captioned with a status that no longer exists is the
+        // kind of small wrongness nobody reports and everybody notices.
+        await client.query(
+          `UPDATE lead_events SET status_name = $2 WHERE status_name = $1`,
+          [oldName, data.name]);
+
+        if (relabelled) {
+          console.log(`[lead_statuses] renamed "${oldName}" → "${data.name}", ` +
+                      `moved ${relabelled} lead(s) with it`);
+        }
+      }
+
       await client.query('COMMIT');
       getIO().emit('invalidate', { topic: 'lead_statuses' });
-      res.json({ item: r.rows[0] });
+      // Reported so the screen can say "renamed, 42 leads updated" rather than
+      // leaving somebody to wonder whether their leads came along.
+      res.json({ item: r.rows[0], leads_relabelled: relabelled });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;

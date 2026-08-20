@@ -77,6 +77,19 @@ async function getCompany(req, res) {
         document_config: resolveFullConfig(null),
       });
     }
+    // A hub login gets the identity block only.
+    //
+    // It needs this: on the hub's own sales invoice the company is the Bill To
+    // party, so the name, address and GSTIN belong on their screen — the PDF
+    // already prints them. It does NOT need document_config, which carries the
+    // company's bank details, nor the theme/logo settings it cannot change.
+    // Narrowing here rather than widening the route keeps the settings surface
+    // staff-only by default.
+    if (req.user?.hub_id) {
+      const { company_name, address_line1, address_line2, city, state, pincode, phone, email, gstin } = rows[0];
+      return res.json({ company_name, address_line1, address_line2, city, state, pincode, phone, email, gstin });
+    }
+
     // Always hand back a fully-resolved config for ALL THREE document types
     // (defaults merged in) so the settings UI can bind checkboxes directly
     // without null-checking every flag.
@@ -106,6 +119,74 @@ const documentConfigOnlySchema = z.object({
     .optional(),
   document_config: documentConfigSchema,
 });
+
+/**
+ * PUT /api/settings/advance-rate — the GST rate on advance receipts.
+ *
+ * ── WHY THIS IS NOT A FIELD ON PUT /company ────────────────────────────────
+ * That endpoint is gated on MANAGE_MASTER_DATA, which is held by whoever
+ * maintains services, locations and vehicles. This value is the tax rate
+ * PRINTED ON A CUSTOMER-FACING TAX DOCUMENT, and it belongs with the gateway
+ * settings for the same reason the security brief keeps refunds and credentials
+ * there: getting it wrong is a compliance problem, not a typo.
+ *
+ * Same shape as upsertDocumentConfig directly above — a narrow endpoint with
+ * its own permission, rather than widening a broad one.
+ *
+ * ── NULL IS A FEATURE, NOT AN EMPTY FIELD ──────────────────────────────────
+ * Setting it to NULL switches taking-payment-with-no-job off entirely: the
+ * endpoint refuses and the Take Payment button stops rendering
+ * (advances.service.accountCreditRate). That is a genuine kill switch and until
+ * now it could only be reached with SQL. So null is accepted explicitly rather
+ * than treated as "field omitted" — which is why the schema below distinguishes
+ * the two.
+ */
+const advanceRateSchema = z.object({
+  // .nullable() BEFORE .optional() matters: nullable alone would reject an
+  // absent key, and optional alone would reject an explicit null — and null is
+  // the case this endpoint exists to make reachable.
+  //
+  // The range mirrors the database constraint company_advance_rate_range
+  // (NULL OR between 0 and 100) so the two cannot drift apart.
+  advance_default_gst_rate: z.coerce.number().min(0).max(100).nullable().optional(),
+});
+
+async function upsertAdvanceRate(req, res) {
+  const parsed = advanceRateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(422).json({ error: parsed.error.errors[0]?.message || 'Validation error.' });
+  }
+  // `in` rather than a truthiness check: 0 is a legitimate rate (an exempt
+  // category) and null is the kill switch. Both are falsy.
+  if (!('advance_default_gst_rate' in parsed.data)) {
+    return res.status(422).json({ error: 'No rate supplied.' });
+  }
+  const rate = parsed.data.advance_default_gst_rate;
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE company_settings
+          SET advance_default_gst_rate = $1, updated_at = NOW()
+        WHERE id = 1
+      RETURNING advance_default_gst_rate`,
+      [rate]);
+    if (!rows[0]) return res.status(404).json({ error: 'Company settings not found.' });
+
+    const saved = rows[0].advance_default_gst_rate;
+    console.log(`[settings] advance GST rate set to ${saved === null ? 'NULL (feature off)' : saved + '%'}`
+      + ` by user ${req.user?.id}`);
+    res.json({
+      enabled: saved !== null && saved !== undefined,
+      gst_rate: saved === null || saved === undefined ? null : Number(saved),
+    });
+  } catch (err) {
+    // The CHECK constraint is the backstop if the Zod range is ever widened.
+    if (err.code === '23514') {
+      return res.status(422).json({ error: 'The rate must be between 0 and 100.' });
+    }
+    throw err;
+  }
+}
 
 async function upsertDocumentConfig(req, res) {
   const parsed = documentConfigOnlySchema.safeParse(req.body);
@@ -505,6 +586,10 @@ const SAMPLE_BASE = {
   po_number: 'PO-2026-0147', eway_bill_number: 'EWB-3417-8890',
   subtotal_ex_gst: 2350, total_gst: 332, grand_total: 2682,
   amount_paid: 1000, balance: 1682, party_balance: 4230,
+  // Part of amount_paid, not on top of it — 400 advance + 600 payments = 1000.
+  // Without a sample advance the theme picker shows the toggle having no effect
+  // while somebody is deciding whether to turn it on.
+  advance_applied: 400, advance_vouchers: 'ADV-2026-27-000042',
   rate_mode: 'tech_rate',
   notes: 'Vehicle collected after 6 PM.',
   created_at: new Date().toISOString(),
@@ -705,4 +790,5 @@ async function deleteLogo(req, res) {
   }
 }
 
-module.exports = { getCompany, upsertCompany, upsertDocumentConfig, listGstStates, uploadSignature, deleteSignature, getAlertSettings, upsertAlertSettings, uploadLogo, deleteLogo, previewInvoiceTheme, getBooksLock, upsertBooksLock };
+module.exports = {
+  upsertAdvanceRate, getCompany, upsertCompany, upsertDocumentConfig, listGstStates, uploadSignature, deleteSignature, getAlertSettings, upsertAlertSettings, uploadLogo, deleteLogo, previewInvoiceTheme, getBooksLock, upsertBooksLock };

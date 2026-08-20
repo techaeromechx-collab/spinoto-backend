@@ -4,7 +4,7 @@ const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
 
-const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
+const { requireAuth, requirePermission, requirePermissionOrHub, requireSuperAdmin } = require('../middleware/auth.middleware');
 const {
   listHubs,
   getHub,
@@ -18,6 +18,8 @@ const {
   saveHubServices,
   createHubLogin,
   deleteHubLogin,
+  resetHubLoginPassword,
+  updateOwnHubProfile,
   getHubLogin,
   listHubLogins,
 } = require('../controllers/hubs.controller');
@@ -73,6 +75,16 @@ router.get('/',    requireAuth, requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS'
 // ── HUB LOGIN (list all) — static route, must be before /:id ─────────────────
 router.get('/logins',       requireAuth, requirePermission('EDIT_HUB', 'MANAGE_HUBS'), listHubLogins);
 
+// ── HUB SELF-SERVICE — also static, also before /:id ─────────────────────────
+// Literally '/me', so it MUST sit above '/:id' or Express matches it as an id
+// and idParam.parse('me') throws a 400 on a perfectly valid request — the same
+// reason '/logins' is up here.
+//
+// No permission gate: the controller refuses any session without a hub_id.
+// This is about WHO you are, not what you may do — a hub login can carry codes
+// like CREATE_INVOICE, and a staff member has no "own hub" to update.
+router.patch('/me', requireAuth, updateOwnHubProfile);
+
 router.get('/:id', requireAuth, requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS'), getHub);
 
 router.post('/',            requireAuth, requirePermission('CREATE_HUB',   'MANAGE_HUBS'), createHub);
@@ -89,9 +101,22 @@ router.put('/:id/services', requireAuth, requirePermission('EDIT_HUB', 'MANAGE_H
 
 // ── HUB LOGIN (per hub) ───────────────────────────────────────────────────────
 
-router.get('/:id/login',    requireAuth, requirePermission('EDIT_HUB', 'MANAGE_HUBS'), getHubLogin);
-router.post('/:id/login',   requireAuth, requirePermission('EDIT_HUB', 'MANAGE_HUBS'), createHubLogin);
-router.delete('/:id/login', requireAuth, requirePermission('EDIT_HUB', 'MANAGE_HUBS'), deleteHubLogin);
+// requireSuperAdmin, not requirePermission. These four already demanded
+// is_super_admin INSIDE the controller while the route let EDIT_HUB through, so
+// a manager with MANAGE_HUBS passed the door and got a 403 from the room — a
+// button that rendered and then failed. The gate is now the route's job alone,
+// which is also what lets the UI hide the section from someone who cannot use
+// it. Behaviour for callers is unchanged; only where the refusal happens moved.
+//
+// GET '/logins' above deliberately keeps the wider gate: it is a read, and the
+// Users screen's Hubs tab uses it for anyone who administers hubs.
+router.get('/:id/login',    requireAuth, requireSuperAdmin, getHubLogin);
+router.post('/:id/login',   requireAuth, requireSuperAdmin, createHubLogin);
+// Reset an existing login's password. Before this the only way to change a hub
+// password was delete-and-recreate, which also dropped that user's permission
+// rows and locked the hub out entirely if the email was retyped wrong.
+router.patch('/:id/login',  requireAuth, requireSuperAdmin, resetHubLoginPassword);
+router.delete('/:id/login', requireAuth, requireSuperAdmin, deleteHubLogin);
 
 // ── HUB DOCUMENTS ─────────────────────────────────────────────────────────────
 

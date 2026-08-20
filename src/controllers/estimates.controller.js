@@ -17,8 +17,11 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
+const { applyItemApprovals } = require('../services/estimateApproval.service');
 const { getRoundingFunction } = require('../utils/math');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
+const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
 const { logActivity } = require('../services/activityLog.service');
 const { getIO } = require('../socket');
 
@@ -232,7 +235,7 @@ async function loadEstimateDateContext(db, id) {
             ci.id                          AS ci_id,
             ci.invoice_date::text          AS ci_invoice_date,
             ci.status                      AS ci_status,
-            (SELECT COUNT(*)::int FROM customer_invoice_payments p
+            (SELECT COUNT(*)::int FROM invoice_payment_lines p
               WHERE p.customer_invoice_id = ci.id)  AS ci_payment_count
        FROM estimates e
        LEFT JOIN appointments a       ON a.id = e.appointment_id
@@ -323,6 +326,8 @@ function estimateDatePreflight(req, res, next) {
     const newDate = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'estimate_date must be YYYY-MM-DD')
       .parse(req.query.estimate_date);
 
+    await _assertEstimateHub(req, id);
+
     const ctx = await loadEstimateDateContext(pool, id);
     if (!ctx) return res.status(404).json({ error: 'Estimate not found' });
 
@@ -371,6 +376,8 @@ function updateEstimateDate(req, res, next) {
       override: z.coerce.boolean().optional().default(false),
       cascade: z.coerce.boolean().optional().default(true),
     }).parse(req.body);
+
+    await _assertEstimateHub(req, id);
 
     const client = await pool.connect();
     try {
@@ -527,6 +534,24 @@ function handle(req, res, next, fn) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Hub tenancy guard for the estimate write paths.
+ *
+ * Load-bearing, not defence in depth: every estimate mutation route is gated
+ * with requirePermissionOrHub (estimates.routes.js), and that middleware waves
+ * through any hub login holding zero permissions. Without this check such a
+ * login could PATCH, submit, revise, company-approve or set work status on ANY
+ * estimate in the system, not just its own hub's.
+ *
+ * Costs one extra round trip, and only on hub-portal requests — for staff and
+ * super admins it returns immediately.
+ */
+async function _assertEstimateHub(req, id, db = pool) {
+  if (!req.user?.hub_id) return;
+  const r = await db.query(`SELECT hub_id FROM estimates WHERE id = $1`, [id]);
+  assertHubOwns(req, r.rows[0], 'hub_id', 'Estimate');
+}
 
 function computeItem(data, roundFn = parseFloat) {
   const qty    = Number(data.quantity)      || 1;
@@ -760,6 +785,13 @@ const EST_SELECT = `
     (SELECT ci.status FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_status,
     (SELECT ci.grand_total FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1) AS customer_invoice_total,
 
+    -- Advances already taken against this job, before any invoice exists.
+    -- Drives both the "₹2,000 taken" label on the button and the ceiling in the
+    -- modal — the figure has to come from the same place the server validates
+    -- against, or staff are offered an amount that will then be refused.
+    (SELECT COALESCE(SUM(p.amount), 0) FROM customer_invoice_payments p
+      WHERE p.estimate_id = e.id AND p.payment_type = 'advance') AS advanced_total,
+
     -- Linked purchase invoice (id + status, so UI can gate CI generation)
     (SELECT pi.id     FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_id,
     (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = e.id ORDER BY pi.id DESC LIMIT 1) AS purchase_invoice_token,
@@ -796,21 +828,31 @@ function listEstimates(req, res, next) {
     const params     = [];
 
     // ── User scoping ──────────────────────────────────────────────────────────
-    // Super admins and VIEW_ESTIMATE users see all. Others see only their own.
+    // Hub-portal logins are pinned to their own hub, checked BEFORE the
+    // permission tiers so that granting a hub user VIEW_ESTIMATE widens them
+    // within their hub instead of across every hub. Without this branch a hub
+    // login saw only estimates it had typed itself (created_by), never the rest
+    // of its hub's work.
+    // Then: super admins and VIEW_ESTIMATE users see all; everyone else sees
+    // only their own.
+    const hubScope = hubScopeSql(req, params, 'e.hub_id');
     const isAll = req.user.is_super_admin || req.user.permissions.has('VIEW_ESTIMATE');
-    if (!isAll) {
+    if (hubScope) {
+      conditions.push(hubScope);
+    } else if (!isAll) {
       params.push(req.user.id);
       conditions.push(`e.created_by = $${params.length}`);
     }
 
     if (appointmentId) { params.push(Number(appointmentId)); conditions.push(`e.appointment_id = $${params.length}`); }
-    if (hubIds) {
+    // Skipped for hub logins — hubScope already pinned the hub above.
+    if (!hubScope && hubIds) {
       const ids = hubIds.split(',').map(Number).filter(n => !isNaN(n));
       if (ids.length > 0) {
         params.push(ids);
         conditions.push(`e.hub_id = ANY($${params.length}::int[])`);
       }
-    } else if (hubId) {
+    } else if (!hubScope && hubId) {
       params.push(Number(hubId));
       conditions.push(`e.hub_id = $${params.length}`);
     }
@@ -880,6 +922,10 @@ function getEstimate(req, res, next) {
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     if (!row.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const estimate = row.rows[0];
+    // Scoping the list is not enough on its own — a hub login could otherwise
+    // read any estimate by walking ids. Also covers /by-token/:token, which
+    // resolves the token then delegates here.
+    assertHubOwns(req, estimate, 'hub_id', 'Estimate');
     estimate.items = await _getItems(id);
     return res.json({ item: estimate });
   });
@@ -902,6 +948,7 @@ function getEstimatePdf(req, res, next) {
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     if (!row.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const estimate = row.rows[0];
+    assertHubOwns(req, estimate, 'hub_id', 'Estimate');
     estimate.items = await _getItems(id);
 
     const company = await loadCompany();
@@ -938,6 +985,14 @@ function createEstimate(req, res, next) {
   handle(req, res, next, async () => {
     const data = createSchema.parse(req.body);
     const isStandalone = !data.appointment_id;
+
+    // A hub login may only raise estimates against its own hub. POST /estimates
+    // is gated with requirePermissionOrHub, so without this a zero-permission
+    // hub user could put work on another hub's books. Mirrors the identical
+    // guard in purchase_invoices.controller.js#generatePurchaseInvoice.
+    if (req.user?.hub_id && Number(data.hub_id) !== Number(req.user.hub_id)) {
+      return res.status(403).json({ error: 'You can only create estimates for your own hub' });
+    }
 
     // Mobile used for the "save B2B details to profile" lookup — either the
     // linked appointment's mobile, or the standalone estimate's own mobile.
@@ -1101,6 +1156,45 @@ function createEstimate(req, res, next) {
       // (public_token) even if no customer_profiles row is ever created.
       await ensureCustomerIdentity(client, profileMobile);
 
+      // Remember the vehicle so the NEXT estimate for this customer prefills.
+      //
+      // Standalone estimates carry their own vehicle columns and nothing else
+      // wrote them to customer_vehicles, so a hub raising a direct estimate had
+      // to retype the same car on every visit — and hubs have no vehicle-write
+      // endpoint (POST /customers/:mobile/vehicles is staff-only), so this is
+      // the only place it can happen for them.
+      //
+      // ON CONFLICT DO NOTHING against the (mobile, vehicle_number) unique
+      // constraint: never overwrite. If your staff have already recorded this
+      // car with a colour, year or notes, an estimate must not flatten that.
+      //
+      // Normalisation is trim + uppercase and nothing more, deliberately: that
+      // is exactly what addCustomerVehicle does, and writing a differently
+      // normalised string here would defeat the unique constraint and give one
+      // car two rows. (The system does still treat "GJ 01 AB 1234" and
+      // "GJ01AB1234" as different plates on write — a pre-existing wrinkle.
+      // The customer lookup strips punctuation when matching, so it finds
+      // either form; only the write side is strict.)
+      if (isStandalone && profileMobile && data.vehicle_number) {
+        const plate = String(data.vehicle_number).trim().toUpperCase();
+        if (plate) {
+          await client.query(
+            `INSERT INTO customer_vehicles
+               (mobile, vehicle_number, vehicle_type_id, make_id, model_id, segment_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (mobile, vehicle_number) DO NOTHING`,
+            [
+              profileMobile,
+              plate,
+              data.vehicle_type_id || null,
+              data.make_id         || null,
+              data.model_id        || null,
+              Array.isArray(data.segment_ids) ? (data.segment_ids[0] ?? null) : null,
+            ]
+          );
+        }
+      }
+
       if (data.is_b2b && data.save_b2b_to_profile) {
         await _saveB2bProfileDefault(client, profileMobile, {
           companyName: data.b2b_company_name,
@@ -1193,6 +1287,10 @@ function updateEstimate(req, res, next) {
 
     const cur = await pool.query(`SELECT id, status, created_at, appointment_id, mobile, hub_id, warranty_claim_id FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
+    // The row already carries hub_id, so no extra round trip is needed here.
+    // Note this also blocks a hub login from reassigning an estimate to another
+    // hub: the guard runs on the CURRENT owner before data.hub_id is applied.
+    assertHubOwns(req, cur.rows[0], 'hub_id', 'Estimate');
 
     const { status, created_at, appointment_id, mobile: standaloneMobile, hub_id: currentHubId, warranty_claim_id: claimId } = cur.rows[0];
     const roundFn = getRoundingFunction(created_at);
@@ -1639,6 +1737,8 @@ function submitEstimate(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
 
+    await _assertEstimateHub(req, id);
+
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
@@ -1681,6 +1781,8 @@ function companyApprove(req, res, next) {
   handle(req, res, next, async () => {
     const id = idParam.parse(req.params.id);
 
+    await _assertEstimateHub(req, id);
+
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
@@ -1704,6 +1806,34 @@ function companyApprove(req, res, next) {
     // Auto-advance appointment status
     await advanceAppointmentStatus(estimate.appointment_id, 'estimate-approved');
 
+    // ── Tell the customer their estimate is ready ──────────────────────────
+    //
+    // HERE, not on submit. Submitting sets 'pending_company_review' — the hub
+    // has proposed a price and Spinoto has not checked it. Messaging then would
+    // send the customer a figure nobody approved, and link them to a page that
+    // correctly refuses to show an unreviewed estimate. This endpoint is where
+    // the estimate literally becomes 'sent_to_customer'.
+    //
+    // Fired directly rather than through advanceAppointmentStatus, and with
+    // entityType 'estimate' — the same pattern invoice_ready already uses.
+    // A status-triggered send always loads the APPOINTMENT context, which has
+    // no grand_total and no estimate token, so estimate_amount and
+    // estimate_link would both come back undefined and the dispatcher would
+    // refuse to queue. That is why this template never sent.
+    //
+    // Which template(s) fire is the 'estimate.sent' automation rows
+    // (Settings → WhatsApp → Automations, migration 151).
+    // fireWhatsAppEventDetached owns the connection, transaction and logging;
+    // failures are swallowed there — a messaging problem must not make an
+    // approved estimate look unapproved.
+    await fireWhatsAppEventDetached(pool, {
+      event: 'estimate.sent',
+      entityId: id,
+      // An estimate is sent to the customer once. A retried request that
+      // reached here twice produces one message.
+      dedupeKey: `sent:${id}`,
+    });
+
     return res.json({ item: estimate });
   });
 }
@@ -1715,6 +1845,8 @@ function companyRevise(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
     const data = companyReviseSchema.parse(req.body);
+
+    await _assertEstimateHub(req, id);
 
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
@@ -1754,6 +1886,8 @@ function customerApproval(req, res, next) {
     const id   = idParam.parse(req.params.id);
     const data = customerApprovalSchema.parse(req.body);
 
+    await _assertEstimateHub(req, id);
+
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
@@ -1768,55 +1902,13 @@ function customerApproval(req, res, next) {
     try {
       await client.query('BEGIN');
 
-      for (const { item_id, approved } of data.approvals) {
-        await client.query(
-          `UPDATE estimate_items
-           SET customer_approved = $1, updated_at = NOW()
-           WHERE id = $2 AND estimate_id = $3`,
-          [approved, item_id, id]
-        );
-      }
-
-      // Reset work_status to 'pending' for all approved items (handles re-approval)
-      await client.query(
-        `UPDATE estimate_items SET work_status = 'pending' WHERE estimate_id = $1 AND customer_approved = true`,
-        [id]
-      );
-
-      // Determine new status based on all items
-      const itemStats = await client.query(
-        `SELECT
-           COUNT(*)::int                                           AS total,
-           COUNT(*) FILTER (WHERE customer_approved = TRUE)::int  AS approved_count,
-           COUNT(*) FILTER (WHERE customer_approved = FALSE)::int AS rejected_count,
-           COUNT(*) FILTER (WHERE customer_approved IS NULL)::int AS pending_count
-         FROM estimate_items
-         WHERE estimate_id = $1`,
-        [id]
-      );
-
-      const { total, approved_count, rejected_count } = itemStats.rows[0];
-
-      const currentStatus = cur.rows[0].status;
-      let newStatus;
-      if (['work_in_progress', 'work_completed'].includes(currentStatus)) {
-        newStatus = currentStatus;
-      } else if (approved_count === total) {
-        newStatus = 'fully_approved';
-      } else if (approved_count > 0) {
-        newStatus = 'partially_approved';
-      } else if (rejected_count === total) {
-        // All rejected — send back for revision
-        newStatus = 'revision_requested';
-      } else {
-        // Some still pending — stay in sent_to_customer
-        newStatus = 'sent_to_customer';
-      }
-
-      await client.query(
-        `UPDATE estimates SET status = $1, updated_at = NOW() WHERE id = $2`,
-        [newStatus, id]
-      );
+      // The per-item write, the work_status reset and the status derivation all
+      // moved to services/estimateApproval.service.js. Not for tidiness: the
+      // customer's own approval link now runs the SAME function, so an estimate
+      // ends up in identical state whether an advisor ticked the boxes here or
+      // the customer did it from their phone. Two implementations of "what do
+      // these items make this estimate" is how those two views drift apart.
+      await applyItemApprovals(client, id, data.approvals);
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1844,6 +1936,8 @@ function updateItemWorkStatus(req, res, next) {
     const { work_status } = z.object({
       work_status: z.enum(['pending', 'in_progress', 'completed']),
     }).parse(req.body);
+
+    await _assertEstimateHub(req, estimateId);
 
     // Validate item belongs to this estimate and is customer_approved
     const itemRow = await pool.query(

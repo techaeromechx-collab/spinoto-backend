@@ -24,6 +24,9 @@ router.get('/calls/summary', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_T
 router.get ('/',     requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.listLeads);
 router.post('/',    requireAuth, requirePermission('CREATE_LEAD'), c.createLead);
 router.post('/bulk-assign',  requireAuth, requirePermission('EDIT_LEAD'),   c.bulkAssign);
+// Same permission as a single status change (PATCH /:id below) — doing it to
+// fifty leads at once is the same act, not a more privileged one.
+router.post('/bulk-status',  requireAuth, requirePermission('EDIT_LEAD'),   c.bulkStatus);
 router.post('/bulk-delete',  requireAuth, requirePermission('DELETE_LEAD'), c.bulkDelete);
 // by-token — resolves a shareable-URL token to a lead; must be before /:id
 router.get ('/by-token/:token', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.getLeadByToken);

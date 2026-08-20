@@ -20,6 +20,172 @@ function handle(req, res, next, fn) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customers/lookup?q=  — customer picker for the estimate wizard
+//
+// Deliberately NOT listCustomers with a different filter. That one runs a
+// five-source UNION and returns spend totals, appointment counts and last
+// activity — the right data for the Customers screen, the wrong data (and far
+// too expensive) for a type-ahead that only needs a name and a car.
+//
+// TWO MODES, and the difference is the whole security model:
+//
+//   staff/admin — partial match on name, mobile or vehicle number. Same
+//                 behaviour the wizard has always had.
+//   hub portal  — EXACT match on mobile or vehicle number only. Never name.
+//
+// Why exact-match rather than restricting hubs to their own customers: a
+// customer who was first served by another hub would otherwise look brand new,
+// so the hub retypes the mobile by hand — and one wrong digit silently creates
+// a second customer that nothing in this system can merge back. Forcing the
+// full number removes the typing, and a hub still cannot browse: there is
+// nothing to enumerate when a nine-digit prefix returns nothing. Rate limited
+// at the route as a second line of defence.
+//
+// The response is deliberately thin: mobile, name, whatsapp, vehicles. No
+// spend, no visit history, and above all no indication of WHICH hub has served
+// this customer before.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Digits only — how mobiles are compared everywhere else in this file.
+const digitsOnly = v => String(v || '').replace(/\D/g, '');
+// Plates get typed with and without spaces ("GJ01AB1234" vs "GJ 01 AB 1234"),
+// so both sides are stripped before comparing. Mirrors the normalisation
+// addCustomerVehicle already applies on write.
+const plateKey   = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function lookupCustomers(req, res, next) {
+  handle(req, res, next, async () => {
+    const q = String(req.query.q || '').trim();
+    const isHub = Boolean(req.user?.hub_id);
+
+    // Below this there is nothing worth matching, and for hubs a short string
+    // is exactly the enumeration attempt we refuse to serve.
+    if (q.length < (isHub ? 4 : 2)) return res.json({ items: [], mode: isHub ? 'exact' : 'partial' });
+
+    const digits = digitsOnly(q);
+    const plate  = plateKey(q);
+
+    let where, params;
+    if (isHub) {
+      // An Indian mobile is 10 digits; accept a 12-digit form with the 91
+      // country code too, since that is what a pasted WhatsApp number looks
+      // like. Anything shorter is not a complete number and must not match.
+      const fullMobile = digits.length === 10 ? digits
+                       : digits.length === 12 && digits.startsWith('91') ? digits.slice(2)
+                       : null;
+      // A registration must contain BOTH letters and a run of digits.
+      //
+      // "has letters" alone is not enough: "Rajesh Kumar" strips to
+      // RAJESHKUMAR, which is 11 characters of letters, and would have been
+      // accepted as a plate — handing hubs the name search this whole design
+      // exists to deny them. Requiring digits excludes every name, and
+      // requiring letters excludes a partially-typed mobile number.
+      // Every Indian format (GJ01AB1234, GJ1A1234, 22BH1234A) satisfies both.
+      const fullPlate  = /[A-Z]/.test(plate) && /\d{4}/.test(plate) && plate.length >= 6 && plate.length <= 12
+        ? plate : null;
+
+      if (!fullMobile && !fullPlate) {
+        return res.json({ items: [], mode: 'exact', reason: 'incomplete' });
+      }
+      params = [fullMobile, fullPlate];
+      where  = `(
+        ($1::text IS NOT NULL AND regexp_replace(src.mobile, '\D', '', 'g') = $1)
+        OR
+        ($2::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM customer_vehicles cv
+           WHERE cv.mobile = src.mobile
+             AND UPPER(regexp_replace(cv.vehicle_number, '[^A-Za-z0-9]', '', 'g')) = $2
+        ))
+        OR
+        ($2::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM appointments a
+           WHERE a.mobile = src.mobile
+             AND UPPER(regexp_replace(COALESCE(a.vehicle_number,''), '[^A-Za-z0-9]', '', 'g')) = $2
+        ))
+      )`;
+    } else {
+      params = [`%${q.toLowerCase()}%`, plate ? `%${plate}%` : null];
+      where  = `(
+        LOWER(COALESCE(src.customer_name,'')) LIKE $1
+        OR src.mobile LIKE $1
+        OR ($2::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM customer_vehicles cv
+           WHERE cv.mobile = src.mobile
+             AND UPPER(regexp_replace(cv.vehicle_number, '[^A-Za-z0-9]', '', 'g')) LIKE $2
+        ))
+      )`;
+    }
+
+    // Candidate mobiles come from the same places a customer can first appear.
+    // customer_vehicles is included so a plate search still finds someone whose
+    // only record is the car.
+    const r = await pool.query(`
+      WITH src AS (
+        SELECT DISTINCT mobile FROM appointments        WHERE mobile IS NOT NULL
+        UNION SELECT DISTINCT mobile FROM estimates     WHERE mobile IS NOT NULL AND appointment_id IS NULL
+        UNION SELECT DISTINCT mobile FROM customer_invoices WHERE mobile IS NOT NULL
+        UNION SELECT DISTINCT mobile FROM customer_profiles WHERE NOT COALESCE(is_deleted, FALSE)
+        UNION SELECT DISTINCT mobile FROM customer_vehicles
+      )
+      SELECT
+        src.mobile,
+        -- Same name rule getCustomer uses: the profile name your staff set is
+        -- authoritative, otherwise the earliest name anyone recorded. Keeping
+        -- these two in step is what stops the picker showing one name and the
+        -- customer page another.
+        COALESCE(
+          (SELECT NULLIF(TRIM(cp.display_name), '') FROM customer_profiles cp
+            WHERE cp.mobile = src.mobile AND NOT COALESCE(cp.is_deleted, FALSE)),
+          (SELECT customer_name FROM (
+             SELECT customer_name, created_at FROM appointments WHERE mobile = src.mobile AND customer_name IS NOT NULL
+             UNION ALL
+             SELECT customer_name, created_at FROM estimates    WHERE mobile = src.mobile AND appointment_id IS NULL AND customer_name IS NOT NULL
+             UNION ALL
+             SELECT customer_name, created_at FROM customer_invoices WHERE mobile = src.mobile AND customer_name IS NOT NULL
+           ) n ORDER BY created_at ASC LIMIT 1)
+        ) AS customer_name,
+        (SELECT whatsapp FROM (
+           SELECT whatsapp, created_at FROM appointments WHERE mobile = src.mobile AND whatsapp IS NOT NULL
+           UNION ALL
+           SELECT whatsapp, created_at FROM estimates    WHERE mobile = src.mobile AND appointment_id IS NULL AND whatsapp IS NOT NULL
+         ) wa ORDER BY created_at ASC LIMIT 1) AS whatsapp
+      FROM src
+      WHERE ${where}
+      ORDER BY src.mobile
+      LIMIT 8
+    `, params);
+
+    // Vehicles for the matches, in one round trip rather than one per row.
+    const mobiles = r.rows.map(x => x.mobile);
+    let byMobile = {};
+    if (mobiles.length) {
+      const v = await pool.query(`
+        SELECT cv.mobile, cv.id, cv.vehicle_number, cv.color, cv.year,
+               cv.vehicle_type_id, vt.name AS vehicle_type_name,
+               cv.make_id,  mk.name AS make_name,
+               cv.model_id, md.name AS model_name,
+               COALESCE(cv.segment_id, md.segment_id) AS segment_id, seg.name AS segment_name,
+               bt.id AS body_type_id, bt.name AS body_type_name
+          FROM customer_vehicles cv
+          LEFT JOIN vehicle_types  vt  ON vt.id  = cv.vehicle_type_id
+          LEFT JOIN vehicle_makes  mk  ON mk.id  = cv.make_id
+          LEFT JOIN vehicle_models md  ON md.id  = cv.model_id
+          LEFT JOIN segments       seg ON seg.id = COALESCE(cv.segment_id, md.segment_id)
+          LEFT JOIN body_types     bt  ON bt.id  = md.body_type_id
+         WHERE cv.mobile = ANY($1::text[])
+         ORDER BY cv.created_at DESC
+      `, [mobiles]);
+      for (const row of v.rows) (byMobile[row.mobile] ||= []).push(row);
+    }
+
+    res.json({
+      mode: isHub ? 'exact' : 'partial',
+      items: r.rows.map(row => ({ ...row, vehicles: byMobile[row.mobile] || [] })),
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/customers — Unique customers (grouped by mobile from appointments OR invoices)
 // Fix #8: include invoice-only customers; Fix #11: use FIRST name seen not MAX
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +364,25 @@ function listCustomers(req, res, next) {
 // GET /api/customers/:mobile. Kept as a thin wrapper — the response still
 // includes `mobile`, which is fine since it's authenticated JSON, not a URL.
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Attaches the newest odometer reading to each vehicle.
+ *
+ * Kept out of the vehicle merge itself because that merge builds its map from
+ * four different sources in sequence, and threading a fifth lookup through all
+ * of them would mean four chances to attach the wrong plate's reading.
+ * One pass, one normalisation rule, applied last.
+ */
+function withOdometer(vehicles, odoRows) {
+  if (!odoRows || !odoRows.length) return vehicles;
+  const byPlate = new Map(odoRows.map(r => [r.plate, r.odometer_km]));
+  return vehicles.map(v => ({
+    ...v,
+    last_odometer_km: v.vehicle_number
+      ? (byPlate.get(v.vehicle_number.toUpperCase().replace(/\s/g, '')) ?? null)
+      : null,
+  }));
+}
+
 function getCustomerByToken(req, res, next) {
   handle(req, res, next, async () => {
     const r = await pool.query(
@@ -214,7 +399,7 @@ function getCustomer(req, res, next) {
   handle(req, res, next, async () => {
     const mobile = req.params.mobile;
 
-    const [apptsRes, invoicesRes, standaloneEstRes] = await Promise.all([
+    const [apptsRes, invoicesRes, standaloneEstRes, odoRes] = await Promise.all([
       pool.query(`
         SELECT
           a.id, a.public_token, a.lead_id, a.customer_name, a.mobile, a.whatsapp,
@@ -289,12 +474,26 @@ function getCustomer(req, res, next) {
         LIMIT 30
       `, [mobile]),
 
-      // Standalone estimates — no appointment exists yet (or ever will), so
-      // this is the only place these customers' vehicle/estimate context
-      // lives until a Customer Invoice is eventually generated.
+      // EVERY estimate this customer has, not just the standalone ones.
+      //
+      // This used to carry `AND e.appointment_id IS NULL`, on the reasoning
+      // that an appointment-linked estimate already had a home in the
+      // Appointments tab. It does not: the appointments query above selects no
+      // estimate columns at all, and the invoices query only reaches an
+      // estimate that has already BECOME an invoice. So a job that was quoted
+      // and not yet billed — exactly the state worth chasing — appeared nowhere
+      // on this page, while the tab counted "1" and read as a complete list.
+      //
+      // Each row now says what it belongs to instead of being filtered on it:
+      // customer_invoice_id where the job was billed (migration 075 makes that
+      // at most one, so the scalar is safe), and appointment_id where it came
+      // from a visit. Neither set means the estimate should be hidden.
       pool.query(`
         SELECT
           e.id, e.public_token, e.status, e.grand_total, e.notes, e.created_at, e.updated_at,
+          e.appointment_id,
+          (SELECT ci.id FROM customer_invoices ci WHERE ci.estimate_id = e.id LIMIT 1)
+            AS customer_invoice_id,
           e.estimate_date::text AS estimate_date,
           e.original_estimate_date::text AS original_estimate_date,
           e.customer_name, e.mobile, e.whatsapp, e.vehicle_number,
@@ -312,9 +511,53 @@ function getCustomer(req, res, next) {
         LEFT JOIN vehicle_models md ON md.id = e.model_id
         LEFT JOIN body_types     bt ON bt.id = e.body_type_id
         LEFT JOIN cc_categories  cc ON cc.id = e.cc_category_id
-        WHERE e.mobile = $1 AND e.appointment_id IS NULL
+        WHERE e.mobile = $1
         ORDER BY e.estimate_date DESC, e.id DESC
-        LIMIT 30
+        -- Raised from 30. That cap was invisible: with only standalone
+        -- estimates listed it was never reached, and now that every estimate
+        -- appears a long-standing customer would silently lose the oldest
+        -- ones with nothing on screen admitting it.
+        LIMIT 200
+      `, [mobile]),
+
+      // ── The latest odometer reading per vehicle ─────────────────────────
+      //
+      // odometer_km lives on appointments, estimates and customer_invoices
+      // (migration 088) and NOT on customer_vehicles, so the reading shown on a
+      // vehicle card is the newest one off that plate's most recent job.
+      //
+      // Derived rather than stored, on purpose. A column on customer_vehicles
+      // would have to be written by every path that records a reading, and the
+      // day one of them forgets, the profile shows a number lower than the
+      // invoice printed last week — with nothing on screen to say which is the
+      // wrong one.
+      //
+      // DISTINCT ON takes the first row per plate under the ORDER BY, which is
+      // the newest. The plate is normalised the way the vehicle merge below
+      // normalises it — upper-cased, whitespace stripped — because matching the
+      // raw string would miss "GJ01 AB1234" against "GJ01AB1234".
+      pool.query(`
+        SELECT DISTINCT ON (plate) plate, odometer_km
+          FROM (
+            SELECT UPPER(REGEXP_REPLACE(vehicle_number, '\s', '', 'g')) AS plate,
+                   odometer_km,
+                   COALESCE(scheduled_date::timestamptz, created_at) AS seen_at
+              FROM appointments
+             WHERE mobile = $1 AND vehicle_number IS NOT NULL AND odometer_km IS NOT NULL
+            UNION ALL
+            SELECT UPPER(REGEXP_REPLACE(vehicle_number, '\s', '', 'g')),
+                   odometer_km,
+                   COALESCE(invoice_date::timestamptz, created_at)
+              FROM customer_invoices
+             WHERE mobile = $1 AND vehicle_number IS NOT NULL AND odometer_km IS NOT NULL
+            UNION ALL
+            SELECT UPPER(REGEXP_REPLACE(vehicle_number, '\s', '', 'g')),
+                   odometer_km,
+                   COALESCE(estimate_date::timestamptz, created_at)
+              FROM estimates
+             WHERE mobile = $1 AND vehicle_number IS NOT NULL AND odometer_km IS NOT NULL
+          ) x
+         ORDER BY plate, seen_at DESC NULLS LAST
       `, [mobile]),
 
     ]);
@@ -546,7 +789,7 @@ function getCustomer(req, res, next) {
         total_outstanding:   totalOutstanding,
         avg_spend:           avgSpend,
         last_visit:          lastVisit,
-        vehicles:            [...vehicleMap.values()],
+        vehicles:            withOdometer([...vehicleMap.values()], odoRes.rows),
         appointments:        appts,
         invoices,
         // Standalone estimates (no appointment) — surfaced separately so the
@@ -1065,7 +1308,8 @@ function getCustomerTimeline(req, res, next) {
 }
 
 module.exports = {
-  listCustomers, getCustomer, updateCustomer, deleteCustomer,
+  listCustomers,
+  lookupCustomers, getCustomer, updateCustomer, deleteCustomer,
   listCustomerVehicles, addCustomerVehicle, updateCustomerVehicle, deleteCustomerVehicle,
   getCustomerTimeline, getVehicleUsage, getCustomerByToken,
 };

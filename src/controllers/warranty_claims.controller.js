@@ -136,7 +136,7 @@ async function loadClaimContext(ciItemId) {
        ci.id AS ci_id, ci.status AS ci_status, ci.hub_id, ci.appointment_id, ci.estimate_id,
        ci.customer_name, ci.mobile, ci.vehicle_number, ci.odometer_km AS service_odometer_km,
          COALESCE(
-         (SELECT MAX(p.paid_at)::date FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id),
+         (SELECT MAX(p.paid_at)::date FROM invoice_payment_lines p WHERE p.customer_invoice_id = ci.id),
          -- Falls back to the invoice's own date, not created_at. On a
          -- backdated invoice the backdated date IS the claim about when the
          -- work was done, so that is when the warranty clock should start —
@@ -221,7 +221,7 @@ function eligibleItems(req, res, next) {
          ci.id AS customer_invoice_id, ci.customer_name, ci.mobile, ci.vehicle_number,
          ci.hub_id, h.hub_name, ci.odometer_km AS service_odometer_km,
          COALESCE(
-           (SELECT MAX(p.paid_at)::date FROM customer_invoice_payments p WHERE p.customer_invoice_id = ci.id),
+           (SELECT MAX(p.paid_at)::date FROM invoice_payment_lines p WHERE p.customer_invoice_id = ci.id),
            -- Falls back to the invoice's own date, not created_at. On a
            -- backdated invoice the backdated date IS the claim about when the
            -- work was done, so that is when the warranty clock should start —

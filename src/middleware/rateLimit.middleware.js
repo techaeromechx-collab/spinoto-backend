@@ -26,11 +26,32 @@ function sweep(now, windowMs) {
   }
 }
 
+/**
+ * The address a rate-limit bucket is keyed on.
+ *
+ * ⚠ X-Forwarded-For IS ATTACKER-CONTROLLED unless a trusted proxy set it.
+ *
+ * This used to read that header unconditionally, with a comment saying "trust
+ * proxy is not assumed" — which had it exactly backwards. Reading the header
+ * without configuring trust proxy is the one combination that is never safe:
+ * anyone can send a different random value on every request, land in a fresh
+ * bucket each time, and never hit any limit. That defeated the 10-orders-per-15
+ * minutes guard on the public pay endpoint, which exists specifically to stop
+ * someone running a stolen-card list through the company's live merchant
+ * account — as well as the OTP limiter and the PDF-render limiter.
+ *
+ * Express already solves this properly: with `app.set('trust proxy', …)`
+ * configured to match the actual hop count, `req.ip` is the left-most address
+ * the trusted chain vouches for and forged entries beyond it are discarded.
+ * So the header is no longer read here at all — `req.ip` is the answer, and it
+ * is correct in both deployments:
+ *
+ *   behind a proxy   → server.js sets trust proxy, req.ip is the real client
+ *   directly exposed → trust proxy is off, req.ip is the socket address, and a
+ *                      forged header is ignored rather than believed
+ */
 function clientIp(req) {
-  // trust proxy is not assumed — fall back through the usual suspects.
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
-  return req.ip || req.connection?.remoteAddress || 'unknown';
+  return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 
 /**
@@ -44,7 +65,23 @@ function rateLimit({ windowMs = 15 * 60 * 1000, max = 20, keyBy = null } = {}) {
     sweep(now, windowMs);
 
     const extra = keyBy ? String(keyBy(req) ?? '') : '';
-    const key = `${req.baseUrl}${req.path}|${clientIp(req)}|${extra}`;
+
+    // req.route.path, NOT req.path.
+    //
+    // Inside a mounted router, req.path is the router-relative URL with
+    // parameters already substituted — so for '/customer-invoice/:token' it is
+    // '/customer-invoice/<the actual token>'. Keying on that gives one bucket
+    // PER TOKEN, which means an attacker enumerating tokens gets a fresh
+    // allowance for every guess and the limiter stops being a limiter.
+    //
+    // Every route that existed when this was written had a static path, so the
+    // two were identical and the bug was invisible; the first parameterised
+    // route to be rate-limited is where it would have bitten. req.route is
+    // populated before route-level middleware runs, and the ?? keeps this safe
+    // if the limiter is ever used as router- or app-level middleware where it
+    // is not.
+    const routePath = req.route?.path ?? req.path;
+    const key = `${req.baseUrl}${routePath}|${clientIp(req)}|${extra}`;
 
     const hits = (buckets.get(key) || []).filter(t => now - t < windowMs);
     if (hits.length >= max) {

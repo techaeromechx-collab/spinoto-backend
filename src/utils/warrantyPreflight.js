@@ -118,7 +118,7 @@ const WARRANTY_ITEMS_SQL = `
     cii.warranty_months, cii.warranty_days,
     cii.guarantee_months, cii.guarantee_days,
     (SELECT MAX(p.paid_at)::date
-       FROM customer_invoice_payments p
+       FROM invoice_payment_lines p
       WHERE p.customer_invoice_id = cii.customer_invoice_id)::text AS last_payment_date,
     EXISTS (
       SELECT 1 FROM warranty_claims wc

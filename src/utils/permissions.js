@@ -86,6 +86,35 @@ const PERMISSIONS = Object.freeze({
     group: 'Settings',
   },
 
+  // ---- WhatsApp ----
+  // Split three ways because they are genuinely different risks.
+  //
+  // MANAGE_WHATSAPP_TEMPLATES is the sharp one. Interakt exposes no API to read
+  // a template's definition, so the variable order is transcribed by hand — and
+  // a wrong mapping does not error, it sends the vehicle in the date slot to
+  // every customer thereafter. That is a narrower, more dangerous power than
+  // being allowed to send a message, so it does not come bundled with it.
+  MANAGE_WHATSAPP_TEMPLATES: {
+    code: 'MANAGE_WHATSAPP_TEMPLATES',
+    label: 'Manage WhatsApp Templates',
+    description: 'Map template variables and switch templates on or off, including automatic sending (Settings → WhatsApp). A wrong mapping is customer-visible on every send.',
+    group: 'Settings',
+  },
+  SEND_WHATSAPP: {
+    code: 'SEND_WHATSAPP',
+    label: 'Send WhatsApp Messages',
+    description: 'Send an approved template to a customer by hand from a lead, appointment or invoice. Does not allow changing what the templates say.',
+    group: 'Settings',
+  },
+  // Message history includes the rendered body of everything ever sent to a
+  // customer, so it is a read of customer data rather than a system setting.
+  VIEW_WHATSAPP_LOGS: {
+    code: 'VIEW_WHATSAPP_LOGS',
+    label: 'View WhatsApp Logs',
+    description: 'View sent message history, delivery status and failures across all records.',
+    group: 'Settings',
+  },
+
   // ---- Leads ----
   CREATE_LEAD: {
     code: 'CREATE_LEAD',
@@ -264,6 +293,50 @@ const PERMISSIONS = Object.freeze({
     group: 'Hubs',
   },
 
+  // ---- Workshops ----
+  // A Workshop is a candidate hub — the stage before onboarding, where the
+  // basics are collected and discussed. Separate codes from Hubs so an RM can
+  // log and work prospects without being able to create a real hub.
+  VIEW_WORKSHOP: {
+    code: 'VIEW_WORKSHOP',
+    label: 'View Workshops',
+    description: 'View candidate workshops and their site-visit photos.',
+    group: 'Workshops',
+  },
+  CREATE_WORKSHOP: {
+    code: 'CREATE_WORKSHOP',
+    label: 'Create Workshop',
+    description: 'Log a new candidate workshop.',
+    group: 'Workshops',
+  },
+  EDIT_WORKSHOP: {
+    code: 'EDIT_WORKSHOP',
+    label: 'Edit Workshop',
+    description: 'Update workshop details and manage its photos.',
+    group: 'Workshops',
+  },
+  APPROVE_WORKSHOP: {
+    code: 'APPROVE_WORKSHOP',
+    label: 'Approve / Reject Workshop',
+    description: 'Mark a workshop ready to become a hub, or turn it down with a reason.',
+    group: 'Workshops',
+  },
+  // Deliberately NOT sufficient on its own. The convert route also requires
+  // CREATE_HUB: conversion creates a real hub, so granting this alone would be
+  // a back door around the hub permissions.
+  CONVERT_WORKSHOP: {
+    code: 'CONVERT_WORKSHOP',
+    label: 'Convert Workshop to Hub',
+    description: 'Turn an approved workshop into a live hub. Also requires Create Hub.',
+    group: 'Workshops',
+  },
+  DELETE_WORKSHOP: {
+    code: 'DELETE_WORKSHOP',
+    label: 'Delete Workshop',
+    description: 'Remove a candidate workshop.',
+    group: 'Workshops',
+  },
+
   // ---- Appointments ----
   VIEW_APPOINTMENT: {
     code: 'VIEW_APPOINTMENT',
@@ -430,6 +503,62 @@ const PERMISSIONS = Object.freeze({
     group: 'Invoices',
   },
 
+  // ---- Payments (online / gateway) ----
+  //
+  // Separate from the ADD_INVOICE_PAYMENT family above, which is unchanged and
+  // still governs money a human records by hand. These govern the gateway:
+  // taking a card or UPI payment, sending a customer a pay link, and sending
+  // money back.
+  //
+  // The split matters most at the bottom of this group. Recording a cash
+  // payment wrongly is a bookkeeping error someone can correct. Issuing a
+  // refund moves real money out of the company's account and cannot be undone
+  // from this system, so it gets its own code rather than being folded into a
+  // general "can handle payments" — and so do the credentials that authorise
+  // every charge.
+  VIEW_PAYMENTS: {
+    code: 'VIEW_PAYMENTS',
+    label: 'View Payments',
+    description: 'View the Payments module: online transactions, payment links, refunds and settlements.',
+    group: 'Payments',
+  },
+  COLLECT_PAYMENT: {
+    code: 'COLLECT_PAYMENT',
+    label: 'Collect Online Payment',
+    description: 'Start an online payment against a customer invoice (card, UPI, net banking).',
+    group: 'Payments',
+  },
+  CREATE_PAYMENT_LINK: {
+    code: 'CREATE_PAYMENT_LINK',
+    label: 'Create Payment Link',
+    description: 'Generate and cancel shareable pay-this-invoice links. A link is a public URL, so anyone it is forwarded to can open it until it expires.',
+    group: 'Payments',
+  },
+  ALLOCATE_PAYMENT: {
+    code: 'ALLOCATE_PAYMENT',
+    label: 'Apply Payment to Invoice',
+    description: 'Decide which invoice a received payment settles — used for advances taken before an invoice existed, and for a customer\'s unused credit. Deliberately separate from collecting: applying money to the wrong invoice makes one job look settled and another look unpaid, schedules the hub payout from the wrong one, and reversing it affects both.',
+    group: 'Payments',
+  },
+  REFUND_PAYMENT: {
+    code: 'REFUND_PAYMENT',
+    label: 'Refund Payment',
+    description: 'Send money back to a customer through the gateway. Irreversible from this system, moves real funds out of the company account, and can drop an invoice out of PAID and pull the hub payout back.',
+    group: 'Payments',
+  },
+  VIEW_SETTLEMENTS: {
+    code: 'VIEW_SETTLEMENTS',
+    label: 'View Settlements',
+    description: 'View gateway settlements — the transfers of collected money into the company bank account, with fees and tax. Accounting reconciliation only.',
+    group: 'Payments',
+  },
+  MANAGE_GATEWAY_SETTINGS: {
+    code: 'MANAGE_GATEWAY_SETTINGS',
+    label: 'Manage Payment Gateway Settings',
+    description: 'View the payment gateway configuration and run a connection test. Credentials live in the server environment and are never shown, entered or changed here.',
+    group: 'Payments',
+  },
+
   // ---- Purchase Invoices ----
   VIEW_PURCHASE_INVOICE: {
     code: 'VIEW_PURCHASE_INVOICE',
@@ -460,6 +589,35 @@ const PERMISSIONS = Object.freeze({
     label: 'Add / Delete Purchase Invoice Payment',
     description: 'Record or delete payment entries (payouts) against a purchase invoice.',
     group: 'Purchase Invoices',
+  },
+
+  // ---- Hub payouts (money out through the gateway) ----
+  //
+  // Deliberately NOT folded into ADD_PURCHASE_INVOICE_PAYMENT above. That one
+  // governs RECORDING a payout somebody already made from their banking app —
+  // a bookkeeping entry, correctable by deleting the row. These govern MOVING
+  // REAL MONEY out of the company account, which this system cannot undo.
+  //
+  // Same reasoning that separates REFUND_PAYMENT from ADD_INVOICE_PAYMENT on
+  // the way in, and it matters more here: a customer notices a refund that did
+  // not arrive, a hub paid to the wrong account may not notice for a month.
+  PAY_HUB_ONLINE: {
+    code: 'PAY_HUB_ONLINE',
+    label: 'Pay Hub via Bank Transfer',
+    description: 'Send money to a hub through the payout provider. Moves real funds out of the company account and cannot be reversed from this system. Recording a payout made by hand does not need this.',
+    group: 'Payouts',
+  },
+  MANAGE_HUB_PAYOUT_ACCOUNT: {
+    code: 'MANAGE_HUB_PAYOUT_ACCOUNT',
+    label: 'Register Hub Bank Account for Payouts',
+    description: 'Register a hub\'s bank account with the payout provider. The registered account is where every future automatic payout to that hub goes, so this is the control that decides who gets paid.',
+    group: 'Payouts',
+  },
+  VIEW_HUB_PAYOUTS: {
+    code: 'VIEW_HUB_PAYOUTS',
+    label: 'View Hub Payouts',
+    description: 'View the payouts list — what has been sent to each hub, what is in flight, and what failed or bounced back.',
+    group: 'Payouts',
   },
 
   // ---- Reference Data (Vehicles page → Reference Data tab) ----

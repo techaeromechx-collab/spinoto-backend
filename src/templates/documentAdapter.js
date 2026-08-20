@@ -23,8 +23,14 @@
  * Themes then branch only on cosmetics.
  */
 
-const { resolvePlaceOfSupply, isInterState, splitGst } = require('../utils/gstStates');
-const { qrEnabled } = require('../utils/documentConfig');
+const {
+  resolvePlaceOfSupply, isInterState, splitGst,
+  resolvePurchasePlaceOfSupply, isPurchaseInterState, hubSupplierStateCode,
+} = require('../utils/gstStates');
+const { maskMobile } = require('../utils/maskMobile');
+const {
+  qrEnabled, ADVANCE_REFUND_TITLE, ADVANCE_REFUND_FOOTER,
+} = require('../utils/documentConfig');
 const { staticLogoDataUri, inlineUploadUrl } = require('../utils/inlineImage');
 
 const num = (v) => Number(v || 0);
@@ -178,8 +184,12 @@ function blocksFrom(cfg, company) {
     // Flattened form kept for themes that render the bank block as free text
     // rather than a labelled table.
     bankDetails: bankRows.map(r => `${r.label}: ${r.value}`).join('\n'),
-    footerNote: cfg.global.footer_note || '',
-    footerDisclaimer: cfg.global.footer_disclaimer || '',
+    // ?? not ||: the per-document value is authoritative whenever it is a
+    // string, INCLUDING ''. Only null/undefined means "inherit the global".
+    // An estimate uses this to keep "subject to change upon final inspection",
+    // which would be wrong on an invoice.
+    footerNote: cfg.footer_note ?? cfg.global.footer_note ?? '',
+    footerDisclaimer: cfg.footer_disclaimer ?? cfg.global.footer_disclaimer ?? '',
     showContact: !!cfg.global.footer_contact,
     contactIcons: !!cfg.global.footer_contact_icons,
     // Master AND this document's own flag — see documentConfig.qrEnabled.
@@ -339,6 +349,14 @@ function totalsFrom(rows) {
 
 // ─── Estimate ─────────────────────────────────────────────────────────────────
 
+// The customer's number, masked on anything a hub receives. cfg.viewerRole is
+// resolved server-side from the session (see purchase_invoices.routes.js), so a
+// hub cannot request the admin view of its own document — the same hard gate
+// the margin columns sit behind.
+function buyerPhone(row, cfg) {
+  return cfg.viewerRole === 'hub' ? maskMobile(row.mobile) : (row.mobile || '');
+}
+
 function fromEstimate(row, company, cfg) {
   // Rejected lines are excluded from the printed table, not just the totals.
   // The old layout printed them while omitting them from the sum, so the
@@ -390,7 +408,7 @@ function fromEstimate(row, company, cfg) {
     seller: sellerFrom(company, cfg),
     buyer: {
       name: buyerName(row),
-      phone: row.mobile || '',
+      phone: buyerPhone(row, cfg),
       gstin: row.is_b2b ? (row.b2b_gst_number || '') : '',
       meta: b2bMeta(row),
       // Empty array unless the job was a pickup — see pickupAddress().
@@ -413,6 +431,27 @@ function fromEstimate(row, company, cfg) {
 }
 
 // ─── Customer invoice ─────────────────────────────────────────────────────────
+
+/**
+ * "Advance Applied (ADV-2026-27-000042)".
+ *
+ * The voucher number belongs ON the line. Without it the receipt voucher and
+ * the invoice describe the same ₹2,000 with no link between them, and matching
+ * the two at year end becomes a manual job.
+ *
+ * Two numbers are printed in full; beyond that the count is stated instead,
+ * because a totals row is one line and four voucher numbers would wrap it into
+ * three. `advance_vouchers` is a comma-separated list from the select — absent
+ * on an older response, in which case the label is simply unqualified rather
+ * than wrong.
+ */
+function advanceLabel(row) {
+  const list = String(row.advance_vouchers || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) return 'Advance Applied';
+  if (list.length <= 2) return `Advance Applied (${list.join(', ')})`;
+  return `Advance Applied (${list.length} receipts)`;
+}
 
 function fromCustomerInvoice(row, company, cfg) {
   // Inc-GST list price, matching what the invoice screen shows.
@@ -457,6 +496,42 @@ function fromCustomerInvoice(row, company, cfg) {
   const discount = num(row.transaction_discount_amount) ||
     items.reduce((s, i) => s + i.discount, 0);
 
+  // ── The advance line, and the trap it exists to avoid ─────────────────────
+  //
+  // An advance that has been applied to this invoice is ALREADY inside
+  // amount_paid, and is ALREADY listed in the Payments block below. Adding an
+  // "Advance Applied" row on top of that would count the same money twice:
+  // ₹8,000 total, ₹2,000 advance, ₹8,000 paid, and a balance that does not add
+  // up in front of the customer.
+  //
+  // So the Paid row is SPLIT, never added to:
+  //
+  //     Advance Applied (ADV-2026-27-000042)   ₹2,000.00
+  //     Payments Received                      ₹6,000.00
+  //     ──────────────────────────────────────────────
+  //     Balance Due                                ₹0.00
+  //
+  // advance + payments === paid, always. The arithmetic is untouched; only the
+  // presentation splits.
+  //
+  // POSITIVE, not negative. docShared.buildTotals renders a negative as
+  // "- 1,234.00", but luxury.js additionally moves the minus ahead of the ₹, so
+  // one number would print as "₹ - 2,000.00" in six themes and "- ₹2,000.00" in
+  // the seventh. The label carries the meaning instead.
+  //
+  // The Math.min is the ONLY guard here, and it is doing real work: it is what
+  // makes the subtraction below incapable of going negative. A bad backfill or
+  // a hand-edited row could leave advance_applied above amount_paid, and
+  // "Payments Received −₹1,999.00" on a customer's invoice is a worse answer
+  // than showing the advance capped at what was actually received.
+  //
+  // A second Math.max(0, …) on the subtraction would be provably dead code, and
+  // dead code that looks like a safety check is worse than none — it invites
+  // the real guard to be removed as redundant.
+  const advanceApplied = Math.min(num(row.advance_applied), paid);
+  const showAdvance = cfg.flags.show_advance_line !== false && advanceApplied > 0.005;
+  const paymentsReceived = Number((paid - advanceApplied).toFixed(2));
+
   return {
     docType: 'customer_invoice',
     viewerRole: cfg.viewerRole,
@@ -471,7 +546,7 @@ function fromCustomerInvoice(row, company, cfg) {
     seller: sellerFrom(company, cfg),
     buyer: {
       name: buyerName(row),
-      phone: row.mobile || '',
+      phone: buyerPhone(row, cfg),
       gstin: row.is_b2b ? (row.b2b_gst_number || '') : '',
       meta: b2bMeta(row),
       // Empty array unless the job was a pickup — see pickupAddress().
@@ -484,7 +559,21 @@ function fromCustomerInvoice(row, company, cfg) {
       discount ? { key: 'discount', label: 'Total Discount', value: -discount, kind: 'normal' } : null,
       { key: 'gst',     label: 'Total GST',   value: totalGst, kind: 'normal' },
       { key: 'grand',   label: 'Grand Total', value: grand,    kind: 'grand'  },
-      { key: 'paid',    label: 'Paid',        value: paid,     kind: 'normal' },
+      // Present only when an advance was actually applied. With no advance the
+      // rows below are byte-identical to what every invoice printed before this
+      // existed — one row, labelled "Paid".
+      showAdvance
+        ? { key: 'advance', label: advanceLabel(row), value: advanceApplied, kind: 'normal' }
+        : null,
+      {
+        key: 'paid',
+        // Relabelled only when it has been split. Left as "Paid" otherwise,
+        // because "Payments Received" on an invoice with no advance would be a
+        // change of wording with no change of meaning.
+        label: showAdvance ? 'Payments Received' : 'Paid',
+        value: showAdvance ? paymentsReceived : paid,
+        kind: 'normal',
+      },
       { key: 'balance', label: 'Balance Due', value: balance,  kind: 'strong' },
       (cfg.flags.show_party_balance && row.party_balance !== undefined && row.party_balance !== null)
         ? { key: 'party_balance', label: 'Total Outstanding', value: num(row.party_balance), kind: 'strong' }
@@ -520,9 +609,30 @@ function fromPurchaseInvoice(row, company, cfg) {
     return itemFrom(i, { rate: hubRate, total });
   });
 
-  const pos = resolvePlaceOfSupply(row, company);
-  const interState = isInterState(company, pos.code);
+  // ── Who is supplying whom ──────────────────────────────────────────────
+  //
+  // This document is the HUB's sales invoice: the hub supplies the work,
+  // Spinoto buys it. So the supplier is the hub and the recipient is Spinoto —
+  // the opposite of every other document this adapter builds.
+  //
+  // The purchase-invoice variants are used here deliberately. The generic
+  // resolvePlaceOfSupply/isInterState put Spinoto's state on BOTH sides of the
+  // comparison, which made every hub's invoice print CGST+SGST; a Maharashtra
+  // hub billing a Gujarat company owes IGST. Right total, wrong heads, and it
+  // carries into the hub's GSTR-1.
+  const pos = resolvePurchasePlaceOfSupply(row, company);
+  const interState = isPurchaseInterState(row, company);
   const isHubView = cfg.viewerRole === 'hub';
+
+  // A hub that is not GST-registered cannot issue a tax invoice and cannot
+  // charge tax. Its document is a Bill of Supply: no tax columns, no breakup,
+  // no GSTIN, and a declaration saying why.
+  //
+  // Reads the SNAPSHOT (migration 120), never hubs.has_gst — a hub that
+  // registers next March must not retroactively turn last year's bills of
+  // supply into tax invoices. `!== false` so pre-migration rows, where the
+  // snapshot is NULL, keep rendering exactly as they do today.
+  const isTaxInvoice = row.hub_has_gst !== false;
 
   const meta = [
     { key: 'number', label: 'Invoice No.', value: formatNumber(cfg, row.id) },
@@ -537,12 +647,24 @@ function fromPurchaseInvoice(row, company, cfg) {
   // The end customer is context for which job this covers, not a party.
   if (row.customer_name) meta.push({ key: 'job_customer', label: 'Job for', value: row.customer_name });
 
-  // Unlike the other two documents, the PI now gets a real bill-to party: the
-  // hub. Previously the hub was a single row inside a generic info grid under
-  // a full company letterhead, with no counterparty block at all.
-  // PI_SELECT exposes only the raw hubs.hub_name, so there is no separate
-  // legal/branch pair to choose between here.
-  const hubName = hubLabel(cfg, { legalName: row.hub_full_name, branchName: row.hub_name });
+  // The hub is the SELLER on this document, not the bill-to. It used to be
+  // rendered as the counterparty under a Spinoto letterhead, which reads as
+  // "Spinoto is selling to the hub" — backwards, and invalid as the hub's own
+  // tax invoice, where the supplier's name, address and GSTIN must head the
+  // page.
+  //
+  // Prefers the snapshot taken at issue (migration 120) over the live join, so
+  // a hub that moves premises or corrects its GSTIN does not rewrite invoices
+  // it has already been given.
+  //
+  // NOT hubLabel(). That helper honours cfg.global.hub_name_mode, which
+  // defaults to 'branch' — a sensible display preference on a customer-facing
+  // document, where "Spinoto Satellite" reads better than the LLP name. On the
+  // supplier line of a tax invoice it is wrong: the registered legal name is
+  // what must appear, and a display setting must not be able to override a
+  // legal requirement. Legal name first, always, with the trading name only as
+  // a fallback for a hub that has not recorded one.
+  const hubName = row.hub_legal_name || row.hub_full_name || row.hub_name || '';
 
   const subtotal = num(row.subtotal_ex_gst);
   const totalGst = num(row.total_gst);
@@ -557,37 +679,250 @@ function fromPurchaseInvoice(row, company, cfg) {
     // Filled in asynchronously by the render pipeline (utils/renderDocument)
     // because QR generation can't happen inside a synchronous template.
     qrDataUri: null,
-    title: cfg.title,
-    number: formatNumber(cfg, row.id),
+    // A Bill of Supply is not a tax invoice and must not be titled as one.
+    title: isTaxInvoice ? cfg.title : 'BILL OF SUPPLY',
+    // The hub's own number once assigned (migration 121), falling back to the
+    // derived SI-/PI- form for invoices raised before the per-hub series
+    // existed. Those numbers are already filed in hubs' returns, so they are
+    // never regenerated.
+    number: row.invoice_number || formatNumber(cfg, row.id),
     date: row.created_at,
-    seller: sellerFrom(company, cfg),
-    buyer: {
+    // Supplier = the hub. `address` is an array of lines, matching sellerFrom's
+    // shape so the themes need no branch. hub_address is stored pre-joined
+    // (migration 120) precisely so it does not have to be reassembled here.
+    //
+    // No `show_hub_gstin` gate on the GSTIN any more: that flag made sense
+    // when the hub was an incidental counterparty. On the hub's own tax
+    // invoice the supplier's GSTIN is mandatory, so it is not optional.
+    // Missing values render as a visible gap rather than being dropped — an
+    // invoice without a supplier address should look broken, because it is.
+    seller: {
+      ...sellerFrom(company, cfg),
       name: hubName || '',
+      address: String(row.hub_address || '').split('\n').map(l => l.trim()).filter(Boolean),
+      gstin: isTaxInvoice ? (row.hub_gstin || row.hub_gst || '') : '',
       phone: '',
-      gstin: cfg.global.show_hub_gstin ? (row.hub_gst || '') : '',
-      meta: [],
+      email: '',
+      // The letterhead logo belongs to whoever heads the page. Spinoto's logo
+      // above a hub's name and GSTIN would misrepresent who issued the invoice.
+      logoUrl: null,
     },
+    // Recipient = Spinoto.
+    buyer: (() => {
+      const c = sellerFrom(company, cfg);
+      return { name: c.name, address: c.address, gstin: c.gstin, phone: '', meta: [] };
+    })(),
     meta,
     items,
     totals: totalsFrom([
-      { key: 'subtotal', label: isHubView ? 'Subtotal (ex-GST)' : 'Subtotal (hub ex-GST)', value: subtotal, kind: 'normal' },
-      { key: 'gst',   label: 'Total GST', value: totalGst, kind: 'normal' },
+      { key: 'subtotal', label: isHubView ? (isTaxInvoice ? 'Subtotal (ex-GST)' : 'Subtotal') : 'Subtotal (hub ex-GST)', value: subtotal, kind: 'normal' },
+      // Dropped entirely, not zeroed: a Bill of Supply showing "Total GST ₹0.00"
+      // still reads as a document that considered charging tax.
+      ...(isTaxInvoice ? [{ key: 'gst', label: 'Total GST', value: totalGst, kind: 'normal' }] : []),
       { key: 'grand', label: isHubView ? 'Grand Total Receivable' : 'Grand Total Payable to Hub', value: grand, kind: 'grand' },
       { key: 'paid',    label: isHubView ? 'Paid to You' : 'Paid to Hub', value: paid, kind: 'normal' },
       { key: 'balance', label: 'Balance Due', value: grand - paid, kind: 'strong' },
     ]),
-    gstBreakup: gstBreakupFrom(items, interState),
+    // Shape must stay { interState, lines } even when empty — themes destructure
+    // it, and handing them a bare array would throw at render rather than
+    // simply printing no tax rows.
+    gstBreakup: isTaxInvoice ? gstBreakupFrom(items, interState) : { interState: false, lines: [] },
     placeOfSupply: pos,
     payments: (row.hub_payments || []).map(p => ({
       date: p.paid_at, method: p.method, reference: p.reference_no, amount: num(p.amount), notes: p.notes,
     })),
     notes: row.notes || '',
-    blocks: blocksFrom(cfg, company),
+    blocks: {
+      ...blocksFrom(cfg, company),
+      // The signature block belongs to whoever issued the document. Spinoto's
+      // uploaded signature image above a hub's letterhead would be a
+      // misrepresentation, so it is dropped and the standard declaration is
+      // used instead. A hub signature upload can replace this later.
+      signatureUrl: null,
+      signature: 'Computer generated invoice — no signature required',
+      // Mandatory on every tax invoice, even when the answer is "No". Absent
+      // until now.
+      declarations: [
+        ...(isTaxInvoice
+          ? ['Tax payable on reverse charge: No']
+          : ['Supplier is not registered under GST. This is a Bill of Supply — no tax is charged or collected.']),
+        // Spinoto raises this document on the hub's behalf. An auditor asks
+        // about that first, so it is stated on the face of the invoice; the
+        // matching clause belongs in the hub agreement.
+        `Self-billed by ${company?.company_name || 'the recipient'} on behalf of the supplier.`,
+      ],
+    },
     // Consumed by buildColumns to decide whether the reference/margin columns
     // render. buildColumns ALSO re-checks viewerRole itself — belt and braces,
     // because a config edit must never be able to expose margin to a hub.
     rateMode: row.rate_mode || null,
     showMargin: cfg.margin_columns && cfg.viewerRole === 'admin',
+  };
+}
+
+// ─── Advance receipt / refund voucher ─────────────────────────────────────────
+
+/**
+ * The document for money taken (or returned) before the invoice exists.
+ *
+ * WHAT MAKES THIS DIFFERENT FROM THE OTHER THREE
+ * ──────────────────────────────────────────────
+ * There are no items. A receipt voucher is not a bill for anything — it is an
+ * acknowledgement of a sum, and of the tax inside that sum. Itemising it would
+ * mean inventing lines the customer has not been charged for yet.
+ *
+ * So `items` is deliberately empty and `totals` carries the whole story:
+ *
+ *     Taxable Value     ₹1,694.92
+ *     GST @18%            ₹305.08
+ *     Advance Received  ₹2,000.00      ← what the customer actually handed over
+ *
+ * THE NUMBER IS NOT BUILT FROM THE ROW ID
+ * ───────────────────────────────────────
+ * Every other document composes its number from the id plus a configured prefix
+ * and padding. This one cannot: a tax series must be consecutive with no gaps,
+ * and ids are consumed by payment links nobody ever pays. The number was issued
+ * at capture (advances.service.issueVoucherNumber) and stored; here it is
+ * simply printed. formatNumber() is not called, and must not be.
+ *
+ * THE TAX IS SNAPSHOTTED, NOT RECOMPUTED
+ * ──────────────────────────────────────
+ * row.gst_amount and row.gst_rate were frozen when the money was taken, at the
+ * proportion the estimate had at that moment. Recomputing them here would
+ * silently reprint a different figure the day someone edits a line on that
+ * estimate — while the customer is holding the old one.
+ */
+function fromAdvanceReceipt(row, company, cfg) {
+  const isRefund = row.kind === 'refund';
+  // Money on the customer's account, belonging to no job yet. The document has
+  // to say so: a receipt that looks job-shaped but names no job reads as one
+  // where the job failed to print.
+  const onAccount = !isRefund && !row.estimate_id;
+
+  const amount = num(row.amount);
+  const gst = num(row.gst_amount);
+  const taxable = Number((amount - gst).toFixed(2));
+  const rate = num(row.gst_rate);
+
+  const pos = resolvePlaceOfSupply(row, company);
+  const interState = isInterState(company, pos.code);
+
+  const jobTotal = num(row.job_total);
+  const advanced = num(row.job_advanced);
+
+  const meta = [
+    // Just "Voucher No." on both — the title already says which kind, and
+    // "Refund Voucher No." wraps onto two lines in the header column.
+    { key: 'number', label: 'Voucher No.', value: row.voucher_no || '—' },
+    { key: 'date', label: 'Date', value: row.paid_at || row.created_at, isDate: true },
+    // A refund points at the receipt it reverses; a receipt points at the job.
+    // Naming the job on a refund would leave the customer holding two documents
+    // with no stated relationship between them.
+    ...(isRefund && row.against_voucher_no
+      ? [{ key: 'against', label: 'Against Receipt', value: row.against_voucher_no }]
+      : row.estimate_id
+        ? [{ key: 'against', label: 'Against', value: `EST-${String(row.estimate_id).padStart(6, '0')}` }]
+        : []),
+    ...vehicleMeta(row, cfg),
+    ...(cfg.header_fields.place_of_supply && pos.name
+      ? [{ key: 'pos', label: 'Place of Supply', value: `${pos.code} — ${pos.name}` }] : []),
+    ...customMeta(row, cfg),
+  ];
+
+  const hub = hubLabel(cfg, { legalName: row.hub_full_name, branchName: row.hub_name });
+  if (hub) meta.push({ key: 'hub', label: 'Hub / Branch', value: hub });
+  if (cfg.global.show_hub_gstin && row.hub_gst) {
+    meta.push({ key: 'hub_gstin', label: 'Hub GSTIN', value: row.hub_gst });
+  }
+
+  return {
+    docType: 'advance_receipt',
+    // The same document with the money going the other way. The renderer reads
+    // this for the few sentences that have to differ, rather than the caller
+    // choosing between two templates.
+    kind: isRefund ? 'refund' : 'receipt',
+    onAccount,
+    viewerRole: cfg.viewerRole,
+    accent: accentFrom(company),
+    publicToken: row.public_token || null,
+    qrDataUri: null,
+    title: isRefund ? ADVANCE_REFUND_TITLE : cfg.title,
+    number: row.voucher_no || '',
+    date: row.paid_at || row.created_at,
+    seller: sellerFrom(company, cfg),
+    buyer: {
+      name: buyerName(row),
+      phone: buyerPhone(row, cfg),
+      gstin: row.is_b2b ? (row.b2b_gst_number || '') : '',
+      meta: b2bMeta(row),
+      // A receipt voucher acknowledges money, not a collection. The pickup
+      // address belongs on the document that describes the work.
+      pickup: [],
+    },
+    meta,
+
+    // No item table. See the header note — this absence is the document.
+    items: [],
+
+    totals: totalsFrom([
+      { key: 'taxable', label: 'Taxable Value', value: taxable, kind: 'normal' },
+      {
+        key: 'gst',
+        // The rate goes in the label because there is no per-line tax column to
+        // carry it, and "GST ₹305.08" with no rate stated is not a tax document.
+        label: rate ? `GST @${rate % 1 === 0 ? rate.toFixed(0) : rate.toFixed(2)}%` : 'GST',
+        value: gst,
+        kind: 'normal',
+      },
+      {
+        key: 'grand',
+        label: isRefund ? 'Amount Refunded' : 'Advance Received',
+        value: amount,
+        kind: 'grand',
+      },
+    ]),
+
+    // { interState, lines } — the shape docShared.buildGstLines reads. A plain
+    // array here parses without error and renders NOTHING, which is how a tax
+    // document quietly ships without its CGST/SGST split.
+    gstBreakup: { interState, lines: gst > 0 ? splitGst(gst, rate, interState) : [] },
+    placeOfSupply: pos,
+
+    // The job this money belongs to. Null rather than 0 when it isn't known, so
+    // the renderer omits the block instead of printing a confident "₹0.00 left
+    // to pay" on a job whose total it could not read.
+    job: {
+      // Omitted entirely on a refund. Without the "still to pay" line it
+      // collapses to a single "Job total" row — a card with one number in it,
+      // which reads as something that failed to render. The job is already
+      // named on a refund by the receipt it reverses.
+      total: (!isRefund && jobTotal) ? jobTotal : null,
+      advanced: advanced || null,
+      // Only meaningful on a receipt: a refund does not change what the job
+      // costs, and printing a "remaining" figure on one would suggest it does.
+      balanceAfter: (!isRefund && jobTotal) ? Number((jobTotal - advanced).toFixed(2)) : null,
+    },
+
+    // How the money moved. On a receipt this is the first thing the customer
+    // checks against their own bank message.
+    received: {
+      method: row.method || '',
+      reference: row.reference_no || row.txn_ref || '',
+      on: row.paid_at || row.created_at,
+    },
+
+    payments: [],
+    notes: row.notes || '',
+    blocks: isRefund
+      // See ADVANCE_REFUND_FOOTER: the receipt's footer promises the money will
+      // be adjusted against the invoice, which is false once it has gone back.
+      ? { ...blocksFrom(cfg, company), footerNote: ADVANCE_REFUND_FOOTER }
+      : onAccount
+        // The on-account block above says this, and says it better — it also
+        // covers the refundable balance. Two sentences making the same promise
+        // on a one-page document is noise, not emphasis.
+        ? { ...blocksFrom(cfg, company), footerNote: '' }
+        : blocksFrom(cfg, company),
   };
 }
 
@@ -597,10 +932,11 @@ const ADAPTERS = {
   estimate: fromEstimate,
   customer_invoice: fromCustomerInvoice,
   purchase_invoice: fromPurchaseInvoice,
+  advance_receipt: fromAdvanceReceipt,
 };
 
 /**
- * @param {'estimate'|'customer_invoice'|'purchase_invoice'} docType
+ * @param {'estimate'|'customer_invoice'|'purchase_invoice'|'advance_receipt'} docType
  * @param {object} row      source row + .items[] (+ .payments/.hub_payments)
  * @param {object} company  company_settings row
  * @param {object} cfg      resolveDocumentConfig(raw, docType, viewerRole)
@@ -611,4 +947,12 @@ function buildDocument(docType, row, company, cfg) {
   return adapter(row || {}, company || {}, cfg);
 }
 
-module.exports = { buildDocument, fromEstimate, fromCustomerInvoice, fromPurchaseInvoice };
+// hubLabel is exported for the public pay page, which has to name the same hub
+// on the same job as the invoice PDF does. Without sharing this function the
+// two drift — the invoice says "Spinoto Gota" while the pay page says the
+// partner workshop's own trading name, and a customer about to hand over money
+// sees two different businesses for one service.
+//
+// It also honours hub_name_mode: 'hidden', a deliberate setting that a screen
+// naming the hub from its own query would silently bypass.
+module.exports = { buildDocument, fromEstimate, fromCustomerInvoice, fromPurchaseInvoice, fromAdvanceReceipt, hubLabel };

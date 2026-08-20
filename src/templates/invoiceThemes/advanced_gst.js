@@ -146,6 +146,15 @@ function render({ doc, cfg, pageSize }) {
   const paid = totals.find(t => t.key === 'paid');
   const grand = totals.find(t => t.key === 'grand');
 
+  // This theme does NOT loop the totals array — it builds its own money block
+  // from doc.items and prints a single RECEIVED AMOUNT strip. Every other theme
+  // picks up a new totals row automatically; here a new row would be silently
+  // invisible, which is the worst kind of failure because nothing errors.
+  //
+  // So the advance is picked out by hand and printed as its own strip above
+  // RECEIVED AMOUNT. This also covers advanced_gst_a5, which shares this file.
+  const advance = totals.find(t => t.key === 'advance');
+
   // Built as inner fragments so the same content can be dropped into either a
   // half-width cell or a full-width one, depending on whether both exist.
   const wordsInner = (blocks.amountInWords && grand)
@@ -348,6 +357,10 @@ function render({ doc, cfg, pageSize }) {
   .b { font-weight: 700; }
 
   .recv { display: flex; justify-content: space-between; padding: 6px 9px; border-bottom: var(--rule) solid #000; font-weight: 700; }
+  /* The advance qualifies the received amount rather than competing with it:
+     same strip, one step quieter. Uppercase is applied here rather than in the
+     label, so the adapter keeps one human-readable string for all 8 themes. */
+  .recv-adv { font-weight: 600; text-transform: uppercase; letter-spacing: .2px; }
 
   table.hsn { width: 100%; border-collapse: collapse; }
   table.hsn th, table.hsn td { border-right: var(--rule) solid #000; border-bottom: var(--rule) solid #000; padding: 5px 6px; font-size: 8.5px; }
@@ -494,7 +507,13 @@ function render({ doc, cfg, pageSize }) {
       </table>` : ''}
     </div>
 
-    ${paid ? `<div class="recv"><span>RECEIVED AMOUNT</span><span>₹ ${paid.value}</span></div>` : ''}
+    ${/* The advance strip sits ABOVE the received amount, in the order the
+          money actually arrived: the advance came first. Lighter weight than
+          the strip below it, because RECEIVED AMOUNT is the headline and this
+          qualifies it. Absent entirely when no advance was applied, so an
+          ordinary invoice prints exactly as it always did. */''}
+    ${advance ? `<div class="recv recv-adv"><span>${advance.label}</span><span>₹ ${advance.value}</span></div>` : ''}
+    ${paid ? `<div class="recv"><span>${advance ? paid.label.toUpperCase() : 'RECEIVED AMOUNT'}</span><span>₹ ${paid.value}</span></div>` : ''}
 
     ${hsn ? `
     <div class="band" style="display:block">

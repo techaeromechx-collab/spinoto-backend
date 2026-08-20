@@ -43,10 +43,26 @@ function publicDocumentUrl(docType, publicToken, fallbackBase) {
   // works out of the box in development without anyone configuring an env var.
   const base = publicBaseUrl() || String(fallbackBase || '').replace(/\/+$/, '');
   if (!base || !publicToken) return null;
+  // Singular, and deliberately not the CRM's list paths.
+  //
+  // /invoice/<token> and /estimate/<token> are public unconditionally. The
+  // plural paths they replaced double as staff deep links, so their meaning
+  // depends on whether whoever scans the code is signed in — and a hub session
+  // scanning one is redirected to /hub, seeing a dashboard instead of the
+  // document. A QR on paper cannot be re-issued, so it has to encode the
+  // address that will never be ambiguous.
+  //
+  // Codes already printed keep working: App.jsx redirects the old paths here.
+  // purchase_invoice is unchanged — it has no public page, and it is a
+  // hub-facing document rather than a customer-facing one.
   const path = {
-    estimate: 'estimates',
-    customer_invoice: 'customer-invoices',
+    estimate: 'estimate',
+    customer_invoice: 'invoice',
     purchase_invoice: 'purchase-invoices',
+    // Public unconditionally, like /invoice and /estimate. The token is the
+    // PAYMENT's public_token (or the refund's) — a receipt voucher must open
+    // the receipt, not the job it was taken against.
+    advance_receipt: 'advance',
   }[docType];
   if (!path) return null;
   return `${base}/${path}/${encodeURIComponent(publicToken)}`;

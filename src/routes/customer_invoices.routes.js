@@ -1,5 +1,6 @@
 'use strict';
 const express = require('express');
+const { maskCustomerContact } = require('../middleware/maskMobile.middleware');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const {
   listCustomerInvoices, exportCustomerInvoices, getCustomerInvoice, getCustomerInvoiceByToken, getCustomerInvoicePdf,
@@ -25,6 +26,11 @@ const canPayment = requirePermission('ADD_INVOICE_PAYMENT');
 const canDeletePayment = requirePermission('DELETE_INVOICE_PAYMENT');
 
 router.use(requireAuth);
+// Customer mobile numbers are masked to 98382xxxxx for hub logins — see
+// middleware/maskMobile.middleware.js. Mounted at the router so every response
+// below is covered by default, including handlers added later.
+router.use(maskCustomerContact);
+
 router.get('/',                        canView,    listCustomerInvoices);
 // Static routes BEFORE /:id to avoid param capture
 router.get('/export',                  canView,    exportCustomerInvoices);

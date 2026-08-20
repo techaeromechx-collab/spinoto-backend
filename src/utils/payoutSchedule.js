@@ -110,7 +110,7 @@ async function syncPayoutDueDate(client, { purchaseInvoiceId = null, customerInv
 
   const ciRes = await client.query(
     `SELECT ci.status,
-            (SELECT MAX(paid_at) FROM customer_invoice_payments WHERE customer_invoice_id = ci.id) AS last_paid_at
+            (SELECT MAX(paid_at) FROM invoice_payment_lines WHERE customer_invoice_id = ci.id) AS last_paid_at
      FROM customer_invoices ci
      WHERE ci.purchase_invoice_id = $1
         OR ci.estimate_id = (SELECT estimate_id FROM purchase_invoices WHERE id = $1)

@@ -177,6 +177,82 @@ function splitGst(amount, ratePercent, interState) {
   ];
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURCHASE INVOICES — the supplier is the HUB, not the company
+//
+// Everything above assumes Spinoto is the supplier, which is true for an
+// estimate and a customer invoice. A purchase invoice is the other direction:
+// the hub supplies the work and Spinoto buys it, so that document is legally
+// the HUB's sales invoice.
+//
+// Using the functions above on a purchase invoice put Spinoto's state on BOTH
+// sides of the intra/inter-state comparison, so every hub's invoice printed
+// CGST+SGST. A Maharashtra hub billing a Gujarat company owes IGST. The rupee
+// total was right; it sat under the wrong heads, and that propagates into the
+// hub's GSTR-1.
+//
+// These live here rather than as a branch inside documentAdapter so that every
+// state decision in the codebase stays in one file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The supplier's state on a purchase invoice — the hub's.
+ *
+ * Priority mirrors supplierStateCode():
+ *   1. supplier_state_code snapshotted on the row (migration 120) — frozen at
+ *      issue, so correcting a hub's GSTIN never rewrites an old invoice
+ *   2. the leading two digits of the hub's GSTIN, which IS the registered state
+ *   3. the hub's state name, for a hub with no GSTIN
+ *
+ * Returns null when nothing resolves. Callers must treat null as "cannot
+ * determine" and fall back to intra-state rather than guessing IGST — an
+ * unregistered hub charges no tax at all, so the distinction is moot there.
+ */
+function hubSupplierStateCode(row) {
+  const snapshot = row?.supplier_state_code;
+  if (snapshot && STATE_CODES[String(snapshot).padStart(2, '0')]) {
+    return String(snapshot).padStart(2, '0');
+  }
+  return stateCodeFromGstin(row?.hub_gstin || row?.hub_gst)
+      || stateCodeFromName(row?.hub_state_name)
+      || null;
+}
+
+/**
+ * Place of supply on a purchase invoice — Spinoto's state, because Spinoto is
+ * the recipient. A B2B supply to a registered recipient is supplied at the
+ * recipient's location.
+ *
+ * The end customer's state is irrelevant here and must never leak in: that
+ * governs the CUSTOMER invoice, a different document between different parties.
+ */
+function resolvePurchasePlaceOfSupply(row, company) {
+  const explicit = row?.place_of_supply_code;
+  if (explicit && STATE_CODES[String(explicit).padStart(2, '0')]) {
+    const c = String(explicit).padStart(2, '0');
+    return { code: c, name: stateName(c), source: 'explicit' };
+  }
+  const own = supplierStateCode(company); // the company is the RECIPIENT here
+  if (own) return { code: own, name: stateName(own), source: 'recipient_company' };
+  return { code: null, name: '', source: 'unknown' };
+}
+
+/**
+ * Inter-state on a purchase invoice: hub's state vs Spinoto's state.
+ *
+ * Returns false when either side is unknown — the same conservative default as
+ * isInterState(). Printing IGST on an unresolved supply would be a worse error
+ * than printing CGST+SGST, because IGST on an intra-state supply is not
+ * creditable to the recipient.
+ */
+function isPurchaseInterState(row, company) {
+  const supplier = hubSupplierStateCode(row);
+  const recipient = resolvePurchasePlaceOfSupply(row, company).code;
+  if (!supplier || !recipient) return false;
+  return String(supplier) !== String(recipient);
+}
+
 module.exports = {
   STATE_CODES,
   stateCodeFromGstin,
@@ -186,4 +262,8 @@ module.exports = {
   resolvePlaceOfSupply,
   isInterState,
   splitGst,
+  // Purchase-invoice variants — supplier is the hub, recipient is the company.
+  hubSupplierStateCode,
+  resolvePurchasePlaceOfSupply,
+  isPurchaseInterState,
 };
