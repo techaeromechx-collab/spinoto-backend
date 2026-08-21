@@ -156,8 +156,19 @@ const iAuto = delFn.indexOf('FROM wa_automations');
 assert.match(delFn.slice(iAuto, iAuto + 700), /res\.status\(409\)/,
   'the automation check does not refuse the delete'); n++;
 // And it names them. "3 automations use it" sends somebody hunting.
-assert.match(delFn.slice(iAuto, iAuto + 700), /template_name/,
+assert.match(delFn.slice(iAuto, iAuto + 700), /template_key/,
   'the refusal does not name which automations, so the admin has to go and find them'); n++;
+/* template_key, and the column matters.
+   This first read `t.name`, which wa_templates does not have — it holds
+   template_key and provider_template_name. A static test cannot know that: the
+   assertion passed happily on a query that would have thrown "column t.name
+   does not exist" the first time somebody tried to delete a status. It was
+   caught by running the SQL against a real Postgres, which is the only thing
+   that can catch it. This assertion pins the correct column so the wrong one
+   cannot come back. */
+assert.ok(!/t\.name\b/.test(delFn),
+  'the automation lookup selects t.name — wa_templates has no such column and the '
+  + 'delete would throw'); n++;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PART 5 — Deleting an appointment puts the lead back where it WAS

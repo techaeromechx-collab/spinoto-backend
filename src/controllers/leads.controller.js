@@ -63,19 +63,36 @@ function handle(req, res, next, fn) {
 // =====================================================================
 
 // Full SELECT fragment reused by list + get
-/* ── The shared WhatsApp queue ────────────────────────────────────────────────
-   An auto-created WhatsApp lead has created_by NULL — no user made it — and,
-   until routing assigns it, assigned_to NULL too. Every scope filter below keys
-   off exactly those two columns, so without this the queue would be invisible
-   to everyone except full-access users: the leads the CRM works hardest to
-   capture would be the only ones an advisor cannot see.
+/* ── The shared WhatsApp queue was HERE, and has been removed ────────────────
 
-   Scoped as tightly as it can be — WhatsApp source, unassigned only. The moment
-   somebody owns it the lead leaves this clause and obeys the normal rules
-   again. No parameter, so it can be concatenated into any of the three filters
-   without disturbing their $n numbering. */
-const SHARED_SQL =
-  " OR (LOWER(TRIM(COALESCE(l.lead_source,''))) = 'whatsapp' AND l.assigned_to IS NULL)";
+   An auto-created WhatsApp lead has created_by NULL — no user made it — and,
+   until somebody is given it, assigned_to NULL too. Every scope filter below
+   keys off exactly those two columns, so such a lead matches nothing and is
+   visible only to Super Admin and VIEW_LEAD.
+
+   A clause used to be concatenated into the two lower scopes making every
+   unassigned WhatsApp lead visible to EVERY advisor — a shared queue anyone
+   could pick from. That was the right design for an install where routing
+   assigns automatically and the unassigned pile is a handful of leftovers.
+
+   It is the wrong design here, and the reason is a deliberate operational
+   choice rather than a technical one: this workshop does not want automatic
+   assignment. Leads are handed out by a manager. So "unassigned" no longer
+   means "nobody has got to it yet" — it means "not yet allocated", which is a
+   manager's in-tray, not a free-for-all. Twenty advisors seeing and working
+   the same untriaged lead is the failure this prevents.
+
+   ── WHAT THIS COSTS, AND WHERE IT SHOWS ───────────────────────────────────
+
+   Nothing assigns these leads on its own now. If nobody is watching, they
+   accumulate unseen — invisible to the very people who would have worked them.
+   That is the intended trade and it has a single point of failure: somebody
+   has to look. Settings → WhatsApp → Routing can still name a fallback owner
+   if that ever stops being true.
+
+   The clause is deleted rather than switched off behind a flag. A flag here
+   would be a second visibility rule to keep in step across four queries, and
+   the one that drifts is always the one nobody tests. */
 
 /* ── The last thing that happened to this lead ────────────────────────────────
    Two sources, because the timeline on the detail page has two: structured
@@ -184,102 +201,232 @@ ${ACTIVITY_COLS},
   LEFT JOIN users         au ON au.id = l.assigned_to
 ${ACTIVITY_JOIN}
 `;
+/* ══ THE LEAD LIST ══════════════════════════════════════════════════════════
+ *
+ * ── WHY THIS IS PAGINATED ON THE SERVER ─────────────────────────────────────
+ *
+ * It used to return EVERY lead the caller could see, in one response, and the
+ * browser did the filtering, the counting and the paging on the array it was
+ * handed. At a few hundred leads that is the simpler design and it was the
+ * right call. At four thousand it is six to ten megabytes of JSON on every
+ * visit, every refresh, on a phone, for ten visible rows — and each row carries
+ * nine joins and six correlated subqueries, so the database does roughly fifty
+ * thousand index lookups to build a page nobody reads past.
+ *
+ * The cost scales exactly with the lead count, which is the number this CRM
+ * exists to grow.
+ *
+ * ── WHAT THAT FORCES ────────────────────────────────────────────────────────
+ *
+ * Every filter has to move here too. A page of ten filtered in the browser is
+ * ten rows filtered out of ten — the other 3,990 are not there to match. So the
+ * fifteen filters the frontend was applying (search, status, assignee, creator,
+ * dates, location, vehicle, source, and the chips) are all expressed below, and
+ * the browser now sends its state rather than its opinion.
+ *
+ * ── AND THE COUNTS, WHICH ARE THE EASY THING TO GET WRONG ───────────────────
+ *
+ * The chips show numbers: "Follow-Up 47", "WhatsApp 900", "Unassigned 30".
+ * Those come from the whole set, not from the page. Compute them from `items`
+ * after paginating and every one of them silently becomes a number out of ten —
+ * still rendered, still confident, completely wrong. So they are counted here,
+ * in their own aggregates.
+ *
+ * The three count sets deliberately use DIFFERENT bases, mirroring exactly what
+ * the browser used to do:
+ *
+ *   status    scope + the assignee filter. Picking an agent re-counts the
+ *             statuses for that agent — that is the point of the combination.
+ *   source    scope only. The source chips are a way IN to a filter; counting
+ *             them through the current filter would show zeroes on every chip
+ *             you have not already picked.
+ *   assignee  scope only, same reasoning.
+ *   value     scope + every filter. It describes the result, not the entry
+ *             points.
+ */
+
+/** Small helper: push a value, get its placeholder. Keeps $n numbering honest
+ *  across four queries that share a params array. */
+function ph(params, value) {
+  params.push(value);
+  return `$${params.length}`;
+}
+
+/**
+ * Who reports to this manager, plus themselves.
+ *
+ * Read ONCE per request and passed to scopeConditions, which is called four
+ * times — once for the page and once per count base. Left inside
+ * scopeConditions it was four identical round trips to build one answer that
+ * cannot change between them.
+ */
+async function teamIdsFor(user) {
+  const r = await pool.query(`SELECT id FROM users WHERE manager_id = $1`, [user.id]);
+  return [...r.rows.map(x => x.id), user.id];
+}
+
+/**
+ * teamIdsFor, but only when the answer will be used.
+ *
+ * A super admin and a VIEW_LEAD holder are not scoped at all, and an advisor
+ * with VIEW_OWN_LEADS is scoped by their own id — neither needs the lookup, and
+ * running it anyway is a query per request for a value that gets discarded.
+ */
+async function teamIdsIfNeeded(user) {
+  if (user.is_super_admin || user.permissions.has('VIEW_LEAD')) return null;
+  if (!user.permissions.has('VIEW_TEAM_LEADS')) return null;
+  return teamIdsFor(user);
+}
+
+/** Which leads this user may see at all. Pushes into `params`. */
+function scopeConditions(user, teamIds, params) {
+  if (user.is_super_admin || user.permissions.has('VIEW_LEAD')) return [];
+
+  if (teamIds) return [`(l.created_by = ANY(${ph(params, teamIds)}))`];
+
+  // VIEW_OWN_LEADS — created by them OR given to them. The second half is what
+  // makes handing somebody a lead work at all.
+  const me = ph(params, user.id);
+  return [`(l.created_by = ${me} OR l.assigned_to = ${me})`];
+}
+
+/* The source chips, as SQL.
+   Grouped rather than matched exactly, because lead_source is free text
+   (VARCHAR(80), no FK) with years of values in it. 'Manual' is not a stored
+   value at all — it is the ABSENCE of a campaign source, which is what a lead
+   typed in by an advisor looks like. */
+const META_SOURCES   = "'meta ads','meta','facebook','instagram','facebook ads','instagram ads','social media'";
+const MANUAL_SOURCES = "'manual','walk-in','walk in','phone call','referral'";
+const SRC = "LOWER(TRIM(COALESCE(l.lead_source,'')))";
+
+function sourceChipSql(key) {
+  switch (key) {
+    case 'whatsapp': return `${SRC} = 'whatsapp'`;
+    case 'website':  return `${SRC} = 'website'`;
+    case 'meta ads': case 'meta_ads': case 'meta':
+      return `${SRC} IN (${META_SOURCES})`;
+    // The absence of a source is a manual lead. Written as a real condition so
+    // the chip and its count cannot disagree.
+    case 'manual':   return `(${SRC} = '' OR ${SRC} IN (${MANUAL_SOURCES}))`;
+    // Defined as the complement, so a source nobody thought of still appears
+    // SOMEWHERE instead of being invisible in every filter.
+    case 'other':    return `(${SRC} <> '' AND ${SRC} NOT IN ('whatsapp','website',${META_SOURCES},${MANUAL_SOURCES}))`;
+    default:         return null;
+  }
+}
+
+/** Everything the user has typed or clicked, as SQL. */
+function filterConditions(q, params) {
+  const c = [];
+
+  const search = (q.search || '').trim();
+  if (search) {
+    const s = ph(params, `%${search.toLowerCase()}%`);
+    c.push(`(LOWER(COALESCE(l.name,'')) LIKE ${s} OR l.mobile LIKE ${s})`);
+  }
+
+  /* Statuses arrive as a comma-separated list because the chips are
+     multi-select. '__new__' is not a status — it is the ABSENCE of one, which
+     is what "New Lead" means in this schema, so it cannot be matched by name
+     and has to be its own branch. */
+  const statuses = String(q.status || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (statuses.length) {
+    const wantsNew = statuses.includes('__new__');
+    const named = statuses.filter(s => s !== '__new__');
+    const parts = [];
+    if (wantsNew) parts.push(`(l.status IS NULL OR TRIM(l.status) = '')`);
+    if (named.length) parts.push(`l.status = ANY(${ph(params, named)})`);
+    c.push(`(${parts.join(' OR ')})`);
+  }
+
+  // Same shape for assignees, and 'unassigned' is the same kind of exception.
+  const assignees = String(q.assignee || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (assignees.length) {
+    const wantsNone = assignees.includes('unassigned');
+    const ids = assignees.filter(s => s !== 'unassigned').map(Number).filter(Number.isInteger);
+    const parts = [];
+    if (wantsNone) parts.push('l.assigned_to IS NULL');
+    if (ids.length) parts.push(`l.assigned_to = ANY(${ph(params, ids)})`);
+    if (parts.length) c.push(`(${parts.join(' OR ')})`);
+  }
+
+  if (q.creator) c.push(`l.created_by = ${ph(params, Number(q.creator))}`);
+
+  /* Dates are compared in the SERVER's timezone via ::date, matching what the
+     browser did with new Date(dateFrom + 'T00:00:00') — local midnight, not
+     UTC. Comparing a timestamptz against a bare date would shift every
+     boundary by the offset and quietly drop the first or last day. */
+  if (q.date_from) c.push(`l.created_at::date >= ${ph(params, q.date_from)}::date`);
+  if (q.date_to)   c.push(`l.created_at::date <= ${ph(params, q.date_to)}::date`);
+
+  for (const [key, col] of [
+    ['state', 'state_id'], ['city', 'city_id'], ['area', 'area_id'],
+    ['vehicle_type', 'vehicle_type_id'], ['make', 'make_id'], ['model', 'model_id'],
+  ]) {
+    if (q[key]) c.push(`l.${col} = ${ph(params, Number(q[key]))}`);
+  }
+
+  // The exact-source dropdown, which is separate from the chips above it.
+  if (q.source_exact) c.push(`l.lead_source = ${ph(params, q.source_exact)}`);
+
+  const chip = String(q.source || '').trim().toLowerCase();
+  if (chip && chip !== 'all') {
+    const sql = sourceChipSql(chip);
+    // An unrecognised value is treated as an exact source name, so the filter
+    // keeps working if one is added to lead_sources without touching this.
+    c.push(sql || `${SRC} = ${ph(params, chip)}`);
+  }
+
+  /* The owner chips. 'mine' needs the caller's id, which is why this takes the
+     user — the browser used to compare against currentUser.id in JavaScript. */
+  const owner = String(q.owner || '').trim().toLowerCase();
+  if (owner === 'unassigned') c.push('l.assigned_to IS NULL');
+  else if (owner === 'mine')  c.push(`l.assigned_to = ${ph(params, q._userId)}`);
+
+  return c;
+}
+
+/* Sortable columns, as an allowlist.
+   An ORDER BY built from a query parameter is an injection whatever escaping
+   is applied around it, because it is an identifier rather than a value. The
+   map is the validation. */
+const SORTABLE = {
+  created_at: 'l.created_at',
+  updated_at: 'l.updated_at',
+  name:       'l.name',
+  status:     'l.status',
+  value:      'l.total_price',
+};
 
 function listLeads(req, res, next) {
   handle(req, res, next, async () => {
-    const search = (req.query.search || '').trim();
-    const status = req.query.status || '';
-    const user   = req.user;
+    const user = req.user;
+    const q    = { ...req.query, _userId: user.id };
 
-    const conditions = [];
-    const params     = [];
+    /* Ten by default, matching the pager's own first option, and capped.
+       Uncapped, `?page_size=99999` is the un-paginated endpoint again — with
+       the added insult that the browser asked for it. */
+    const pageSize = Math.min(Math.max(parseInt(q.page_size, 10) || 10, 1), 200);
+    const page     = Math.max(parseInt(q.page, 10) || 1, 1);
+    const offset   = (page - 1) * pageSize;
 
-    // ── Scope by permission level ──────────────────────────────────────────
-    if (!user.is_super_admin && !user.permissions.has('VIEW_LEAD')) {
-      if (user.permissions.has('VIEW_TEAM_LEADS')) {
-        // Find all callers whose manager_id = this user's id, then include own leads too
-        const teamRows = await pool.query(
-          `SELECT id FROM users WHERE manager_id = $1`,
-          [user.id]
-        );
-        const teamIds = teamRows.rows.map(r => r.id);
-        teamIds.push(user.id); // include manager's own leads as well
-        params.push(teamIds);
-        conditions.push(`(l.created_by = ANY($${params.length})${SHARED_SQL})`);
-      } else {
-        // VIEW_OWN_LEADS — leads they created OR are assigned to
-        params.push(user.id);
-        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`);
-      }
-    }
+    const sortCol = SORTABLE[String(q.sort || 'created_at')] || SORTABLE.created_at;
+    const sortDir = String(q.dir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
-    // ── Search & status filters ────────────────────────────────────────────
-    if (search) {
-      params.push(`%${search.toLowerCase()}%`);
-      conditions.push(`(LOWER(COALESCE(l.name,'')) LIKE $${params.length} OR l.mobile LIKE $${params.length})`);
-    }
-    if (status) {
-      params.push(status);
-      conditions.push(`l.status = $${params.length}`);
-    }
+    const teamIds = await teamIdsIfNeeded(user);
 
-    // ── Source filter ──────────────────────────────────────────────────────
-    //
-    // New. The list had search and status only, so "show me just the WhatsApp
-    // leads" was not expressible — which matters now that leads arrive from the
-    // inbound webhook and need to be told apart from the ones staff typed.
-    //
-    // TRIM everywhere. The client mirrors this grouping in LeadsPage.jsx and
-    // trims before comparing; without it here a source stored as '  WhatsApp  '
-    // — which free-text entry allows — lands under WhatsApp in the browser and
-    // under Other on the server, and the same filter returns two different
-    // answers depending on which one you asked.
-    //
-    // Grouped rather than an exact match, because lead_source is free text
-    // (VARCHAR(80), no FK) with years of values in it. 'Manual' is not a stored
-    // value at all — it is the ABSENCE of a campaign source, which is what a
-    // lead typed in by an advisor looks like. Encoding that here keeps the
-    // chips honest rather than offering a filter that returns nothing.
-    const source = (req.query.source || '').trim();
-    if (source && source.toLowerCase() !== 'all') {
-      const key = source.toLowerCase();
-      if (key === 'whatsapp') {
-        params.push('whatsapp');
-        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
-      } else if (key === 'website') {
-        params.push('website');
-        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
-      } else if (key === 'meta ads' || key === 'meta_ads' || key === 'meta') {
-        // Meta covers what people have historically typed for the same thing.
-        conditions.push(
-          `LOWER(TRIM(COALESCE(l.lead_source, ''))) IN ('meta ads','meta','facebook','instagram','facebook ads','instagram ads','social media')`
-        );
-      } else if (key === 'manual') {
-        // Typed by a person: no source, or one of the walk-up channels.
-        conditions.push(
-          `(l.lead_source IS NULL OR TRIM(l.lead_source) = ''
-            OR LOWER(TRIM(l.lead_source)) IN ('manual','walk-in','walk in','phone call','referral'))`
-        );
-      } else if (key === 'other') {
-        // Everything the four chips above do not claim. Defined as the
-        // complement so a source nobody thought of still appears SOMEWHERE
-        // instead of being invisible in every filter.
-        conditions.push(
-          `(l.lead_source IS NOT NULL AND TRIM(l.lead_source) <> ''
-            AND LOWER(TRIM(l.lead_source)) NOT IN (
-              'whatsapp','website','meta ads','meta','facebook','instagram',
-              'facebook ads','instagram ads','social media',
-              'manual','walk-in','walk in','phone call','referral'))`
-        );
-      } else {
-        // Anything else is treated as an exact source name, so the filter keeps
-        // working if a new one is added to lead_sources without touching this.
-        params.push(key);
-        conditions.push(`LOWER(TRIM(COALESCE(l.lead_source, ''))) = $${params.length}`);
-      }
-    }
+    // ── The page itself ────────────────────────────────────────────────────
+    const params  = [];
+    const scope   = scopeConditions(user, teamIds, params);
+    const filters = filterConditions(q, params);
+    const all     = [...scope, ...filters];
+    const where   = all.length ? `WHERE ${all.join(' AND ')}` : '';
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    /* Snapshotted BEFORE the limit and offset are pushed, so the count query
+       can reuse the identical WHERE with the identical params.
+       The alternative — slicing two off the end afterwards — works and breaks
+       silently the day somebody adds a third parameter below. */
+    const whereParams = [...params];
 
     // Separate SELECT for list view — adds service/category subqueries in SELECT clause
     const LIST_SELECT = `
@@ -337,17 +484,131 @@ function listLeads(req, res, next) {
       LEFT JOIN users         u  ON u.id  = l.created_by
       LEFT JOIN users         au ON au.id = l.assigned_to${ACTIVITY_JOIN}
     `;
+    /* NULLS LAST on both directions so a lead with no name or no value sinks
+       rather than heading the list. Postgres defaults NULLs first on DESC,
+       which puts every unnamed lead at the top of a name sort. */
+    const items = await pool.query(
+      `${LIST_SELECT} ${where} ORDER BY ${sortCol} ${sortDir} NULLS LAST, l.id ${sortDir}
+        LIMIT ${ph(params, pageSize)} OFFSET ${ph(params, offset)}`,
+      params
+    );
 
-    const r = await pool.query(`${LIST_SELECT} ${where} ORDER BY l.created_at DESC`, params);
+    /* ── The numbers ───────────────────────────────────────────────────────
+       Four aggregates, three different bases — see the header. Run together:
+       they are independent, and serialising them would make the page wait for
+       the sum of four round trips instead of the slowest one.
 
-    // Tell the frontend what scope was applied so it can show the right heading
-    const scope = user.is_super_admin || user.permissions.has('VIEW_LEAD')
-      ? 'all'
-      : user.permissions.has('VIEW_TEAM_LEADS')
-      ? 'team'
-      : 'own';
+       Each rebuilds its own params array. Sharing one would mean four queries
+       agreeing on $n ordering, which is the kind of coupling that breaks the
+       moment somebody adds a filter to one of them. */
+    const cParams    = [];
+    const countScope = scopeConditions(user, teamIds, cParams);
 
-    res.json({ items: r.rows, scope });
+    // status: scope + the assignee filter only
+    const sParams = [...cParams];
+    const sWhere  = [...countScope,
+                     ...filterConditions({ assignee: q.assignee, _userId: user.id }, sParams)];
+
+    // owner chips: scope + the source chip only
+    const oParams = [];
+    const oWhere  = scopeConditions(user, teamIds, oParams);
+    {
+      const chip = String(q.source || '').trim().toLowerCase();
+      if (chip && chip !== 'all') {
+        const sql = sourceChipSql(chip);
+        oWhere.push(sql || `${SRC} = ${ph(oParams, chip)}`);
+      }
+    }
+
+    // value: scope + everything
+    const vParams = [];
+    const vAll    = [...scopeConditions(user, teamIds, vParams), ...filterConditions(q, vParams)];
+
+    const [total, statusCounts, sourceCounts, assigneeCounts, ownerCounts, value] = await Promise.all([
+      // No joins: every condition above references l.* only, so counting does
+      // not need the nine LEFT JOINs the page itself carries.
+      pool.query(`SELECT COUNT(*)::int AS n FROM leads l ${where}`, whereParams),
+
+      pool.query(
+        `SELECT COALESCE(NULLIF(TRIM(l.status), ''), '__new__') AS k, COUNT(*)::int AS n
+           FROM leads l ${sWhere.length ? `WHERE ${sWhere.join(' AND ')}` : ''}
+          GROUP BY 1`, sParams),
+
+      pool.query(
+        `SELECT COUNT(*)::int AS all_n,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('whatsapp')})::int AS whatsapp,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('website')})::int  AS website,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('meta ads')})::int AS meta,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('manual')})::int   AS manual,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('other')})::int    AS other
+           FROM leads l ${countScope.length ? `WHERE ${countScope.join(' AND ')}` : ''}`, cParams),
+
+      /* The assignee dropdown's LIST, not just its numbers.
+         It used to be derived in the browser from the leads it had — fine when
+         that was every lead, useless when it is ten: the dropdown would offer
+         whoever happened to appear on page one and hide the rest, so filtering
+         by an agent became impossible the moment they had no recent lead.
+         Names come from the join because an id is not something to show. */
+      pool.query(
+        `SELECT COALESCE(l.assigned_to::text, 'unassigned') AS k,
+                COUNT(*)::int AS n,
+                MAX(u.name) AS name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+          ${countScope.length ? `WHERE ${countScope.join(' AND ')}` : ''}
+          GROUP BY 1`, cParams),
+
+      /* The owner chips, counted THROUGH the source chip.
+         Everyone / Mine / Unassigned sit beside the source strip and combine
+         with it rather than replacing it — WhatsApp + Unassigned is a real
+         view somebody opens at the start of a shift. So the number on
+         Unassigned has to be the number you would get if you pressed it, not a
+         global total that changes the moment you do.
+         Only the source chip is applied, not the rest of the filters: these
+         are entry points, same as the source counts above. */
+      pool.query(
+        `SELECT COUNT(*)::int AS all_n,
+                COUNT(*) FILTER (WHERE l.assigned_to IS NULL)::int AS unassigned,
+                COUNT(*) FILTER (WHERE l.assigned_to = ${ph(oParams, user.id)})::int AS mine
+           FROM leads l ${oWhere.length ? `WHERE ${oWhere.join(' AND ')}` : ''}`, oParams),
+
+      pool.query(
+        `SELECT COALESCE(SUM(l.total_price), 0)::float AS v
+           FROM leads l ${vAll.length ? `WHERE ${vAll.join(' AND ')}` : ''}`, vParams),
+    ]);
+
+    const asMap = (rows) => rows.reduce((acc, r) => { acc[r.k] = r.n; return acc; }, {});
+    const sc = sourceCounts.rows[0] || {};
+
+    res.json({
+      items: items.rows,
+      total: total.rows[0].n,
+      page,
+      page_size: pageSize,
+      // Tell the frontend what scope was applied so it can show the right heading
+      scope: user.is_super_admin || user.permissions.has('VIEW_LEAD') ? 'all'
+           : user.permissions.has('VIEW_TEAM_LEADS') ? 'team' : 'own',
+      /* Everyone who currently holds a lead, with how many — the dropdown's
+         options and its counts in one list, so the two cannot disagree. */
+      assignees: assigneeCounts.rows
+        .filter(r => r.k !== 'unassigned')
+        .map(r => ({ id: r.k, name: r.name || `#${r.k}`, count: r.n }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      counts: {
+        status:   asMap(statusCounts.rows),
+        assignee: asMap(assigneeCounts.rows),
+        owner: {
+          all:        ownerCounts.rows[0]?.all_n || 0,
+          mine:       ownerCounts.rows[0]?.mine || 0,
+          unassigned: ownerCounts.rows[0]?.unassigned || 0,
+        },
+        source: {
+          all: sc.all_n || 0, whatsapp: sc.whatsapp || 0, website: sc.website || 0,
+          'meta ads': sc.meta || 0, manual: sc.manual || 0, other: sc.other || 0,
+        },
+      },
+      total_value: value.rows[0].v,
+    });
   });
 }
 
@@ -360,21 +621,13 @@ function getLead(req, res, next) {
     let whereClause = 'WHERE l.id = $1';
     const params = [id];
 
-    if (!user.is_super_admin && !user.permissions.has('VIEW_LEAD')) {
-      if (user.permissions.has('VIEW_TEAM_LEADS')) {
-        // All callers whose manager_id = this user + own leads
-        const teamRows = await pool.query(
-          `SELECT id FROM users WHERE manager_id = $1`, [user.id]
-        );
-        const teamIds = [user.id, ...teamRows.rows.map(r => r.id)];
-        params.push(teamIds);
-        whereClause += ` AND (l.created_by = ANY($${params.length})${SHARED_SQL})`;
-      } else {
-        // VIEW_OWN_LEADS — leads created by or assigned to this user
-        params.push(user.id);
-        whereClause += ` AND (l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`;
-      }
-    }
+    /* The same helper the list uses, rather than a fourth copy of the rule.
+       There were three copies and they had already drifted — one built its team
+       array as [self, ...team] and another as [...team, self], which is
+       harmless and is exactly how the difference that is NOT harmless gets in
+       unnoticed. */
+    const scope = scopeConditions(user, await teamIdsIfNeeded(user), params);
+    if (scope.length) whereClause += ` AND ${scope.join(' AND ')}`;
 
     const leadRow = await pool.query(`${LEAD_SELECT} ${whereClause}`, params);
     if (!leadRow.rows[0]) return res.status(404).json({ error: 'Lead not found' });
@@ -515,6 +768,40 @@ function updateLead(req, res, next) {
         }
       }
 
+      /* ── A status that needs a follow-up must arrive with one ─────────────
+         needs_follow_up was enforced only in the browser: StatusActionModal
+         refuses to confirm without a date. The API never checked, so any other
+         caller could move a lead INTO a chase status while the auto-close below
+         shut the previous follow-up — leaving the lead in "Attempt 2" with
+         nothing scheduled, and invisible, because the Follow-up list is built
+         from open lead_events rows. The one place it would eventually surface
+         is a compliance report, as a lead nobody ever followed up.
+
+         Only on the TRANSITION. Saving a note on a lead already sitting in
+         Attempt 2 must not demand a date it does not have.
+
+         This cannot break the UI: the modal already blocks the same case, so
+         every request the frontend sends today carries the date. It also cannot
+         break an import — import.controller.js writes leads.status directly and
+         never comes through here, which is right: loading history is not the
+         same act as working a lead. */
+      if (coreData.status && coreData.status !== prevLead?.status && !req.body.follow_up_date) {
+        const nf = await client.query(
+          `SELECT name FROM lead_statuses
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) AND needs_follow_up = TRUE
+            LIMIT 1`,
+          [coreData.status]
+        );
+        if (nf.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(422).json({
+            error: `"${nf.rows[0].name}" needs a follow-up date. Send follow_up_date (YYYY-MM-DD) with the status change.`,
+            code: 'FOLLOW_UP_REQUIRED',
+            status: nf.rows[0].name,
+          });
+        }
+      }
+
       // Update core lead fields if any provided
       const fields = [];
       const params = [];
@@ -570,9 +857,13 @@ function updateLead(req, res, next) {
       // (The old auto-timing via follow_up_days/follow_up_hours has been replaced
       //  by the manual follow-up modal on the frontend.)
       if (req.body.follow_up_date) {
-        // Close any existing open follow-ups for this lead
+        /* Close any existing open follow-ups for this lead.
+           auto_closed = TRUE: this is the follow-up being REPLACED by the one
+           about to be inserted, not one anybody completed. Counting it as
+           completed would credit the advisor for a call they are, in this very
+           request, rescheduling. */
         await client.query(
-          `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+          `UPDATE lead_events SET is_done = TRUE, done_at = NOW(), auto_closed = TRUE
            WHERE lead_id = $1 AND is_done = FALSE`,
           [id]
         );
@@ -615,7 +906,7 @@ function updateLead(req, res, next) {
       // mark all pending events as done automatically.
       if (coreData.status && coreData.status !== prevLead?.status && !req.body.follow_up_date) {
         await client.query(
-          `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+          `UPDATE lead_events SET is_done = TRUE, done_at = NOW(), auto_closed = TRUE
            WHERE lead_id = $1 AND is_done = FALSE`,
           [id]
         );
@@ -944,22 +1235,8 @@ function exportLeads(req, res, next) {
     const conditions = [];
     const params     = [];
 
-    // Same scope rules as listLeads
-    if (!user.is_super_admin && !user.permissions.has('VIEW_LEAD')) {
-      if (user.permissions.has('VIEW_TEAM_LEADS')) {
-        const teamRows = await pool.query(
-          `SELECT id FROM users WHERE manager_id = $1`, [user.id]
-        );
-        const teamIds = teamRows.rows.map(r => r.id);
-        teamIds.push(user.id);
-        params.push(teamIds);
-        conditions.push(`(l.created_by = ANY($${params.length})${SHARED_SQL})`);
-      } else {
-        // VIEW_OWN_LEADS — leads they created OR are assigned to
-        params.push(user.id);
-        conditions.push(`(l.created_by = $${params.length} OR l.assigned_to = $${params.length}${SHARED_SQL})`);
-      }
-    }
+    // Same helper as the list. One rule, one implementation.
+    conditions.push(...scopeConditions(user, await teamIdsIfNeeded(user), params));
 
     if (search) {
       params.push(`%${search.toLowerCase()}%`);
@@ -1224,10 +1501,12 @@ function bulkStatus(req, res, next) {
          stores, and accepting anything Date() will swallow would let
          '2026' through as 1 January.
 
-         Optional, always. A status that needs a follow-up can still be set
-         without one — the frontend asks, the API does not insist, and a
-         script moving leads to "Contacted" should not have to invent a
-         date to be allowed to. */
+         Optional at the SCHEMA level, then required below for a status
+         flagged needs_follow_up. It has to be in two places: zod cannot see
+         lead_statuses, so which statuses demand a date is a database fact,
+         not a shape. A script moving leads to a plain status still needs no
+         date; one moving them into a chase status does, because this handler
+         closes the existing follow-up either way. */
       follow_up_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/,
         'The follow-up date must look like 2026-08-25.').optional().nullable(),
       follow_up_time: z.string().trim().regex(/^\d{2}:\d{2}$/,
@@ -1241,7 +1520,7 @@ function bulkStatus(req, res, next) {
     // stores the NAME, and a rename in Settings should not be able to strand a
     // request that was in flight.
     const stRes = await pool.query(
-      `SELECT name, is_locked, converts_to_appointment
+      `SELECT name, is_locked, converts_to_appointment, needs_follow_up
          FROM lead_statuses
         WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
         LIMIT 1`,
@@ -1254,6 +1533,24 @@ function bulkStatus(req, res, next) {
     if (target.converts_to_appointment) {
       return res.status(400).json({
         error: `"${target.name}" creates an appointment, which needs details for each lead. Open the leads one at a time to use it.`,
+      });
+    }
+    /* Same rule as the single-lead update, and it matters MORE here.
+       This handler closes the open follow-up on every selected lead before
+       inserting the new one. Without a date there is no new one — so a bulk
+       move of 200 leads into "Attempt 2" would silently strip 200 follow-ups
+       and schedule nothing, which is the largest version of this mistake
+       anybody can make in one click.
+
+       The comment on follow_up_date in the schema above says the API does not
+       insist, which was true and is now true only for statuses that do not
+       carry the flag. A script moving leads to a plain status still needs no
+       date; a script moving them into a chase status does. */
+    if (target.needs_follow_up && !follow_up_date) {
+      return res.status(422).json({
+        error: `"${target.name}" needs a follow-up date. Send follow_up_date (YYYY-MM-DD) with the bulk status change.`,
+        code: 'FOLLOW_UP_REQUIRED',
+        status: target.name,
       });
     }
 
@@ -1329,7 +1626,7 @@ function bulkStatus(req, res, next) {
       // the same breath, which is the version of this bug that looks like
       // "bulk follow-ups silently do nothing".
       await client.query(
-        `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+        `UPDATE lead_events SET is_done = TRUE, done_at = NOW(), auto_closed = TRUE
           WHERE lead_id = ANY($1) AND is_done = FALSE`,
         [ids]
       );
@@ -1558,12 +1855,12 @@ async function checkMobile(req, res, next) {
     const user = req.user;
     const full = Boolean(user.is_super_admin || user.permissions.has('VIEW_LEAD'));
 
-    // Same team resolution as listLeads and getLead: direct reports, plus self.
-    let teamIds = null;
-    if (!full && user.permissions.has('VIEW_TEAM_LEADS')) {
-      const t = await pool.query(`SELECT id FROM users WHERE manager_id = $1`, [user.id]);
-      teamIds = [user.id, ...t.rows.map(r => r.id)];
-    }
+    /* Same team resolution as everywhere else.
+       This handler cannot use scopeConditions itself: it needs the predicate as
+       an expression in the SELECT list with hand-computed placeholder numbers,
+       not appended to a params array. The team LOOKUP is shared even so —
+       that was the part that had drifted between copies. */
+    const teamIds = await teamIdsIfNeeded(user);
 
     // Only return leads that are still OPEN (not yet converted to an appointment,
     // not lost, not cancelled). Leads that already have an appointment linked are
@@ -1578,11 +1875,11 @@ async function checkMobile(req, res, next) {
       canViewSql = 'TRUE';
     } else if (teamIds) {
       scopeParams.push(teamIds);
-      canViewSql = `(l.created_by = ANY($${1 + (excludeId ? 2 : 1)})${SHARED_SQL})`;
+      canViewSql = `(l.created_by = ANY($${1 + (excludeId ? 2 : 1)}))`;
     } else {
       scopeParams.push(user.id);
       canViewSql = `(l.created_by = $${1 + (excludeId ? 2 : 1)} `
-                 + `OR l.assigned_to = $${1 + (excludeId ? 2 : 1)}${SHARED_SQL})`;
+                 + `OR l.assigned_to = $${1 + (excludeId ? 2 : 1)})`;
     }
 
     // ── COALESCE, and it is not decoration ──────────────────────────────────

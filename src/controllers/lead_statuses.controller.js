@@ -272,15 +272,20 @@ function deleteStatus(req, res, next) {
        cascade to — only a person knows which status that message should now
        follow. Naming the rules in the message is the whole point: "3
        automations use it" sends somebody hunting through a list. */
+    // template_key, not `name` — wa_templates has no `name` column. It holds
+    // template_key (the stable key used in code) and provider_template_name
+    // (Interakt's own display string, which an admin can change in a dashboard
+    // we do not control). The key is the one worth showing: it is what the
+    // automations screen lists them under.
     const rules = await pool.query(
-      `SELECT a.id, t.name AS template_name
+      `SELECT a.id, t.template_key
          FROM wa_automations a
          LEFT JOIN wa_templates t ON t.id = a.template_id
         WHERE a.match_value = $1 AND a.event LIKE 'lead.%'
         ORDER BY a.id`,
       [name]);
     if (rules.rowCount) {
-      const which = rules.rows.map(r => r.template_name || `#${r.id}`).join(', ');
+      const which = rules.rows.map(r => r.template_key || `#${r.id}`).join(', ');
       return res.status(409).json({
         error: `Cannot delete — ${rules.rowCount} WhatsApp automation(s) send on this status `
              + `(${which}). Point them at another status first, in Settings → WhatsApp → Automations.`,

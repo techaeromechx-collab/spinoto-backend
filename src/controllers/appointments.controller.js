@@ -504,6 +504,35 @@ function createAppointment(req, res, next) {
             );
           }
         }
+
+        /* ── Close the open follow-up ────────────────────────────────────
+           This file changed the lead's status for years and never touched
+           lead_events — the word did not appear in it once. The row stayed
+           is_done = FALSE forever.
+
+           It was invisible rather than harmless: listEvents and pendingCount
+           both skip leads sitting in a converts_to_appointment status, so
+           nobody saw the orphan. Then you DELETE the appointment, the lead is
+           returned to the status it held before (see the un-convert below),
+           and a follow-up from six weeks ago reappears at the top of somebody's
+           list as overdue — for a call that stopped being owed the moment the
+           customer booked.
+
+           OUTSIDE the `if (oldStatusName !== newStatusName)` on purpose. The
+           thing that settles the follow-up is the BOOKING, not the status
+           transition. A lead already sitting in the converting status still
+           has its chase settled by an appointment being made.
+
+           auto_closed = TRUE: nobody completed this follow-up, the reason for
+           it went away. Counting it as completed would hand every advisor a
+           free on-time tick for each lead they convert — which is precisely
+           the leads they are most likely to convert. */
+        await client.query(
+          `UPDATE lead_events
+              SET is_done = TRUE, done_at = NOW(), auto_closed = TRUE
+            WHERE lead_id = $1 AND is_done = FALSE`,
+          [data.lead_id]
+        );
       }
 
       // Queue the "Appointment Generated" WhatsApp message.

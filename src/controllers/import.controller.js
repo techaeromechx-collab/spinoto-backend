@@ -1822,8 +1822,13 @@ async function importLeads(req, res, next) {
           WHERE l.id = v.id`,
         params
       );
+      /* auto_closed = TRUE, and this is the site that made the reports lie
+         loudest. An import updating 400 statuses closes 400 follow-ups in one
+         statement; without this flag every one of them was booked as a
+         completed follow-up, on_time for any not yet due, and attributed to
+         whoever happened to be assigned to the lead. */
       await client.query(
-        `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
+        `UPDATE lead_events SET is_done = TRUE, done_at = NOW(), auto_closed = TRUE
           WHERE lead_id = ANY($1) AND is_done = FALSE`,
         [batch.map(r => r.existingLeadId)]
       );

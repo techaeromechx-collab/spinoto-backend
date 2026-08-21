@@ -385,20 +385,31 @@ function getStats(req, res, next) {
          )::int AS upcoming,
 
          -- Period-scoped: Completed (done_at within period bounds)
-         COUNT(*) FILTER (WHERE e.is_done = TRUE
+         --
+         -- NOT e.auto_closed on every done-based figure below. "Completed" here
+         -- is shown to an advisor as their own week's work, so a follow-up that
+         -- expired when somebody moved the status must not appear in it — that
+         -- is somebody reading their own effort off a number that counts things
+         -- they did not do.
+         COUNT(*) FILTER (WHERE e.is_done = TRUE AND NOT e.auto_closed
            AND ($2::text IS NULL OR e.done_at::date >= $2::date)
            AND ($3::text IS NULL OR e.done_at::date <= $3::date)
          )::int AS completed,
 
          -- All-time for completion rate denominator
-         COUNT(*) FILTER (WHERE e.is_done = TRUE)::int AS completed_total,
-         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE e.is_done = TRUE AND NOT e.auto_closed)::int AS completed_total,
+         -- and the denominator loses them too, or the rate is a fraction whose
+         -- top and bottom count different things.
+         COUNT(*) FILTER (WHERE NOT (e.is_done = TRUE AND e.auto_closed))::int AS total,
 
-         -- Avg response: this week vs last week (always fixed)
-         ROUND(AVG(CASE WHEN e.is_done = TRUE AND e.done_at >= $4::date
+         -- Avg response: this week vs last week (always fixed).
+         -- done_at - created_at on an auto-closed row measures how long the
+         -- lead sat before somebody changed its status, which is not a response
+         -- time to anything.
+         ROUND(AVG(CASE WHEN e.is_done = TRUE AND NOT e.auto_closed AND e.done_at >= $4::date
            THEN EXTRACT(EPOCH FROM (e.done_at - e.created_at)) / 86400.0 END)::numeric, 1
          ) AS avg_response_days,
-         ROUND(AVG(CASE WHEN e.is_done = TRUE
+         ROUND(AVG(CASE WHEN e.is_done = TRUE AND NOT e.auto_closed
            AND e.done_at >= $5::date AND e.done_at < $4::date
            THEN EXTRACT(EPOCH FROM (e.done_at - e.created_at)) / 86400.0 END)::numeric, 1
          ) AS avg_response_last_week
@@ -432,15 +443,22 @@ function getStats(req, res, next) {
 }
 
 // PATCH /api/lead-events/:id/done
+//
+// The ONE path that means "a person did this follow-up". Everything else that
+// sets is_done — a status change, a bulk update, an import, an appointment
+// booking — writes auto_closed = TRUE and is excluded from the numbers.
+//
+// done_by is stamped here and nowhere else, for the same reason: it is the only
+// moment at which a specific human is claiming the work.
 function markDone(req, res, next) {
   handle(req, res, next, async () => {
     const id = parseInt(req.params.id, 10);
     const r = await pool.query(
       `UPDATE lead_events
-       SET is_done = TRUE, done_at = NOW()
+       SET is_done = TRUE, done_at = NOW(), done_by = $2, auto_closed = FALSE
        WHERE id = $1
        RETURNING *`,
-      [id]
+      [id, req.user.id]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Event not found' });
     res.json({ item: r.rows[0] });
@@ -485,13 +503,31 @@ function getCompliance(req, res, next) {
           AND is_active = TRUE
       )`;
 
-    // Overall summary
+    /* ── Auto-closed follow-ups are not compliance, either way ──────────────
+       A follow-up closed by a status change is not evidence the advisor made
+       the call, and it is not evidence they skipped it. It is evidence the
+       reason for the call went away. So it belongs in neither on_time, late nor
+       missed — it comes back as its own count, `auto`, and stays out of the
+       rate.
+
+       Counting it as on_time (what happened before) inflates: one import
+       updating 400 statuses booked 400 completed follow-ups. Counting it as
+       missed would deflate just as wrongly: moving Attempt 1 → Attempt 2 IS
+       working the lead, and punishing it would push people to stop using the
+       statuses.
+
+       `auto` is returned rather than silently dropped because it is the number
+       that says how much of the rate you should trust. 40 on_time out of 50
+       reads very differently when 900 more were auto-closed — that is a team
+       whose follow-ups are mostly being overtaken by events, and no single
+       percentage can tell you that. */
     const overall = await pool.query(
       `SELECT
          COUNT(*) FILTER (WHERE e.due_date <= $${pOffset + 1})::int                                             AS total_due,
-         COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.done_at::date <= e.due_date)::int                       AS on_time,
-         COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.done_at::date >  e.due_date)::int                       AS late,
-         COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $${pOffset + 1})::int                        AS missed
+         COUNT(*) FILTER (WHERE e.is_done = TRUE  AND NOT e.auto_closed AND e.done_at::date <= e.due_date)::int AS on_time,
+         COUNT(*) FILTER (WHERE e.is_done = TRUE  AND NOT e.auto_closed AND e.done_at::date >  e.due_date)::int AS late,
+         COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $${pOffset + 1})::int                        AS missed,
+         COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.auto_closed)::int                                       AS auto
        FROM lead_events e
        JOIN leads l ON l.id = e.lead_id
        WHERE TRUE ${visibilitySQL} ${COMPLIANCE_NOT_CONVERTED}`,
@@ -505,9 +541,10 @@ function getCompliance(req, res, next) {
         `SELECT
            COALESCE(u.name, 'Unassigned') AS agent_name,
            COUNT(*) FILTER (WHERE e.due_date <= $${pOffset + 1})::int                                          AS total_due,
-           COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.done_at::date <= e.due_date)::int                    AS on_time,
-           COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.done_at::date >  e.due_date)::int                    AS late,
-           COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $${pOffset + 1})::int                     AS missed
+           COUNT(*) FILTER (WHERE e.is_done = TRUE  AND NOT e.auto_closed AND e.done_at::date <= e.due_date)::int AS on_time,
+           COUNT(*) FILTER (WHERE e.is_done = TRUE  AND NOT e.auto_closed AND e.done_at::date >  e.due_date)::int AS late,
+           COUNT(*) FILTER (WHERE e.is_done = FALSE AND e.due_date < $${pOffset + 1})::int                     AS missed,
+           COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.auto_closed)::int                                     AS auto
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users u ON u.id = COALESCE(l.assigned_to, l.created_by)
@@ -525,17 +562,20 @@ function getCompliance(req, res, next) {
     const onTime = Number(o.on_time);
     const late   = Number(o.late);
     const missed = Number(o.missed);
+    const auto   = Number(o.auto);
+    // `auto` is deliberately NOT in the denominator — see the query above.
     const denominator = onTime + late + missed;
     const rate = denominator > 0 ? Math.round((onTime / denominator) * 100) : null;
 
     res.json({
-      summary: { total_due: Number(o.total_due), on_time: onTime, late, missed, rate },
+      summary: { total_due: Number(o.total_due), on_time: onTime, late, missed, auto, rate },
       by_agent: byAgent.map(a => ({
         agent_name: a.agent_name,
         total_due:  Number(a.total_due),
         on_time:    Number(a.on_time),
         late:       Number(a.late),
         missed:     Number(a.missed),
+        auto:       Number(a.auto),
         rate: (Number(a.on_time) + Number(a.late) + Number(a.missed)) > 0
           ? Math.round((Number(a.on_time) / (Number(a.on_time) + Number(a.late) + Number(a.missed))) * 100)
           : null,
