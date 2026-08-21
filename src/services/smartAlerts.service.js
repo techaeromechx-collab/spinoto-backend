@@ -1,3 +1,18 @@
+/*
+ * ── WHY THESE QUERIES ASK THE STATUS TABLE ──────────────────────────────────
+ *
+ * Three of the alerts below exclude leads that are finished. They used to do it
+ * with LOWER(status) NOT IN ('closed','won','converted','lost') — and of those
+ * four names only 'Lost' has ever existed in this system, so the filter did
+ * almost nothing while looking thorough. Every alert fired on converted leads
+ * and on leads sitting in Junk.
+ *
+ * A status name is master data an admin renames on a screen. The FLAGS are what
+ * carry the meaning: is_closed says "this lead is finished",
+ * converts_to_appointment says "this one became a booking". Both survive a
+ * rename because they live on the row.
+ */
+
 /**
  * smartAlerts.service.js
  * ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +111,9 @@ async function fireOverdueLeadAlerts() {
       JOIN leads l ON l.id = le.lead_id
       WHERE le.is_done = FALSE
         AND le.due_at < NOW()
-        AND LOWER(COALESCE(l.status,'')) NOT IN ('closed','won','converted','lost')
+        AND NOT EXISTS (SELECT 1 FROM lead_statuses ls
+                         WHERE LOWER(TRIM(ls.name)) = LOWER(TRIM(l.status))
+                           AND (ls.is_closed OR ls.converts_to_appointment))
     `);
 
     for (const row of rows) {
@@ -289,7 +306,9 @@ async function fireInactiveLeadAlerts(cfg = DEFAULT_ALERT_CFG) {
         MAX(la.created_at) AS last_activity
       FROM leads l
       LEFT JOIN lead_activities la ON la.lead_id = l.id
-      WHERE LOWER(COALESCE(l.status,'')) NOT IN ('closed','won','converted','lost')
+      WHERE NOT EXISTS (SELECT 1 FROM lead_statuses ls
+                         WHERE LOWER(TRIM(ls.name)) = LOWER(TRIM(l.status))
+                           AND (ls.is_closed OR ls.converts_to_appointment))
       GROUP BY l.id, l.name, l.mobile, l.created_by, l.assigned_to
       HAVING MAX(la.created_at) < NOW() - ($1 || ' days')::interval
           OR MAX(la.created_at) IS NULL
@@ -339,7 +358,9 @@ async function fireEscalationAlerts(cfg = DEFAULT_ALERT_CFG) {
       JOIN lead_events le ON le.lead_id = l.id
       WHERE le.is_done = FALSE
         AND le.due_at < NOW()
-        AND LOWER(COALESCE(l.status,'')) NOT IN ('closed','won','converted','lost')
+        AND NOT EXISTS (SELECT 1 FROM lead_statuses ls
+                         WHERE LOWER(TRIM(ls.name)) = LOWER(TRIM(l.status))
+                           AND (ls.is_closed OR ls.converts_to_appointment))
       GROUP BY l.id, l.name, l.mobile, l.created_by, l.assigned_to
       HAVING
         COUNT(le.id) >= $1

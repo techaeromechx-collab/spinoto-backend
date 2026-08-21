@@ -202,6 +202,32 @@ function updateStatus(req, res, next) {
           `UPDATE lead_events SET status_name = $2 WHERE status_name = $1`,
           [oldName, data.name]);
 
+        /* ── And the WhatsApp automations ────────────────────────────────
+           wa_automations.match_value holds the status NAME for the
+           lead.status_changed event, compared exact-string when the event
+           fires. Leave it on the old spelling and every rule pointing at this
+           status stops matching — while staying switched ON, raising nothing,
+           and logging nothing. The screen still shows it as active. It simply
+           never fires again, and the first sign is a customer who did not get
+           the message they always got.
+
+           Scoped to the lead events, and that is not optional: appointment
+           automations store a SLUG in the same column, and an unscoped rewrite
+           of a status called 'confirmed' would repoint them at nothing.
+
+           (The slug is why only lead automations can break this way. Giving
+           lead_statuses a slug of its own is the real fix and is a bigger job
+           than a rename cascade.) */
+        const rules = await client.query(
+          `UPDATE wa_automations SET match_value = $2
+            WHERE match_value = $1 AND event LIKE 'lead.%'
+            RETURNING id`,
+          [oldName, data.name]);
+        if (rules.rowCount) {
+          console.log(`[lead_statuses] repointed ${rules.rowCount} WhatsApp automation(s) ` +
+                      `from "${oldName}" to "${data.name}"`);
+        }
+
         if (relabelled) {
           console.log(`[lead_statuses] renamed "${oldName}" → "${data.name}", ` +
                       `moved ${relabelled} lead(s) with it`);
@@ -236,6 +262,32 @@ function deleteStatus(req, res, next) {
         error: `Cannot delete — ${inUse.rows[0].count} lead(s) currently use this status. Reassign them first.`
       });
     }
+
+    /* ── The same protection the leads above get ─────────────────────────
+       A WhatsApp automation matches a lead status by NAME. Deleting the status
+       leaves the rule pointed at a name that exists nowhere: still active,
+       still listed, permanently silent. Nothing errored, so nobody looks.
+
+       Refused rather than cascaded, because there is no correct destination to
+       cascade to — only a person knows which status that message should now
+       follow. Naming the rules in the message is the whole point: "3
+       automations use it" sends somebody hunting through a list. */
+    const rules = await pool.query(
+      `SELECT a.id, t.name AS template_name
+         FROM wa_automations a
+         LEFT JOIN wa_templates t ON t.id = a.template_id
+        WHERE a.match_value = $1 AND a.event LIKE 'lead.%'
+        ORDER BY a.id`,
+      [name]);
+    if (rules.rowCount) {
+      const which = rules.rows.map(r => r.template_name || `#${r.id}`).join(', ');
+      return res.status(409).json({
+        error: `Cannot delete — ${rules.rowCount} WhatsApp automation(s) send on this status `
+             + `(${which}). Point them at another status first, in Settings → WhatsApp → Automations.`,
+        code: 'AUTOMATIONS_USE_STATUS',
+      });
+    }
+
     await pool.query('DELETE FROM lead_statuses WHERE id = $1', [id]);
     getIO().emit('invalidate', { topic: 'lead_statuses' });
     res.status(204).end();

@@ -1416,17 +1416,56 @@ function deleteAppointment(req, res, next) {
       await client.query(`DELETE FROM appointment_reminder_log WHERE appointment_id = $1`, [id]);
       await client.query(`DELETE FROM appointments             WHERE id = $1`, [id]);
 
-      // 7) Lead: if this was the lead's ONLY appointment, un-convert it back
-      //    to the default pipeline status and log it on the lead timeline.
+      /* 7) Lead: if this was the lead's ONLY appointment, un-convert it and
+            log it on the lead timeline.
+
+         ── WHERE IT GOES BACK TO ────────────────────────────────────────────
+         Two tiers, and the order matters.
+
+         FIRST, back where it actually was. Converting the lead wrote a
+         status_changed row whose old_value is the status it held the moment
+         before — 'Follow-Up - Details Sent', or wherever the advisor had got
+         to. That is the honest destination, and it is already recorded; using
+         a fixed bucket instead throws away a fact the timeline is holding.
+
+         SECOND, the default status, only when the first cannot answer: the
+         lead was created already converted so there is no earlier status, or
+         the status it came from has since been deleted. That is what a default
+         is FOR — the net, not the first choice.
+
+         The recovered name is checked against lead_statuses before it is used.
+         An old_value naming a status somebody deleted last month would put the
+         lead on a status no filter, colour or board column recognises, which is
+         worse than the generic bucket. */
       if (appt.lead_id) {
         const others = await client.query(
           `SELECT COUNT(*)::int AS n FROM appointments WHERE lead_id = $1`, [appt.lead_id]);
         if (others.rows[0].n === 0) {
-          const defStatus = await client.query(
-            `SELECT name FROM lead_statuses WHERE is_default = TRUE AND is_active = TRUE LIMIT 1`);
-          if (defStatus.rows[0]) {
+          const back = await client.query(
+            `SELECT ls.name
+               FROM lead_activities la
+               JOIN lead_statuses  ls
+                 ON ls.name = la.old_value AND ls.is_active
+              WHERE la.lead_id = $1
+                AND la.type = 'status_changed'
+                AND la.old_value IS NOT NULL
+                -- The transition INTO the converting status, not any earlier
+                -- one. Ordered newest first and taken one at a time, so a lead
+                -- converted twice returns to where the LAST conversion found
+                -- it.
+                AND EXISTS (SELECT 1 FROM lead_statuses c
+                             WHERE c.name = la.new_value AND c.converts_to_appointment)
+              ORDER BY la.created_at DESC
+              LIMIT 1`,
+            [appt.lead_id]);
+
+          const target = back.rows[0]?.name || (await client.query(
+            `SELECT name FROM lead_statuses WHERE is_default = TRUE AND is_active = TRUE LIMIT 1`
+          )).rows[0]?.name || null;
+
+          if (target) {
             await client.query(`UPDATE leads SET status = $1, updated_at = NOW() WHERE id = $2`,
-              [defStatus.rows[0].name, appt.lead_id]);
+              [target, appt.lead_id]);
           }
         }
         await client.query(

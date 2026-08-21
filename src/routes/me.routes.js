@@ -363,8 +363,14 @@ router.get('/team', requireAuth, requirePermission('VIEW_TEAM_LEADS', 'VIEW_REPO
         u.last_login, u.joining_date, u.profile_photo,
         COALESCE(ARRAY_AGG(up.permission_code) FILTER (WHERE up.permission_code IS NOT NULL), '{}') AS permissions,
         (SELECT COUNT(*) FROM leads WHERE assigned_to = u.id OR created_by = u.id) AS total_leads,
-        (SELECT COUNT(*) FROM leads WHERE (assigned_to = u.id OR created_by = u.id)
-          AND LOWER(COALESCE(status,'')) IN ('won','converted'))                    AS converted_leads,
+        -- Counted from the converts_to_appointment flag. This used to test the
+        -- status name against a hardcoded list, and not one name on that list
+        -- had ever existed here, so the column read zero for every user since
+        -- the day it shipped. A flag lives on the row and survives a rename.
+        (SELECT COUNT(*) FROM leads l2
+           JOIN lead_statuses ls ON LOWER(TRIM(ls.name)) = LOWER(TRIM(l2.status))
+          WHERE (l2.assigned_to = u.id OR l2.created_by = u.id)
+            AND ls.converts_to_appointment)                                         AS converted_leads,
         (SELECT COUNT(*) FROM lead_events le JOIN leads l ON l.id = le.lead_id
           WHERE (l.assigned_to = u.id OR l.created_by = u.id)
             AND le.is_done = FALSE AND le.due_at < NOW())                          AS overdue_count

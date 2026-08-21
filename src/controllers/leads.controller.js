@@ -731,12 +731,23 @@ function updateLead(req, res, next) {
         }
       }
 
-      // ── Alert #9 Lead Conversion ─────────────────────────────────────────
+      /* ── Alert #9 Lead Conversion ────────────────────────────────────────
+         Asked of the STATUS TABLE, not of a list of names in this file.
+
+         The list used to be ['won', 'converted', 'closed won'] and not one of
+         those has ever been a status in this system — the alert read as
+         working and had never once fired. A hardcoded name is wrong here twice
+         over: it is wrong on the day it is written if nobody checks, and it
+         goes wrong later the moment somebody renames a status.
+
+         converts_to_appointment is the flag that MEANS converted: it is the
+         one that turns a lead into an appointment. */
       if (coreData.status) {
-        const conversionStatuses = ['won', 'converted', 'closed won'];
-        if (conversionStatuses.includes(coreData.status.toLowerCase())) {
-          fireLeadConversionAlert(id, req.user.id).catch(() => {});
-        }
+        const conv = await client.query(
+          `SELECT 1 FROM lead_statuses
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) AND converts_to_appointment`,
+          [coreData.status]);
+        if (conv.rowCount) fireLeadConversionAlert(id, req.user.id).catch(() => {});
       }
 
       // ── Alert #2 High Priority (on update) ───────────────────────────────
@@ -1449,8 +1460,10 @@ function bulkStatus(req, res, next) {
 
       // After the commit, never inside it: these fan out to push services and
       // must not be able to hold a transaction open or roll one back.
-      const conversionStatuses = ['won', 'converted', 'closed won'];
-      if (conversionStatuses.includes(statusName.toLowerCase())) {
+      // Same flag the single-lead path above uses. `target` was read from
+      // lead_statuses at the top of this handler, so the answer is already
+      // here and costs no query.
+      if (target.converts_to_appointment) {
         for (const id of ids) fireLeadConversionAlert(id, req.user.id).catch(() => {});
       }
 

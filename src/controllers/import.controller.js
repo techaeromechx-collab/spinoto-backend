@@ -96,8 +96,8 @@ const TEMPLATE_SAMPLES = {
     { name: 'Chain Lubrication',  category: '',         vehicle_type: '2W',   gst_percent: '18', hsn_code: ''         },
   ],
   leads: [
-    { mobile: '9712301573', name: 'Raj Patel',    whatsapp: '',           state: 'Gujarat',     city: 'Ahmedabad', area: 'Navrangpura', vehicle_type: '4W', make: 'Maruti',  model: 'Swift',   lead_source: 'Walk-in',  status: 'Follow-Up',            assigned_to: '',                  notes: 'Interested in full service', services: 'AC Service',  categories: ''     },
-    { mobile: '9898123456', name: 'Priya Shah',   whatsapp: '9898123456', state: 'Gujarat',     city: 'Surat',     area: 'Adajan',      vehicle_type: '2W', make: 'Honda',   model: 'Activa',  lead_source: 'Website',  status: 'Call No Ans. (Day 1)', assigned_to: 'agent@example.com', notes: '',                           services: '',            categories: 'AC;Wash' },
+    { mobile: '9712301573', name: 'Raj Patel',    whatsapp: '',           state: 'Gujarat',     city: 'Ahmedabad', area: 'Navrangpura', vehicle_type: '4W', make: 'Maruti',  model: 'Swift',   lead_source: 'Walk-in',  status: 'Follow-Up - General',            assigned_to: '',                  notes: 'Interested in full service', services: 'AC Service',  categories: ''     },
+    { mobile: '9898123456', name: 'Priya Shah',   whatsapp: '9898123456', state: 'Gujarat',     city: 'Surat',     area: 'Adajan',      vehicle_type: '2W', make: 'Honda',   model: 'Activa',  lead_source: 'Website',  status: 'Call Unanswered - Attempt 1', assigned_to: 'agent@example.com', notes: '',                           services: '',            categories: 'AC;Wash' },
     { mobile: '9876543210', name: 'Amit Kumar',   whatsapp: '',           state: '',            city: '',          area: '',            vehicle_type: '',   make: '',        model: '',        lead_source: 'Referral', status: '',                     assigned_to: '',                  notes: '',                           services: '',            categories: ''     },
   ],
   pricing: [
