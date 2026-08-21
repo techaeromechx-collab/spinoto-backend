@@ -17,6 +17,7 @@ const { addMonthsDays, ymd } = require('../utils/warrantyPreflight');
 const { getIO } = require('../socket');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity } = require('../utils/publicToken');
+const { upsertCustomerVehicle } = require('../utils/customerVehicle');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 
 // ── Validators ────────────────────────────────────────────────────────────────
@@ -566,6 +567,22 @@ function createRedo(req, res, next) {
       const redoApptId = apptIns.rows[0].id;
 
       if (ctx.mobile) await ensureCustomerIdentity(client, ctx.mobile);
+
+      // Register the vehicle against the customer, so the Customer page can
+      // EDIT it rather than offering to create a second copy. See
+      // utils/customerVehicle.js.
+      //
+      // Almost always a no-op here — a warranty redo is by definition a car
+      // that has been in before, so the row exists. It is included anyway
+      // because "almost always" is not a rule, and a redo booked for a vehicle
+      // that predates this change would otherwise stay an orphan.
+      await upsertCustomerVehicle(client, ctx.mobile, {
+        vehicle_number:  ctx.vehicle_number,
+        vehicle_type_id: veh.vehicle_type_id,
+        make_id:         veh.make_id,
+        model_id:        veh.model_id,
+        segment_ids:     veh.segment_ids,
+      });
 
       if (hubId) {
         const hubRow = await client.query(`SELECT hub_code FROM hubs WHERE id = $1`, [hubId]);

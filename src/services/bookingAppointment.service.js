@@ -22,6 +22,7 @@ const { getIO } = require('../socket');
 const { logActivity } = require('./activityLog.service');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity } = require('../utils/publicToken');
+const { upsertCustomerVehicle } = require('../utils/customerVehicle');
 const { classifyTypeName } = require('./bookingCatalog.service');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +267,23 @@ async function createBookingAppointment(input) {
       ]
     );
     apptId = ins.rows[0].id;
+
+    // Register the vehicle against the customer, so the Customer page can EDIT
+    // it rather than offering to create a second copy. See
+    // utils/customerVehicle.js — the plate normalisation there is the part
+    // that must not be reinvented here.
+    //
+    // The values are taken from the same locals the INSERT above used, not
+    // re-derived from data.vehicle: those locals are the RESOLVED ids (a
+    // booking sends names, which bookingCatalog resolves), and re-deriving
+    // them would store a vehicle the appointment does not have.
+    await upsertCustomerVehicle(client, data.customer.mobile, {
+      vehicle_number:  data.vehicle.registration_no || null,
+      vehicle_type_id: vehicleTypeId,
+      make_id:         makeId,
+      model_id:        modelId,
+      segment_id:      segmentId || null,
+    });
 
     await ensureCustomerIdentity(client, data.customer.mobile);
 

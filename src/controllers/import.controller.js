@@ -3,6 +3,10 @@
 const { parse: parseCsvSync } = require('csv-parse/sync');
 const XLSX                     = require('xlsx');
 const { pool }                 = require('../config/db');
+// The same generator every other lead-creating path uses. Sharing it is the
+// point: a second implementation here could drift in length or alphabet, and
+// the column's whole job is to look identical no matter which path made the row.
+const { generatePublicToken }  = require('../utils/publicToken');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MAX_FIELD_LENGTH   = 255;
@@ -1842,14 +1846,30 @@ async function importLeads(req, res, next) {
 
     // 3) Lead inserts — multi-row VALUES with RETURNING id. Postgres returns
     //    RETURNING rows in insert order for a plain VALUES insert, so ids map
-    //    back to the batch by index. 200 rows × 16 params = 3,200 params/stmt.
+    //    back to the batch by index. 200 rows × 17 params = 3,400 params/stmt.
+    //
+    //    ── public_token is the 17th, and it was missing until now ──────────
+    //
+    //    Every other INSERT INTO leads in this codebase supplies one
+    //    (leads.controller.js, waInboundLead.service.js). This one did not, so
+    //    EVERY lead ever created by Bulk Upload had a null token — and the
+    //    frontend routes detail pages by token, so clicking one produced the
+    //    URL /leads/null, a 404 from /api/leads/by-token/null, and a record
+    //    that could not be linked to or reopened by refreshing.
+    //
+    //    It stayed invisible because the record still OPENS on click: the
+    //    numeric id travels separately. Only the URL was broken.
+    //
+    //    Generated per row rather than once per batch — a shared token would
+    //    violate the unique index on the second row of the very first import.
     const svcRows = []; // [leadId, serviceId, price]
     const catRows = []; // [leadId, categoryId]
+    const COLS = 17;
     for (const batch of chunk(toInsert, 200)) {
       const values = [];
       const params = [];
       batch.forEach((r, i) => {
-        const base = i * 16;
+        const base = i * COLS;
         params.push(
           r.name, r.mobile, r.whatsapp,
           r.stateId, r.cityId, r.areaId,
@@ -1860,15 +1880,15 @@ async function importLeads(req, res, next) {
           r.vehicleNote
             ? [r.notes, r.vehicleNote].filter(Boolean).join('\n')
             : (r.notes || null),
-          r.assignedTo, createdBy
+          r.assignedTo, createdBy, generatePublicToken()
         );
-        values.push(`(${Array.from({ length: 16 }, (_, j) => `$${base + j + 1}`).join(',')})`);
+        values.push(`(${Array.from({ length: COLS }, (_, j) => `$${base + j + 1}`).join(',')})`);
       });
       const ins = await client.query(
         `INSERT INTO leads
            (name, mobile, whatsapp, state_id, city_id, area_id,
             vehicle_type_id, make_id, model_id, body_type_id, segment_ids, lead_source, status, notes,
-            assigned_to, created_by)
+            assigned_to, created_by, public_token)
          VALUES ${values.join(',')}
          RETURNING id`,
         params

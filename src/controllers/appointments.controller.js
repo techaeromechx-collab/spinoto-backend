@@ -16,6 +16,7 @@ const { pool } = require('../config/db');
 const { logActivity } = require('../services/activityLog.service');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
+const { upsertCustomerVehicle } = require('../utils/customerVehicle');
 const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
 
 // ─── Hub schedule validator ───────────────────────────────────────────────────
@@ -414,6 +415,35 @@ function createAppointment(req, res, next) {
       // Make sure this mobile number has a customer routing identity
       // (public_token) even if no customer_profiles row is ever created.
       await ensureCustomerIdentity(client, data.mobile);
+
+      // ── Register the vehicle against the customer ───────────────────────
+      //
+      // Until now this did not happen, and the consequence was confusing in a
+      // way that looked like a bug in the Customer page.
+      //
+      // An appointment stores its vehicle in its OWN columns —
+      // vehicle_number, vehicle_type_id, make_id, model_id (migration 021).
+      // Nothing wrote a customer_vehicles row. So the Customer page, which
+      // merges real vehicles with ones DERIVED from appointments, showed the
+      // car with cv_id = null — and pressing Edit on a row with no id cannot
+      // update anything, so it fell through to "save this vehicle", creating
+      // a second record that looked manually added and left the appointment
+      // untouched.
+      //
+      // Standalone estimates have done this since migration 082
+      // (estimates.controller.js). Appointments simply never got the same
+      // treatment.
+      //
+      // Same normalisation as addCustomerVehicle: trim + uppercase and
+      // NOTHING more. A differently normalised string here would slip past
+      // the (mobile, vehicle_number) unique constraint and give one car two
+      // rows — the exact problem this is fixing.
+      //
+      // DO NOTHING, never DO UPDATE: a vehicle the customer already has on
+      // file may carry a colour, a year and notes that an appointment form
+      // never asks for, and overwriting those with nulls would quietly
+      // destroy data every time a job was booked.
+      await upsertCustomerVehicle(client, data.mobile, data);
 
       // Insert service line items — one multi-row statement instead of a loop
       if (data.services.length > 0) {

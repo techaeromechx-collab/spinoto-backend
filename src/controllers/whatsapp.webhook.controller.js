@@ -40,7 +40,7 @@ const { pool } = require('../config/db');
 const { toE164 } = require('../utils/phone');
 const { getSetting } = require('../services/integrationSettings.service');
 const {
-  resolveOrCreateLead, nameFromBody, bodyFor,
+  resolveOrCreateLead, nameFromBody, bodyFor, mediaFor,
 } = require('../services/waInboundLead.service');
 const { routeInbound } = require('../services/waRouting.service');
 const { getIO }   = require('../socket');
@@ -267,6 +267,11 @@ async function applyInbound(payload) {
   // sent something instead of an unexplained gap.
   const body = bodyFor(msg);
 
+  // The attachment itself (migration 166). body above stays exactly as it was —
+  // it is the text fallback, and it is what every reader that predates these
+  // columns will keep showing.
+  const media = mediaFor(msg);
+
   // traits.name is the WhatsApp profile name — often absent, sometimes an
   // emoji. A form-fill message carries the real one in its body ("Full name:
   // Rajeev Mundra"), which is exactly the case that would otherwise produce a
@@ -340,15 +345,16 @@ async function applyInbound(payload) {
     const ins = await client.query(
       `INSERT INTO wa_messages
          (direction, to_number, body_rendered, status, provider_message_id,
-          entity_type, entity_id, created_at)
-       VALUES ('in', $1, $2, 'received', $3, $4, $5, NOW())
+          entity_type, entity_id, message_type, media_url, caption, created_at)
+       VALUES ('in', $1, $2, 'received', $3, $4, $5, $6, $7, $8, NOW())
        -- Idempotency. The signature covers the body but carries no timestamp or
        -- nonce, so a captured webhook can be replayed indefinitely; without
        -- this that is an unbounded insert primitive, and every replay would
        -- also re-extend the free-form window by another 24 hours.
        ON CONFLICT DO NOTHING
        RETURNING id`,
-      [e164, body, msg.id || null, target.entityType, target.entityId]
+      [e164, body, msg.id || null, target.entityType, target.entityId,
+       media.message_type, media.media_url, media.caption]
     );
 
     await client.query('COMMIT');

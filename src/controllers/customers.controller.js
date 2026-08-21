@@ -947,7 +947,13 @@ function updateCustomerVehicle(req, res, next) {
     const { mobile, id } = req.params;
     const {
       vehicle_type_id, make_id, model_id, color, year, notes,
-      vehicle_number, propagate_vehicle_number,
+      vehicle_number,
+      // Three separate opt-ins, because they undo three different amounts of
+      // history and the person editing is the only one who knows which they
+      // meant. See the cascade block below.
+      propagate_vehicle_number,   // the plate, on records that still carry the old one
+      propagate_details,          // type/make/model, on work not yet invoiced
+      propagate_details_all,      // ...and on completed jobs, estimates, invoices too
     } = req.body;
 
     const existing = await pool.query(
@@ -997,24 +1003,11 @@ function updateCustomerVehicle(req, res, next) {
         ]
       );
 
-      // Optional cascade: propagate a corrected plate number onto this
-      // customer's past appointments/estimates/invoices. Purchase invoices
-      // don't store their own vehicle_number — they inherit it live via
-      // their linked estimate/appointment — so nothing to update there.
-      if (plateChanged && propagate_vehicle_number) {
-        await client.query(
-          `UPDATE appointments SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
-          [newPlate, mobile, oldPlate]
-        );
-        await client.query(
-          `UPDATE estimates SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
-          [newPlate, mobile, oldPlate]
-        );
-        await client.query(
-          `UPDATE customer_invoices SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
-          [newPlate, mobile, oldPlate]
-        );
-      }
+      await cascadeVehicleEdit(client, {
+        mobile, oldPlate, newPlate, plateChanged,
+        vehicle_type_id, make_id, model_id,
+        propagate_vehicle_number, propagate_details, propagate_details_all,
+      });
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1307,7 +1300,133 @@ function getCustomerTimeline(req, res, next) {
   });
 }
 
+/**
+ * Push a corrected vehicle out onto the records that mention it.
+ *
+ * Extracted from updateCustomerVehicle so it can be TESTED. Left inline, the
+ * only way to exercise it was to rebuild its branching in the test — and a
+ * test that reimplements the decisions it is checking passes happily while the
+ * real ones are broken. Mutation testing caught exactly that: three deliberate
+ * breaks to the conditionals here went unnoticed until this became a function
+ * the test could call.
+ *
+ * Runs inside the caller's transaction. Every statement is scoped to one
+ * mobile and one plate.
+ */
+async function cascadeVehicleEdit(client, {
+  mobile, oldPlate, newPlate, plateChanged,
+  vehicle_type_id, make_id, model_id,
+  propagate_vehicle_number, propagate_details, propagate_details_all,
+}) {
+  /* ── CASCADE ────────────────────────────────────────────────────────
+   *
+   * Three opt-ins, because they undo three different amounts of history.
+   *
+   * ── WHY THE VEHICLE DETAILS NEEDED THEIR OWN SWITCH ─────────────────
+   *
+   * This block used to propagate ONLY vehicle_number. So correcting a
+   * plate typo reached the appointment, and correcting a wrong MODEL did
+   * not — the appointment kept showing the old car forever, and there was
+   * no way to fix it from the Customer page. That is half the reported
+   * problem; the other half (editing creating a second vehicle) is fixed
+   * by utils/customerVehicle.js and migration 167.
+   *
+   * ── WHAT "OPEN" MEANS, AND WHY IT IS NOT A STATUS ───────────────────
+   *
+   * An appointment is treated as still open when NO APPROVED CUSTOMER
+   * INVOICE exists for it.
+   *
+   * The obvious rule — match appointment_statuses — does not survive
+   * contact with this schema. Migration 036 gave 11 system statuses a
+   * stable `slug`, but the six original ones from 019 (Confirmed, In
+   * Progress, COMPLETED, CANCELLED, No Show, Rescheduled) have slug NULL:
+   * a slug-based rule misses precisely the statuses that mean "finished".
+   * Falling back to matching on `name` is worse — names are user-editable
+   * master data, so the rule would break silently the day somebody renames
+   * a status.
+   *
+   * An approved invoice is a FACT rather than a label, and it is the
+   * document the customer is actually holding. That is exactly what this
+   * switch protects.
+   *
+   * ── WHAT EACH TABLE CAN EVEN RECEIVE ────────────────────────────────
+   *
+   *   appointments        plate + type + make + model    (migration 021)
+   *   estimates           plate + type + make + model    (migration 082)
+   *   customer_invoices   plate ONLY — no make/model     (migration 065)
+   *   purchase_invoices   nothing; it reads the vehicle live from its
+   *                       linked estimate/appointment, so fixing those
+   *                       fixes the PI with no write here at all.
+   *
+   * The UI says this out loud rather than implying more than it delivers.
+   */
+
+  // 1. The plate, wherever the old one is still recorded.
+  if (plateChanged && propagate_vehicle_number) {
+    await client.query(
+      `UPDATE appointments SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+      [newPlate, mobile, oldPlate]
+    );
+    await client.query(
+      `UPDATE estimates SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+      [newPlate, mobile, oldPlate]
+    );
+    await client.query(
+      `UPDATE customer_invoices SET vehicle_number = $1 WHERE mobile = $2 AND vehicle_number = $3`,
+      [newPlate, mobile, oldPlate]
+    );
+  }
+
+  // 2. The vehicle details.
+  //
+  // Matched on newPlate: if step 1 ran, every row now carries it; if the
+  // plate did not change, newPlate IS oldPlate. Using oldPlate here would
+  // match nothing whenever both switches were used together — the single
+  // most likely combination, and a failure that looks like the feature
+  // simply not working.
+  if (propagate_details || propagate_details_all) {
+    // Completed work is excluded unless the second box is ticked. Written
+    // as one statement with a conditional clause rather than two branches,
+    // so the two paths cannot drift in which columns they set.
+    const onlyOpen = propagate_details_all ? '' : `
+         AND NOT EXISTS (
+           SELECT 1 FROM customer_invoices ci
+            WHERE ci.appointment_id = a.id
+              AND ci.status = 'approved'
+         )`;
+
+    await client.query(
+      `UPDATE appointments a SET
+         vehicle_type_id = $1,
+         make_id         = $2,
+         model_id        = $3
+       WHERE a.mobile = $4
+         AND a.vehicle_number = $5${onlyOpen}`,
+      [vehicle_type_id || null, make_id || null, model_id || null, mobile, newPlate]
+    );
+
+    // Estimates only when the second box is ticked. An estimate is a
+    // quotation the customer has been shown — it is a document in its own
+    // right, not work-in-progress, so it belongs with the history rather
+    // than with the open jobs.
+    if (propagate_details_all) {
+      await client.query(
+        `UPDATE estimates SET
+           vehicle_type_id = $1,
+           make_id         = $2,
+           model_id        = $3
+         WHERE mobile = $4 AND vehicle_number = $5`,
+        [vehicle_type_id || null, make_id || null, model_id || null, mobile, newPlate]
+      );
+    }
+    // customer_invoices and purchase_invoices carry no make/model, so
+    // there is deliberately nothing to write for them here.
+  }
+}
+
 module.exports = {
+  // Exported for the suite, which drives the real branching rather than a copy.
+  cascadeVehicleEdit,
   listCustomers,
   lookupCustomers, getCustomer, updateCustomer, deleteCustomer,
   listCustomerVehicles, addCustomerVehicle, updateCustomerVehicle, deleteCustomerVehicle,

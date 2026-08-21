@@ -34,6 +34,22 @@ const KNOWN_KEYS = Object.freeze([
   'interakt_api_key',
   'interakt_webhook_secret',
   'whatsapp_test_number',
+  // Whether advisors may attach a photo from their own computer — the
+  // paperclip in the WhatsApp composer. Not a credential, and it is here
+  // anyway: this table is "one value, read by the app, written from a settings
+  // screen", which is exactly what it is, and a table of its own for a single
+  // boolean would be a table to maintain forever.
+  //
+  // Stored as the string 'true' / 'false'. Never '' — putSetting DELETES the
+  // row for an empty value, and an absent row means ON (see
+  // whatsapp.library.controller's localUploadAllowed), so writing '' would
+  // turn "switch it off" into "switch it on".
+  //
+  // No ENV_FALLBACK entry on purpose. There is no deployment configured the
+  // old way to keep working — the setting did not exist before — and an env
+  // var that silently overrode the screen would be a switch that does nothing
+  // for reasons nobody can see from the CRM.
+  'wa_allow_local_upload',
   // ── Payments (Razorpay) ──
   //
   // Note the ordering rule these obey and the WhatsApp ones do not: the

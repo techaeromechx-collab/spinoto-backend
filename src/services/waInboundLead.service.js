@@ -304,6 +304,63 @@ function bodyFor(msg) {
 }
 
 /**
+ * The attachment on an inbound message, as the columns from migration 166.
+ *
+ * ── WHAT USED TO HAPPEN TO IT ───────────────────────────────────────────────
+ *
+ * Interakt sends `media_url` — their docs call it "public link to media file" —
+ * and this module read `message_content_type`, turned it into the string
+ * '📷 Photo' and dropped the URL on the floor. The customer's photo survived
+ * only inside the raw wa_events payload, where nothing looks for it. An advisor
+ * asking "send me a picture of the damage" got back the words "📷 Photo" and
+ * had to open WhatsApp on their own phone to see it.
+ *
+ * ── media_file_id IS DELIBERATELY NOT SET ───────────────────────────────────
+ *
+ * That column is OUR ImageKit handle, for deleting files we uploaded. Inbound
+ * media lives on the provider's storage and is not ours to delete; writing an
+ * id there would be a claim on a file we do not own.
+ *
+ * ── THESE URLS EXPIRE ───────────────────────────────────────────────────────
+ *
+ * The provider's link is not permanent. A photo from months ago may 404, so
+ * the thread must tolerate a broken image rather than assume one — which is
+ * why body_rendered keeps its '📷 Photo' text either way: it is the fallback
+ * that still says what arrived once the picture is gone.
+ *
+ * @returns {{message_type: string, media_url: string|null, caption: string|null}}
+ */
+const CONTENT_TYPE_TO_KIND = Object.freeze({
+  Image: 'image', Video: 'video', Audio: 'audio', Document: 'document',
+  Sticker: 'sticker', Location: 'location', Contacts: 'contacts',
+});
+
+function mediaFor(msg) {
+  const kind = CONTENT_TYPE_TO_KIND[msg?.message_content_type];
+  if (!kind) return { message_type: 'text', media_url: null, caption: null };
+
+  const url = typeof msg?.media_url === 'string' ? msg.media_url.trim() : '';
+  const usable = /^https?:\/\/\S+$/i.test(url) ? url : null;
+
+  // Location and Contacts carry no file, so they are the one media kind that
+  // may be stored without a URL — the CHECK in migration 166 allows exactly
+  // those two. Every other kind without a fetchable URL is recorded as text,
+  // because a media row with nothing to show is a permanently empty bubble.
+  if (!usable && kind !== 'location' && kind !== 'contacts') {
+    return { message_type: 'text', media_url: null, caption: null };
+  }
+
+  // WhatsApp lets a photo carry a caption, and Interakt puts it in `message` —
+  // the same field a plain text message uses. bodyFor only reads it when it is
+  // non-empty, so a captioned photo already produces sensible body text; this
+  // records it as a caption as well, so the thread can render it under the
+  // picture rather than beside a paperclip emoji.
+  const cap = typeof msg?.message === 'string' ? msg.message.trim() : '';
+
+  return { message_type: kind, media_url: usable, caption: cap || null };
+}
+
+/**
  * Resolve — and if necessary create — the record this number belongs to.
  *
  * MUST be called inside a transaction on `client`, after the wa_conversations
@@ -479,6 +536,7 @@ module.exports = {
   resolveOrCreateLead,
   nameFromBody,
   bodyFor,
+  mediaFor,
   // Exported for the suite, which asserts the classification directly rather
   // than inferring it from whichever status happened to be ticked.
   classifyReturn,

@@ -16,6 +16,7 @@
  */
 
 const express = require('express');
+const multer = require('multer');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
 const r = require('../controllers/whatsapp.routing.controller');
 const inbox = require('../controllers/whatsapp.inbox.controller');
@@ -24,6 +25,7 @@ const c = require('../controllers/whatsapp.controller');
 const wh = require('../controllers/whatsapp.webhook.controller');
 const m = require('../controllers/whatsapp.messages.controller');
 const a = require('../controllers/whatsapp.automations.controller');
+const lib = require('../controllers/whatsapp.library.controller');
 
 const router = express.Router();
 
@@ -159,6 +161,136 @@ router.post('/inbox/dismiss-all', canRead, inbox.dismissAll);
 
 router.get('/messages/thread',     canRead, m.listThread);
 router.post('/messages/reply',     canSend, sendLimit, m.sendReply);
+
+/* ── Photo replies ──────────────────────────────────────────────────────────
+ *
+ * Same permission and the same rate limiter as a text reply, deliberately: a
+ * photo is a free-form message inside the 24-hour window and Meta treats it
+ * identically, so anyone trusted to type a reply is trusted to attach one. The
+ * shared sendLimit also means the two cannot be used to double each other's
+ * budget.
+ *
+ * memoryStorage, not diskStorage. Every other uploader in this codebase falls
+ * back to writing files under backend/uploads/ when ImageKit is unset; this one
+ * must not, because WhatsApp fetches the image from the public internet and a
+ * local `/uploads/...` path is reachable by nobody but us. The handler refuses
+ * with a 503 naming the missing variables rather than writing a file that could
+ * never be delivered.
+ *
+ * The limits below are Interakt's, not ours — 5 MB, and JPEG or PNG only. They
+ * are enforced HERE as well as in the browser because the browser check is a
+ * courtesy and this one is the rule.
+ */
+const photoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    // Both, and both must agree. The mimetype is client-supplied and trivially
+    // spoofed; the extension is what ends up in the public URL. Neither alone
+    // is worth much, and requiring both costs nothing.
+    const okMime = ['image/jpeg', 'image/png'].includes(file.mimetype);
+    const okExt  = /\.(jpe?g|png)$/i.test(file.originalname || '');
+    if (okMime && okExt) return cb(null, true);
+    cb(new Error('WhatsApp accepts JPG and PNG photos only.'));
+  },
+});
+
+/**
+ * Turns multer's own failures into the JSON shape the composer already handles.
+ *
+ * Without this they arrive at the global error handler as a 500, and "something
+ * went wrong" is the least useful thing to tell somebody who picked a photo
+ * that was 200 KB too big. LIMIT_FILE_SIZE in particular has to name the limit,
+ * or the advisor retries the same file.
+ */
+/**
+ * `?all=1` returns INACTIVE rows too, and is for the admin screen only.
+ *
+ * Without this an agent could ask for the disabled images by adding four
+ * characters to a URL. The list handler filters by is_active, so they still
+ * could not SEND one — the send endpoint re-checks — but they would see a
+ * retired offer or a draft price list, and "you can see it but not use it" is
+ * a leak with extra steps.
+ *
+ * A separate middleware rather than a check inside each handler, because there
+ * are two handlers and this is one rule.
+ */
+function guardAllFlag(req, res, next) {
+  const wantsAll = req.query.all === '1' || req.query.all === 'true';
+  if (!wantsAll) return next();
+  const u = req.user;
+  const mayManage = u?.is_super_admin || u?.permissions?.has?.('MANAGE_WHATSAPP_TEMPLATES');
+  if (mayManage) return next();
+  // Not an error — the agent gets the active list, which is what they are
+  // entitled to and what they almost certainly wanted.
+  delete req.query.all;
+  return next();
+}
+
+function photoField(req, res, next) {
+  photoUpload.single('photo')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: 'That photo is over the 5 MB limit WhatsApp allows. Send a smaller one.',
+        code: 'FILE_TOO_LARGE',
+      });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: 'Send one photo at a time.', code: 'ONE_FILE' });
+    }
+    return res.status(415).json({
+      error: err.message || 'That file type cannot be sent.',
+      code: 'BAD_FILE_TYPE',
+    });
+  });
+}
+
+router.post('/messages/reply-media', canSend, sendLimit, photoField, m.sendReplyMedia);
+
+/* ── Sending an image from the library ──────────────────────────────────────
+ *
+ * JSON, not multipart: there is no file, only the id of one an admin already
+ * approved. The endpoint resolves the address itself — see the handler's
+ * header for why the browser must never supply a URL.
+ *
+ * canSend and the shared sendLimit, exactly like a text reply. It is the same
+ * act and it costs the same conversation. */
+router.post('/messages/reply-image', canSend, sendLimit, m.sendReplyImage);
+
+/* ══ THE LIBRARY: images and quick replies ═════════════════════════════════
+ *
+ * The read/write split is the whole design.
+ *
+ *   canRead   an agent needs the list in order to use it. The handlers return
+ *             ACTIVE rows only unless ?all=1, and that flag is behind canManage
+ *             below — so an agent cannot ask for the disabled ones either.
+ *
+ *   canManage MANAGE_WHATSAPP_TEMPLATES. The same right that decides what every
+ *             automatic message says now also decides which images may reach a
+ *             customer, which is the correct pairing: both are "what this
+ *             business sends", as opposed to "may I send one".
+ *
+ * Declared before any '/:id' pattern elsewhere in this router so the literal
+ * segments cannot be captured.
+ */
+const canReadLib = canRead;
+
+router.get   ('/images',        canReadLib, guardAllFlag, lib.listImages);
+router.post  ('/images',        canManage,  lib.createImage);
+router.patch ('/images/:id',    canManage,  lib.updateImage);
+router.delete('/images/:id',    canManage,  lib.deleteImage);
+
+router.get   ('/quick-replies',     canReadLib, guardAllFlag, lib.listQuickReplies);
+router.post  ('/quick-replies',     canManage,  lib.createQuickReply);
+router.patch ('/quick-replies/:id', canManage,  lib.updateQuickReply);
+router.delete('/quick-replies/:id', canManage,  lib.deleteQuickReply);
+
+// Whether the paperclip is offered. The GET is canRead because the COMPOSER
+// needs it on every load — an agent has to know whether to draw the button —
+// while changing it is a configuration act.
+router.get('/library-settings', canRead,   lib.getLibrarySettings);
+router.put('/library-settings', canManage, lib.saveLibrarySettings);
 
 router.get('/messages',            canRead, m.listMessages);
 router.get('/messages/preview',    canRead, m.preview);

@@ -14,7 +14,7 @@ const { pool } = require('../config/db');
 const { notifyWhatsApp, previewWhatsApp } = require('../services/whatsapp.dispatcher');
 const { drainOnce } = require('../services/whatsappOutbox.service');
 const { toE164 } = require('../utils/phone');
-const { sendText } = require('../utils/interakt');
+const { sendText, sendMedia } = require('../utils/interakt');
 
 function handle(req, res, next, fn) {
   Promise.resolve(fn()).catch((err) => {
@@ -568,6 +568,13 @@ function listThread(req, res, next) {
               -- nobody reads "Hi 👋 What do you need help with?" as something a
               -- colleague typed.
               m.origin,
+              -- Photos (migration 166). Without these three the thread draws a
+              -- media row as an empty bubble the moment it is re-fetched: the
+              -- send response carries the URL, so the photo appears once and
+              -- then vanishes on the next poll. media_file_id is deliberately
+              -- NOT selected — it is our handle for deleting the file and the
+              -- browser has no use for it.
+              m.message_type, m.media_url, m.caption,
               m.entity_type, m.entity_id,
               m.created_at, m.sent_at, m.delivered_at, m.read_at, m.failed_at,
               u.name AS sent_by_name
@@ -778,6 +785,365 @@ function sendReply(req, res, next) {
   });
 }
 
+/* ══ PHOTO REPLIES ═══════════════════════════════════════════════════════════
+ *
+ * POST /api/whatsapp/messages/reply-media — multipart, field name `photo`.
+ *
+ * ── THE SAME MESSAGE, WITH A FILE ───────────────────────────────────────────
+ *
+ * Deliberately a near-copy of sendReply above rather than a shared helper with
+ * a mode flag. The two differ at four of their nine steps — the upload, the
+ * columns written, the send call and the rollback — and a merged version would
+ * be a function whose every paragraph starts "if this is media". Kept apart,
+ * each reads straight through; the ORDER of steps is what must stay in step,
+ * and that is short enough to see.
+ *
+ * ── WHY THE IMAGE GOES TO A CDN AND NOT TO INTERAKT ─────────────────────────
+ *
+ * We never upload bytes to Interakt. We give them a URL and WhatsApp fetches
+ * it from its own servers. So the image must be at a public address before the
+ * send, which is what ImageKit is for and why IMAGEKIT_* being unset is a hard
+ * failure here rather than a fallback to local disk: the disk path produces
+ * `/uploads/…`, which is reachable by us and by nobody else, and the send would
+ * fail with a provider error blaming the image instead of the configuration.
+ *
+ * ── ORDER: ROW, THEN UPLOAD, THEN SEND ──────────────────────────────────────
+ *
+ * The wa_messages row is written FIRST, exactly as in sendReply, because the
+ * row id is the callbackData Interakt echoes back on every delivery receipt.
+ * No row means no id means no way to match a receipt to a message. The cost is
+ * that a failed upload leaves a row behind — so it is marked `failed` with a
+ * real reason rather than deleted, because a photo that did not reach the
+ * customer is a thing the advisor needs to SEE, not a thing that should quietly
+ * vanish from the thread.
+ */
+function sendReplyMedia(req, res, next) {
+  handle(req, res, next, async () => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No photo was attached.' });
+    }
+
+    // ── The switch is enforced HERE, not only in the composer ─────────────
+    //
+    // Settings → WhatsApp → Images can turn off attaching from a computer.
+    // Hiding the paperclip is what an agent sees; this is what makes it true.
+    // A setting that only removes a button leaves the endpoint open to a stale
+    // tab, a bookmark, or anyone who has ever opened devtools — which is to
+    // say it is not a setting, it is a suggestion.
+    const { localUploadAllowed } = require('./whatsapp.library.controller');
+    if (!localUploadAllowed()) {
+      return res.status(403).json({
+        error: 'Attaching images from your computer is switched off. Use the image library instead.',
+        code: 'LOCAL_UPLOAD_DISABLED',
+      });
+    }
+
+    const e164 = toE164(String(req.body?.mobile || ''));
+    if (!e164) return res.status(400).json({ error: 'A valid Indian mobile number is required.' });
+
+    const caption = String(req.body?.caption || '').trim().slice(0, 1024);
+
+    // Configuration checked BEFORE the window query, so an install that can
+    // never send a photo says so plainly instead of blaming the conversation.
+    if (!imagekitReady()) {
+      return res.status(503).json({
+        error: 'Photo sending is not configured on this server. WhatsApp has to fetch the image '
+             + 'from a public address, so IMAGEKIT_PUBLIC_KEY, IMAGEKIT_PRIVATE_KEY and '
+             + 'IMAGEKIT_URL_ENDPOINT must be set.',
+        code: 'MEDIA_NOT_CONFIGURED',
+      });
+    }
+
+    // Same rule, same words, same code as a text reply — a photo is a free-form
+    // message and Meta treats it identically.
+    const conv = await pool.query(
+      `SELECT (window_expires_at IS NOT NULL AND window_expires_at > NOW()) AS open
+         FROM wa_conversations WHERE mobile = $1`,
+      [e164]
+    );
+    if (!conv.rows[0]?.open) {
+      return res.status(409).json({
+        error:
+          'The 24-hour reply window has closed. WhatsApp only allows a free-typed message or photo within 24 hours ' +
+          'of the customer’s last message — send an approved template instead.',
+        code: 'WINDOW_CLOSED',
+      });
+    }
+
+    const anchor = await pool.query(
+      `SELECT entity_type, entity_id FROM wa_messages
+        WHERE to_number = $1 AND entity_type IS NOT NULL
+        ORDER BY id DESC LIMIT 1`,
+      [e164]
+    );
+
+    // media_url is NOT NULL-able by the CHECK from migration 166 once
+    // message_type is 'image', so the row cannot be written before the upload
+    // succeeds. A placeholder is used and replaced — chosen over relaxing the
+    // constraint, because a permanently nullable media_url would let a genuinely
+    // broken row exist forever and render as an empty bubble.
+    const PENDING = 'https://pending.upload.invalid/';
+
+    const ins = await pool.query(
+      `INSERT INTO wa_messages
+         (direction, to_number, message_type, media_url, media_mime, caption,
+          body_rendered, status, sent_by, entity_type, entity_id,
+          dedupe_key, created_at, queued_at)
+       VALUES ('out', $1, 'image', $2, $3, $4, $5, 'queued', $6, $7, $8, $9, NOW(), NOW())
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
+      [
+        e164, PENDING, req.file.mimetype, caption || null,
+        // body_rendered stays populated so every existing reader — the thread
+        // list, the per-entity log, exports — shows something sensible without
+        // needing to know about message_type yet.
+        caption ? `📷 ${caption}` : '📷 Photo',
+        req.user.id,
+        anchor.rows[0]?.entity_type || null,
+        anchor.rows[0]?.entity_id || null,
+        `media:${new Date().toISOString().slice(0, 16)}`,
+      ]
+    );
+    if (ins.rowCount === 0) {
+      return res.status(409).json({ error: 'That photo was already sent moments ago.' });
+    }
+    const rowId = ins.rows[0].id;
+
+    /** Marks the row failed and answers the caller. One place, so no path forgets. */
+    const abandon = async (status, code, message) => {
+      await pool.query(
+        `UPDATE wa_messages
+            SET status = 'failed', failed_at = NOW(), error_code = $2, error_message = $3
+          WHERE id = $1`,
+        [rowId, code, message]
+      ).catch(err => console.error('[whatsapp:media] could not mark row failed:', err.message));
+      return res.status(status).json({ error: message, code });
+    };
+
+    // ── Upload ────────────────────────────────────────────────────────────
+    let uploaded;
+    try {
+      const { uploadToImageKit } = require('../utils/imagekit');
+      uploaded = await uploadToImageKit(
+        req.file.buffer,
+        // The original filename is not reused: it is attacker-controlled text
+        // that would end up in a public URL. ImageKit's useUniqueFileName adds
+        // its own suffix on top of this.
+        `wa-${rowId}${extFor(req.file.mimetype)}`,
+        'whatsapp-outbound'
+      );
+    } catch (err) {
+      console.error('[whatsapp:media] upload failed for row', rowId, err.message);
+      return abandon(502, 'UPLOAD_FAILED',
+        'The photo could not be uploaded, so nothing was sent. Try again in a moment.');
+    }
+
+    if (!uploaded?.url) {
+      return abandon(502, 'UPLOAD_NO_URL',
+        'The photo was uploaded but no public address came back, so nothing was sent.');
+    }
+
+    await pool.query(
+      `UPDATE wa_messages SET media_url = $2, media_file_id = $3 WHERE id = $1`,
+      [rowId, uploaded.url, uploaded.fileId || null]
+    );
+
+    // ── Send ──────────────────────────────────────────────────────────────
+    const out = await sendMedia({
+      to: e164,
+      mediaUrl: uploaded.url,
+      caption: caption || null,
+      callbackData: String(rowId),
+    });
+
+    if (!out.ok) {
+      return abandon(502, out.errorCode || 'ERROR',
+        out.errorMessage || 'Interakt rejected the photo.');
+    }
+
+    await pool.query(
+      `UPDATE wa_messages
+          SET status = 'sent', sent_at = NOW(), provider_message_id = COALESCE($2, provider_message_id)
+        WHERE id = $1`,
+      [rowId, out.providerMessageId || null]
+    );
+
+    await pool.query(
+      `UPDATE wa_conversations SET last_message_at = NOW() WHERE mobile = $1`,
+      [e164]
+    );
+
+    try {
+      await claimIfUnassigned(e164, req.user.id);
+    } catch (err) {
+      console.error('[whatsapp:media] could not claim conversation:', err.message);
+    }
+
+    // media_url is returned so the thread can draw the photo immediately
+    // instead of waiting for the next poll. It is a public CDN URL by
+    // construction — there is nothing here the customer's own phone will not
+    // also receive.
+    res.json({
+      id: rowId,
+      status: 'sent',
+      message_type: 'image',
+      media_url: uploaded.url,
+      caption: caption || null,
+    });
+  });
+}
+
+/* ══ SENDING FROM THE LIBRARY ════════════════════════════════════════════════
+ *
+ * POST /api/whatsapp/messages/reply-image — JSON, { mobile, image_id, caption }
+ *
+ * ── THE BROWSER SENDS AN ID, NEVER A URL ────────────────────────────────────
+ *
+ * This is the whole security shape of the feature, and it is worth stating
+ * because the lazier version is one line shorter.
+ *
+ * If the composer posted { media_url }, this endpoint would be a machine for
+ * sending any address on the internet to a customer's phone, over the
+ * workshop's own verified WhatsApp number, on the authority of whoever is
+ * logged in. Anyone with SEND_WHATSAPP could point it anywhere. Nothing about
+ * that is hypothetical — it is the default behaviour of "just pass the URL
+ * through".
+ *
+ * So the browser sends the ROW ID of a library image. The address is looked up
+ * here, from a table only MANAGE_WHATSAPP_TEMPLATES can write. The CRM can
+ * therefore only ever send images an admin deliberately put there.
+ *
+ * ── AND INACTIVE MEANS INACTIVE ─────────────────────────────────────────────
+ *
+ * The lookup filters on is_active. Hiding a disabled image in the picker is a
+ * courtesy; refusing to send it is the rule. A stale browser tab opened before
+ * somebody retired last season's offer would otherwise still send it.
+ *
+ * Everything after the lookup is identical to sendReplyMedia — same row-first
+ * ordering, same failure handling, same delivery receipts — because it is the
+ * same act with the picture already hosted.
+ */
+const replyImageBody = z.object({
+  mobile:   z.string().trim().min(1),
+  image_id: z.coerce.number().int().positive(),
+  caption:  z.string().trim().max(1024).optional().nullable(),
+});
+
+function sendReplyImage(req, res, next) {
+  handle(req, res, next, async () => {
+    const b = replyImageBody.parse(req.body || {});
+    const e164 = toE164(b.mobile);
+    if (!e164) return res.status(400).json({ error: 'A valid Indian mobile number is required.' });
+
+    const caption = (b.caption || '').trim();
+
+    const img = await pool.query(
+      `SELECT id, name, imagekit_url FROM wa_images WHERE id = $1 AND is_active`,
+      [b.image_id]
+    );
+    if (!img.rowCount) {
+      return res.status(404).json({
+        error: 'That image is no longer available. Refresh and pick another.',
+        code: 'IMAGE_UNAVAILABLE',
+      });
+    }
+    const mediaUrl = img.rows[0].imagekit_url;
+
+    // Same rule, same words, same code as a text reply.
+    const conv = await pool.query(
+      `SELECT (window_expires_at IS NOT NULL AND window_expires_at > NOW()) AS open
+         FROM wa_conversations WHERE mobile = $1`,
+      [e164]
+    );
+    if (!conv.rows[0]?.open) {
+      return res.status(409).json({
+        error:
+          'The 24-hour reply window has closed. WhatsApp only allows a free-typed message or photo within 24 hours ' +
+          'of the customer’s last message — send an approved template instead.',
+        code: 'WINDOW_CLOSED',
+      });
+    }
+
+    const anchor = await pool.query(
+      `SELECT entity_type, entity_id FROM wa_messages
+        WHERE to_number = $1 AND entity_type IS NOT NULL
+        ORDER BY id DESC LIMIT 1`,
+      [e164]
+    );
+
+    // media_url is known up front here — unlike an upload, there is nothing to
+    // wait for — so the row is complete from the moment it is written.
+    const ins = await pool.query(
+      `INSERT INTO wa_messages
+         (direction, to_number, message_type, media_url, caption,
+          body_rendered, status, sent_by, entity_type, entity_id,
+          dedupe_key, created_at, queued_at)
+       VALUES ('out', $1, 'image', $2, $3, $4, 'queued', $5, $6, $7, $8, NOW(), NOW())
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
+      [
+        e164, mediaUrl, caption || null,
+        caption ? `📷 ${caption}` : `📷 ${img.rows[0].name}`,
+        req.user.id,
+        anchor.rows[0]?.entity_type || null,
+        anchor.rows[0]?.entity_id || null,
+        `img:${b.image_id}:${new Date().toISOString().slice(0, 16)}`,
+      ]
+    );
+    if (ins.rowCount === 0) {
+      return res.status(409).json({ error: 'That image was already sent moments ago.' });
+    }
+    const rowId = ins.rows[0].id;
+
+    const out = await sendMedia({
+      to: e164, mediaUrl, caption: caption || null, callbackData: String(rowId),
+    });
+
+    if (!out.ok) {
+      await pool.query(
+        `UPDATE wa_messages
+            SET status = 'failed', failed_at = NOW(), error_code = $2, error_message = $3
+          WHERE id = $1`,
+        [rowId, out.errorCode || 'ERROR', out.errorMessage || 'Send failed.']
+      ).catch(err => console.error('[whatsapp:image] could not mark row failed:', err.message));
+      return res.status(502).json({
+        error: out.errorMessage || 'Interakt rejected the image.', code: out.errorCode,
+      });
+    }
+
+    await pool.query(
+      `UPDATE wa_messages
+          SET status = 'sent', sent_at = NOW(), provider_message_id = COALESCE($2, provider_message_id)
+        WHERE id = $1`,
+      [rowId, out.providerMessageId || null]
+    );
+    await pool.query(
+      `UPDATE wa_conversations SET last_message_at = NOW() WHERE mobile = $1`, [e164]);
+
+    try { await claimIfUnassigned(e164, req.user.id); }
+    catch (err) { console.error('[whatsapp:image] could not claim conversation:', err.message); }
+
+    res.json({
+      id: rowId, status: 'sent', message_type: 'image',
+      media_url: mediaUrl, caption: caption || null,
+    });
+  });
+}
+
+/** Extension from the mime type we already validated. Never from the filename. */
+function extFor(mime) {
+  return mime === 'image/png' ? '.png' : '.jpg';
+}
+
+/** All three, because utils/imagekit.js throws when any one is missing. */
+function imagekitReady() {
+  return Boolean(
+    process.env.IMAGEKIT_PUBLIC_KEY &&
+    process.env.IMAGEKIT_PRIVATE_KEY &&
+    process.env.IMAGEKIT_URL_ENDPOINT
+  );
+}
+
 /** Dispatcher reasons are terse and internal; advisors get a sentence. */
 function reasonToMessage(reason) {
   if (!reason) return 'Could not send.';
@@ -809,5 +1175,5 @@ function reasonToMessage(reason) {
 module.exports = {
   listMessages, preview, sendManual, retryMessage, getStats, listRecent,
   clearSkips, clearSkip, clearLog, clearLogEntry,
-  listThread, sendReply,
+  listThread, sendReply, sendReplyMedia, sendReplyImage,
 };

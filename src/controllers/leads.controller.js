@@ -1183,6 +1183,13 @@ function bulkAssign(req, res, next) {
 //   already there       Nothing to do. Counted separately from a skip, because
 //                       "8 changed, 2 already Contacted" is not a failure.
 //
+// A status flagged NEEDS_FOLLOW_UP may carry one follow-up for the whole
+// selection — one date, one time, one note, written to every lead that moved.
+// That is the honest shape of the thing: "chase all of these on Tuesday" is a
+// single decision, unlike a call outcome, which describes one conversation and
+// cannot describe twenty. So this endpoint takes a follow-up and does not take
+// a call log.
+//
 // And one status is refused outright for the whole request: a status flagged
 // converts_to_appointment. Applying it opens an appointment form per lead —
 // vehicle, service, date, bay — which is per-lead data nobody can supply from a
@@ -1194,8 +1201,30 @@ function bulkStatus(req, res, next) {
       lead_ids:    z.array(z.coerce.number().int().positive()).min(1).max(500),
       status:      z.string().trim().min(1).max(100),
       lost_reason: z.string().trim().max(120).optional().nullable(),
+
+      /* ── One follow-up for the whole selection ─────────────────────────
+         A status flagged needs_follow_up asks for a date when it is set on
+         one lead, and used to ask for nothing at all in bulk — which meant
+         the flag was quietly ignored on exactly the batches where a chased
+         list matters most.
+
+         The date is regexed here rather than parsed as a Date: 'YYYY-MM-DD'
+         is what <input type="date"> emits and what lead_events.due_date
+         stores, and accepting anything Date() will swallow would let
+         '2026' through as 1 January.
+
+         Optional, always. A status that needs a follow-up can still be set
+         without one — the frontend asks, the API does not insist, and a
+         script moving leads to "Contacted" should not have to invent a
+         date to be allowed to. */
+      follow_up_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/,
+        'The follow-up date must look like 2026-08-25.').optional().nullable(),
+      follow_up_time: z.string().trim().regex(/^\d{2}:\d{2}$/,
+        'The follow-up time must look like 09:00.').optional().nullable(),
+      follow_up_note: z.string().trim().max(500).optional().nullable(),
     });
-    const { lead_ids, status, lost_reason } = schema.parse(req.body);
+    const { lead_ids, status, lost_reason,
+            follow_up_date, follow_up_time, follow_up_note } = schema.parse(req.body);
 
     // The status must exist. Matched case-insensitively because leads.status
     // stores the NAME, and a rename in Settings should not be able to strand a
@@ -1232,6 +1261,8 @@ function bulkStatus(req, res, next) {
       const rows = (await client.query(
         `SELECT l.id,
                 l.status                                   AS cur,
+                l.created_by,
+                l.assigned_to,
                 COALESCE(ls.is_locked, FALSE)              AS cur_locked,
                 EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id) AS converted
            FROM leads l
@@ -1254,12 +1285,16 @@ function bulkStatus(req, res, next) {
 
       if (!changeable.length) {
         await client.query('ROLLBACK');
+        // Nothing moved, so nothing is scheduled either — a follow-up belongs
+        // to a status change, and there was no status change.
         return res.json({
           updated: 0,
           skipped_converted: skippedConverted,
           skipped_locked: skippedLocked,
           unchanged,
           status: statusName,
+          follow_ups: 0,
+          follow_up_date: null,
         });
       }
 
@@ -1277,11 +1312,51 @@ function bulkStatus(req, res, next) {
       // Any status change closes the open follow-ups — the same rule
       // updateLead applies. A follow-up scheduled against the status you just
       // left is not a reminder any more, it is noise.
+      //
+      // This runs whether or not a new follow-up is being scheduled, and it
+      // runs FIRST. Inserting before closing would mark the new one done in
+      // the same breath, which is the version of this bug that looks like
+      // "bulk follow-ups silently do nothing".
       await client.query(
         `UPDATE lead_events SET is_done = TRUE, done_at = NOW()
           WHERE lead_id = ANY($1) AND is_done = FALSE`,
         [ids]
       );
+
+      /* ── The new follow-up, one row per lead ────────────────────────────
+         Same shape updateLead writes, so the Today / Tomorrow / This week
+         tabs and the overdue alerts read these without knowing they came
+         from a bulk action.
+
+         due_at is built from the date and time as LOCAL time — `new
+         Date('2026-08-25T09:00:00')` with no Z — because 9am means 9am at
+         the workshop. Appending a Z would file a morning follow-up at 2:30pm
+         IST and every one of them would look late.
+
+         Written for the leads that actually MOVED. A lead the loop above
+         skipped as locked or already converted keeps its status, so giving
+         it a follow-up for a status it is not in would be a reminder about
+         something that never happened. */
+      let followUpCount = 0;
+      if (follow_up_date) {
+        const timeStr = follow_up_time || '09:00';
+        const dueAt   = new Date(`${follow_up_date}T${timeStr}:00`);
+        if (isNaN(dueAt)) {
+          await client.query('ROLLBACK');
+          return res.status(422).json({ error: 'That follow-up date and time is not a real moment.' });
+        }
+        const note = follow_up_note || 'Follow-up scheduled';
+
+        // One statement, not one per lead: unnest expands the id array into
+        // rows, so 500 leads cost a single round trip inside the transaction
+        // rather than 500.
+        await client.query(
+          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note)
+           SELECT id, $2, $3, $4, $5 FROM unnest($1::int[]) AS t(id)`,
+          [ids, statusName, follow_up_date, dueAt.toISOString(), note]
+        );
+        followUpCount = ids.length;
+      }
 
       // One activity row per lead, carrying the status it came FROM — which is
       // why the previous values were read above rather than thrown away.
@@ -1320,6 +1395,58 @@ function bulkStatus(req, res, next) {
         description: `Bulk set status "${statusName}" on ${ids.length} lead(s): IDs ${ids.join(', ')}`,
       });
 
+      /* ── Telling people, ONCE ───────────────────────────────────────────
+         updateLead notifies the creator, the assignee and the actor for one
+         follow-up. Repeating that per lead here would mean up to three
+         notifications and three pushes times fifty leads — a phone buzzing
+         a hundred and fifty times for a single click, which is how people
+         learn to turn notifications off entirely.
+
+         So one summary each, and each person is told THEIR number, not the
+         total. An agent who owns three of the fifty is told about three;
+         "50 follow-ups scheduled" would send them looking for forty-seven
+         that are not theirs. The person who pressed the button gets the
+         total, because that is the number they are responsible for.
+
+         A person counted once per lead even if they are both its creator
+         and its assignee — the Set inside the loop is what makes that true. */
+      if (followUpCount) {
+        const perUser = new Map();
+        for (const r of changeable) {
+          for (const uid of new Set([r.created_by, r.assigned_to].filter(Boolean))) {
+            perUser.set(uid, (perUser.get(uid) || 0) + 1);
+          }
+        }
+        if (req.user?.id) perUser.set(req.user.id, followUpCount);
+
+        const timeStr = follow_up_time || '09:00';
+        const when    = `${follow_up_date} at ${timeStr}`;
+
+        for (const [uid, count] of perUser) {
+          const body = `${count} follow-up${count === 1 ? '' : 's'} scheduled for ${when} `
+                     + `(status set to ${statusName})`;
+          try {
+            // pool, not client — the transaction is committed and its client
+            // released. A notification must never be able to reopen it.
+            if (await isNotificationEnabled(pool, uid, 'follow_up_scheduled')) {
+              await pool.query(
+                `INSERT INTO notifications (user_id, type, title, body, lead_id)
+                 VALUES ($1, 'follow_up_scheduled', $2, $3, NULL)`,
+                [uid, 'Follow-ups scheduled', body]
+              );
+            }
+            // lead_id NULL on purpose: this row is about a batch, and pointing
+            // it at one arbitrary lead of fifty would open the wrong one.
+            sendPush(uid, 'follow_up_scheduled', 'Follow-ups Scheduled', body, '/leads');
+          } catch (err) {
+            // The statuses and the follow-ups are already committed. A failure
+            // to announce them must not turn into a 500 that makes the caller
+            // believe none of it happened.
+            console.error('[bulkStatus] follow-up notice failed for user', uid, '—', err.message);
+          }
+        }
+      }
+
       // After the commit, never inside it: these fan out to push services and
       // must not be able to hold a transaction open or roll one back.
       const conversionStatuses = ['won', 'converted', 'closed won'];
@@ -1333,6 +1460,10 @@ function bulkStatus(req, res, next) {
         skipped_locked: skippedLocked,
         unchanged,
         status: statusName,
+        // How many follow-ups were actually written, so the toast can say so
+        // rather than the frontend assuming its request took effect.
+        follow_ups: followUpCount,
+        follow_up_date: followUpCount ? follow_up_date : null,
         ids,
       });
     } catch (err) {
@@ -1370,20 +1501,102 @@ function bulkDelete(req, res, next) {
 }
 
 // ── GET /api/leads/check-mobile?mobile=xxx&exclude_id=yyy ─────────────────────
+/**
+ * Is this number already in the pipeline?
+ *
+ * ── THIS QUERY IS DELIBERATELY UNSCOPED. IT IS THE ONLY ONE. ────────────────
+ *
+ * Every other lead read filters by created_by / assigned_to. This one searches
+ * every lead in the database, on purpose, and the reason is the whole point of
+ * the warning: an advisor who cannot SEE a colleague's lead is exactly the
+ * advisor about to create a second one for the same customer. Scope it and the
+ * check becomes silent precisely when it is needed — the customer then gets
+ * called twice by two people who each believe they own the conversation.
+ *
+ * ── SO WHAT IT RETURNS IS RATIONED ─────────────────────────────────────────
+ *
+ * The advisor is told the number is taken and WHO TO ASK. Not the customer's
+ * name, not who created the record, not its history:
+ *
+ *   assigned_to_name   the person to go and talk to. This replaced
+ *                      created_by_name, which answered a question nobody was
+ *                      asking — the advisor needs whoever OWNS the customer
+ *                      now, not whoever typed the row in months ago.
+ *   can_view           whether this caller may actually open the lead.
+ *
+ * `can_view` exists because the screen used to offer a "View Lead →" button to
+ * everybody, and for anyone outside the lead's scope it went nowhere: getLead
+ * applies the normal filter and answers 404. Being told a record exists, being
+ * offered a link to it, and having the link fail is worse than not being
+ * offered the link — it reads as a broken CRM rather than a deliberate
+ * boundary. The button is now shown only when it will work.
+ *
+ * The scope expression below MUST mirror listLeads and getLead. It is written
+ * as a SELECT-list boolean rather than a WHERE clause because this query
+ * returns rows the caller cannot see — that is its job — and must merely label
+ * them.
+ */
 async function checkMobile(req, res, next) {
   try {
     const mobile     = (req.query.mobile || '').trim();
     const excludeId  = parseInt(req.query.exclude_id, 10) || 0;
     if (!mobile) return res.json({ duplicates: [] });
 
+    const user = req.user;
+    const full = Boolean(user.is_super_admin || user.permissions.has('VIEW_LEAD'));
+
+    // Same team resolution as listLeads and getLead: direct reports, plus self.
+    let teamIds = null;
+    if (!full && user.permissions.has('VIEW_TEAM_LEADS')) {
+      const t = await pool.query(`SELECT id FROM users WHERE manager_id = $1`, [user.id]);
+      teamIds = [user.id, ...t.rows.map(r => r.id)];
+    }
+
     // Only return leads that are still OPEN (not yet converted to an appointment,
     // not lost, not cancelled). Leads that already have an appointment linked are
     // excluded — they are done; showing them as duplicates is misleading.
+    // Built here so the $n numbering stays in step with the params array below.
+    // `full` short-circuits to TRUE — a caller who sees everything needs no
+    // comparison, and writing one would put their own id in the query for no
+    // reason.
+    const scopeParams = [];
+    let canViewSql;
+    if (full) {
+      canViewSql = 'TRUE';
+    } else if (teamIds) {
+      scopeParams.push(teamIds);
+      canViewSql = `(l.created_by = ANY($${1 + (excludeId ? 2 : 1)})${SHARED_SQL})`;
+    } else {
+      scopeParams.push(user.id);
+      canViewSql = `(l.created_by = $${1 + (excludeId ? 2 : 1)} `
+                 + `OR l.assigned_to = $${1 + (excludeId ? 2 : 1)}${SHARED_SQL})`;
+    }
+
+    // ── COALESCE, and it is not decoration ──────────────────────────────────
+    //
+    // These same predicates live in listLeads and getLead as WHERE clauses,
+    // where SQL's three-valued logic is harmless: a row evaluating to NULL is
+    // not returned, which is the right answer. In a SELECT list it is not
+    // harmless. `assigned_to = 1` against a NULL assigned_to is NULL, not
+    // false, and `false OR NULL OR false` is NULL — so an unassigned lead
+    // belonging to nobody came back with can_view: null.
+    //
+    // JavaScript treats null as falsy, so the screen would have behaved
+    // correctly by accident. It would stop the day anyone wrote
+    // `can_view === false`. Found by the test, not by reading.
+    canViewSql = `COALESCE(${canViewSql}, FALSE)`;
+
     const r = await pool.query(
       `SELECT l.id, l.name, l.mobile, l.status, l.created_at,
-              u.name AS created_by_name
+              -- Who owns the customer NOW. NULL when nobody does, which the
+              -- screen renders as "not assigned to anyone yet" — a different
+              -- and more actionable sentence than naming a person.
+              au.name AS assigned_to_name,
+              -- Whether this caller may open it. See the header: the button is
+              -- hidden rather than offered and broken.
+              ${canViewSql} AS can_view
          FROM leads l
-         LEFT JOIN users          u   ON u.id  = l.created_by
+         LEFT JOIN users          au  ON au.id = l.assigned_to
          LEFT JOIN lead_statuses  ls  ON LOWER(ls.name) = LOWER(l.status)
         -- Matched on the last TEN DIGITS, not on the stored string.
         --
@@ -1413,7 +1626,7 @@ async function checkMobile(req, res, next) {
           AND COALESCE(ls.is_pipeline, TRUE) = TRUE
           AND COALESCE(ls.converts_to_appointment, FALSE) = FALSE
         ORDER BY l.created_at DESC LIMIT 5`,
-      excludeId ? [mobile, excludeId] : [mobile]
+      excludeId ? [mobile, excludeId, ...scopeParams] : [mobile, ...scopeParams]
     );
     res.json({ duplicates: r.rows });
   } catch (err) { next(err); }

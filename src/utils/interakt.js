@@ -329,14 +329,104 @@ async function sendText({ to, message, callbackData = null }) {
     return { ok: false, retryable: false, errorCode: 'EMPTY_MESSAGE', errorMessage: 'Refusing to send an empty message.' };
   }
 
-  const payload = {
-    countryCode: parts.countryCode,
-    phoneNumber: parts.phoneNumber,
-    type: 'Text',
-    data: { message: text },
-    ...(callbackData ? { callbackData: String(callbackData).slice(0, 512) } : {}),
-  };
+  return postFreeForm({
+    key,
+    label: 'text',
+    payload: {
+      countryCode: parts.countryCode,
+      phoneNumber: parts.phoneNumber,
+      type: 'Text',
+      data: { message: text },
+      ...(callbackData ? { callbackData: String(callbackData).slice(0, 512) } : {}),
+    },
+  });
+}
 
+/**
+ * Send a PHOTO free-form — an advisor attaching an image to a reply.
+ *
+ * ⚠️ UNVERIFIED, for the same reason sendText is: Interakt documents only
+ * `type: "Template"`. sendText proves an undocumented free-form shape exists
+ * and works, so a media equivalent is very likely; MEDIA_PAYLOAD below is the
+ * best candidate. `backend/interakt-image-probe.js` settles which shape the API
+ * actually accepts, and swapping to the answer is a change to ONE function.
+ *
+ * ── The URL must be reachable from the public internet ──────────────────────
+ *
+ * We do not upload bytes to Interakt. We hand them a URL and WhatsApp fetches
+ * it. That has one consequence worth stating plainly, because it is the thing
+ * that will break in staging: a relative path such as `/uploads/wa/x.jpg` —
+ * what this codebase's disk-storage fallback produces — is not fetchable by
+ * anybody but us, and the send fails with an error that blames the image
+ * rather than the configuration. ImageKit's CDN URL is the supported input;
+ * the caller is responsible for producing one.
+ *
+ * ── Legal only inside the 24-hour window ────────────────────────────────────
+ *
+ * Same rule as text, and same division of responsibility: this function does
+ * NOT check the window. wa_conversations.window_expires_at is the record and
+ * the caller owns the decision, because the caller is the one that can offer a
+ * template instead.
+ */
+async function sendMedia({ to, mediaUrl, caption = null, callbackData = null }) {
+  const key = apiKey();
+  if (!key) {
+    return { ok: false, retryable: false, errorCode: 'NOT_CONFIGURED', errorMessage: 'Interakt API key is not configured.' };
+  }
+
+  const parts = toInteraktParts(to);
+  if (!parts) {
+    return { ok: false, retryable: false, errorCode: 'BAD_NUMBER', errorMessage: `Not a messageable number: ${to}` };
+  }
+
+  // Checked here as well as at the endpoint. WhatsApp fetches this URL from
+  // its own servers, so anything that is not an absolute http(s) address is a
+  // guaranteed failure — and catching it before the call turns a confusing
+  // provider rejection into a sentence naming the real problem.
+  const url = typeof mediaUrl === 'string' ? mediaUrl.trim() : '';
+  if (!/^https?:\/\/\S+$/i.test(url)) {
+    return {
+      ok: false, retryable: false, errorCode: 'BAD_MEDIA_URL',
+      errorMessage: 'The image must be at a public https:// address before it can be sent.',
+    };
+  }
+
+  const text = typeof caption === 'string' ? caption.trim() : '';
+
+  return postFreeForm({
+    key,
+    label: 'media',
+    payload: {
+      countryCode: parts.countryCode,
+      phoneNumber: parts.phoneNumber,
+      type: 'Image',
+      data: {
+        mediaUrl: url,
+        // Omitted rather than sent empty. An empty caption key is the kind of
+        // field a strict validator rejects outright, and there is no reason to
+        // find out the hard way.
+        ...(text ? { caption: text } : {}),
+      },
+      ...(callbackData ? { callbackData: String(callbackData).slice(0, 512) } : {}),
+    },
+  });
+}
+
+/**
+ * POST a free-form payload and turn the answer into this module's result shape.
+ *
+ * Extracted so sendText and sendMedia cannot drift. That is not tidiness for
+ * its own sake — sendText's own header already warns that "a second sending
+ * path with its own error handling is how the two drift", and adding a second
+ * free-form sender is exactly the moment that would have happened. The breaker,
+ * the 20-second abort, the retryable/permanent split and the
+ * HTTP-200-with-result:false trap now have one implementation.
+ *
+ * `label` appears in the two console.error lines and nowhere else. It is what
+ * makes a rejection say which shape was refused, which is the whole diagnostic
+ * value of an unverified payload.
+ */
+async function postFreeForm({ key, payload, label }) {
   let status = null;
   let body = null;
   const abort = new AbortController();
@@ -379,9 +469,9 @@ async function sendText({ to, message, callbackData = null }) {
   }
 
   if (status && (status < 200 || status >= 300)) {
-    // Printed in full because this is the unverified path: if Interakt wants a
-    // different body shape for text, THIS line is where it says so.
-    console.error('[interakt:text] rejected', status, JSON.stringify(body || {}).slice(0, 500));
+    // Printed in full because these are the unverified paths: if Interakt wants
+    // a different body shape, THIS line is where it says so.
+    console.error(`[interakt:${label}] rejected`, status, JSON.stringify(body || {}).slice(0, 500));
     return {
       ok: false,
       retryable: false,
@@ -391,11 +481,11 @@ async function sendText({ to, message, callbackData = null }) {
   }
 
   if (body && body.result === false) {
-    console.error('[interakt:text] result:false', JSON.stringify(body).slice(0, 500));
+    console.error(`[interakt:${label}] result:false`, JSON.stringify(body).slice(0, 500));
     return { ok: false, retryable: false, errorCode: 'REJECTED', errorMessage: body.message || 'Interakt rejected the reply.' };
   }
 
   return { ok: true, providerMessageId: body?.id || body?.messageId || null };
 }
 
-module.exports = { sendTemplate, sendText, isConfigured, _breaker: breaker };
+module.exports = { sendTemplate, sendText, sendMedia, isConfigured, _breaker: breaker };
