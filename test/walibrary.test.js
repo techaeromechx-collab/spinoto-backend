@@ -583,6 +583,132 @@ const ADMIN = { id: 7, name: 'Admin', permissions: new Set(['MANAGE_WHATSAPP_TEM
   assert.match(keyBlock, /acceptSuggest/, 'Enter does not accept the highlighted suggestion'); n++;
   assert.match(keyBlock, /Escape/, 'there is no way out of the suggestion list'); n++;
 
+  // ═════════════════════════════════════════════════════════════════════════
+  // PART 6 — Getting an image INTO the library
+  // ═════════════════════════════════════════════════════════════════════════
+  //
+  // Two ways in, and each has a failure the other does not.
+
+  const libSrc = strip(read(path.join(ROOT, 'controllers/whatsapp.library.controller.js')));
+  const imagesTab = strip(read(path.join(FE, 'src/components/settings/WhatsAppImagesTab.jsx')));
+
+  // ── Uploading ───────────────────────────────────────────────────────────
+  assert.strictEqual(typeof lib.uploadImage, 'function', 'uploadImage is not exported'); n++;
+
+  const iUp = libSrc.indexOf('function uploadImage(');
+  assert.ok(iUp > -1, 'uploadImage is gone'); n++;
+  const upFn = libSrc.slice(iUp, libSrc.indexOf('\n}', iUp));
+
+  assert.match(upFn, /uploadToImageKit/,
+    'the upload does not go through the shared ImageKit uploader'); n++;
+
+  /* The ORIGINAL filename must never reach ImageKit.
+     It is user text that ends up in a public URL, and it is the source of the
+     space-sanitising confusion this endpoint exists to end — a name like
+     'CAR SERVICE PRICE-03 08-06-2026.png' comes back as an address nobody can
+     reproduce by reading it. */
+  assert.ok(!/originalname/i.test(upFn),
+    "the uploaded file is named from the browser's filename, which is user-controlled "
+    + 'and lands in a public URL'); n++;
+
+  /* The duplicate name is checked BEFORE the bytes go up. Both orders end with
+     the same message; only this one avoids leaving a file on ImageKit that no
+     row points at and nothing will ever clean up. */
+  const iClash = upFn.indexOf('FROM wa_images WHERE LOWER(TRIM(name))');
+  const iToIk = upFn.indexOf('uploadToImageKit');
+  assert.ok(iClash > -1, 'uploadImage does not check the name is free'); n++;
+  assert.ok(iClash < iToIk,
+    'the name clash is checked AFTER the upload — a rejected save orphans a file on ImageKit'); n++;
+
+  // fileId is stored. It is the handle a pasted address can never have, and
+  // the only thing that could ever let deleting a row delete the picture.
+  // The COLUMN being named is not enough — it stays in the INSERT list while a
+  // literal null is passed into it, which is the shape this first passed on.
+  // What matters is that ImageKit's own id reaches the row.
+  assert.match(upFn, /imagekit_file_id/,
+    'the insert no longer has a column for the file id'); n++;
+  assert.match(upFn, /up\.fileId/,
+    "the upload discards ImageKit's file id — a row created here would be no better than a "
+    + 'pasted address, and the picture could never be cleaned up with the row'); n++;
+
+  // ── Pasting: the address is checked before it is saved ──────────────────
+  assert.match(libSrc, /async function probeImageUrl\(/,
+    'nothing checks that a pasted address actually serves an image'); n++;
+
+  for (const fnName of ['function createImage(', 'function updateImage(']) {
+    const i = libSrc.indexOf(fnName);
+    assert.ok(i > -1, `${fnName} is gone`); n++;
+    const body = libSrc.slice(i, libSrc.indexOf('\n}', i));
+    assert.match(body, /await probeImageUrl\(/,
+      `${fnName} saves an address without checking it — the broken card and the failed send `
+      + 'both arrive later, and neither names the cause'); n++;
+  }
+
+  const iProbe = libSrc.indexOf('async function probeImageUrl(');
+  const probeFn = libSrc.slice(iProbe, libSrc.indexOf('\n}', libSrc.indexOf('return null;', iProbe)));
+
+  /* The four statuses that actually happened, each with its own sentence.
+     400/401/403 is ImageKit refusing an unsigned request for a PRIVATE file —
+     the one that cost the most time, because the address is right and reads
+     right. 404 is the renamed-file case. Lumping them into "that URL doesn't
+     work" would throw away the only useful half of the answer. */
+  for (const code of ['400', '404']) {
+    assert.ok(probeFn.includes(code),
+      `probeImageUrl does not distinguish ${code}; a private file and a missing one would `
+      + 'get the same unhelpful message'); n++;
+  }
+  assert.match(probeFn, /private/i,
+    'the 400 case does not mention the private-file setting, which is what it means'); n++;
+
+  // A non-image is refused. A PDF or an HTML error page at a 200 is exactly
+  // what a misconfigured CDN serves, and WhatsApp will not send it.
+  assert.match(probeFn, /content-type/i,
+    'probeImageUrl does not check the content type — an HTML error page served with a 200 '
+    + 'would be saved as an image'); n++;
+  assert.match(probeFn, /startsWith\('image\//,
+    'the content-type check does not require an image'); n++;
+
+  /* A probe that could not RUN must not refuse the save.
+     A timeout or a blocked egress is our network, not their URL, and refusing
+     there means a firewall change locks an admin out of a screen that worked
+     yesterday. The catch returns null — allow — and says so in the log. */
+  const iCatch = probeFn.indexOf('catch (err)');
+  assert.ok(iCatch > -1, 'probeImageUrl does not handle being unable to reach the address'); n++;
+  const catchBody = probeFn.slice(iCatch, iCatch + 220);
+  assert.match(catchBody, /return null/,
+    'a probe that could not run REFUSES the save — a network blip on our side would block a '
+    + 'perfectly good address'); n++;
+
+  // And it must not hang. Six seconds of an admin waiting is already a lot;
+  // an unbounded fetch would hold the request open until the proxy gave up.
+  assert.match(probeFn, /signal/,
+    'the probe has no timeout — an unresponsive host would hang the save'); n++;
+
+  // ── The route ───────────────────────────────────────────────────────────
+  const upMw = middlewareFor('post', '/images/upload');
+  assert.ok(/\bcanManage\b/.test(upMw),
+    'anyone who can send WhatsApp can upload into the library'); n++;
+  assert.ok(/photoField/.test(upMw),
+    'the upload route does not reuse the shared multipart middleware, so its size and type '
+    + 'limits are a second copy to keep in step'); n++;
+
+  // ── The screen offers both, and cannot mangle a pasted address ──────────
+  assert.match(imagesTab, /images\/upload/,
+    'the settings screen never calls the upload endpoint'); n++;
+  assert.match(imagesTab, /FormData/,
+    'the upload is not posted as multipart'); n++;
+  assert.ok(!/\bapi\(['\`][^'\`]*images\/upload/.test(imagesTab),
+    'the upload uses api(), which stringifies its body and cannot post a file'); n++;
+
+  /* Both address boxes select their whole contents on focus.
+     Without it the caret lands wherever the click did, and a paste is INSERTED
+     into the old address rather than replacing it — which produced a
+     300-character hybrid of two URLs that looked almost right. Two boxes, so
+     two assertions: fixing one and not the other is the obvious slip. */
+  assert.strictEqual((imagesTab.match(/onFocus=\{e => e\.target\.select\(\)\}/g) || []).length, 2,
+    'one of the two address boxes does not select all on focus, so a paste can land inside '
+    + 'the old URL instead of replacing it'); n++;
+
   // ── The settings screens ────────────────────────────────────────────────
   for (const f of ['WhatsAppImagesTab.jsx', 'WhatsAppQuickRepliesTab.jsx']) {
     assert.ok(fs.existsSync(path.join(FE, 'src/components/settings', f)), `${f} is missing`); n++;
@@ -595,7 +721,6 @@ const ADMIN = { id: 7, name: 'Admin', permissions: new Set(['MANAGE_WHATSAPP_TEM
   assert.match(settings, /tab === 'images'/, 'there is no Image Library tab'); n++;
   assert.match(settings, /tab === 'quick'/,  'there is no Quick Replies tab'); n++;
 
-  const imagesTab = strip(read(path.join(FE, 'src/components/settings/WhatsAppImagesTab.jsx')));
   // all=1 — without it the admin screen cannot see, and therefore cannot
   // re-enable, anything it has switched off.
   assert.match(imagesTab, /images\?all=1/,

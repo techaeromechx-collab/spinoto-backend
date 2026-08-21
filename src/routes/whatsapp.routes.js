@@ -278,6 +278,16 @@ const canReadLib = canRead;
 
 router.get   ('/images',        canReadLib, guardAllFlag, lib.listImages);
 router.post  ('/images',        canManage,  lib.createImage);
+
+/* The file, rather than its address.
+ *
+ * photoField is the SAME multipart middleware the reply-media route uses — the
+ * same 5 MB ceiling, the same JPEG/PNG rule, the same sentences when a file
+ * breaks them. Two copies would be two limits to keep in step, and the pair
+ * that drifts is always the one nobody sends test files through.
+ *
+ * Declared before '/images/:id' so 'upload' cannot be read as an id. */
+router.post  ('/images/upload', canManage,  photoField, lib.uploadImage);
 router.patch ('/images/:id',    canManage,  lib.updateImage);
 router.delete('/images/:id',    canManage,  lib.deleteImage);
 

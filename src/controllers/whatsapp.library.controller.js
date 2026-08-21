@@ -94,6 +94,95 @@ function badImageUrl(url) {
   return null;
 }
 
+/**
+ * Does that address actually serve an image, right now?
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ *
+ * badImageUrl above checks the SHAPE — https, a real host, not localhost. It
+ * cannot tell you the file is there, and every way a pasted ImageKit address
+ * goes wrong is invisible to a shape check:
+ *
+ *   • the filename had spaces, and ImageKit sanitised them on upload, so the
+ *     address you copied from the design tool is not the address it lives at
+ *   • the file was renamed, and every rename mints a new address
+ *   • the URL was pasted into the middle of the old one
+ *   • the file is marked PRIVATE in ImageKit and answers 400 to anyone unsigned
+ *
+ * All four save cleanly, show a broken card, and — the part that matters —
+ * fail at SEND time, where WhatsApp fetches the same address and returns a
+ * provider error blaming the picture. One request here turns a confusing
+ * failure days later into a sentence at the moment somebody pastes it.
+ *
+ * ── WHY A FAILED PROBE IS NOT ALWAYS A REFUSAL ──────────────────────────────
+ *
+ * Two different things can go wrong and they deserve different answers:
+ *
+ *   the SERVER answered badly (404, 400, a PDF) — their address is wrong, and
+ *   refusing it is the whole point.
+ *
+ *   we could not ASK (timeout, DNS, no egress) — that is our network, not
+ *   their URL. Refusing would mean a firewall change silently locks an admin
+ *   out of a screen that worked yesterday, and the address may be perfectly
+ *   good. So the save is allowed and the reason is logged.
+ *
+ * Returns null when the address is fine or unknowable; a sentence when it is
+ * definitely wrong.
+ */
+async function probeImageUrl(url) {
+  // Range: bytes=0-0 rather than HEAD. Some CDNs answer HEAD with 405 while
+  // serving GET perfectly, and one byte is enough to read a status and a
+  // content-type without pulling a 4 MB poster through this server.
+  const attempt = async (method, headers) => {
+    const ctl = setTimeoutController(6000);
+    try {
+      return await fetch(url, { method, headers, redirect: 'follow', signal: ctl.signal });
+    } finally {
+      ctl.done();
+    }
+  };
+
+  let r;
+  try {
+    r = await attempt('GET', { Range: 'bytes=0-0' });
+  } catch (err) {
+    console.warn('[wa-library] could not reach', url, '—', err.message);
+    return null;   // our side, not theirs
+  }
+
+  if (r.status === 400 || r.status === 401 || r.status === 403) {
+    return 'That address exists but refuses to be read without a signature — in ImageKit the '
+         + 'file is marked private. Open it in the Media Library and turn the private setting '
+         + 'off, or upload it here instead.';
+  }
+  if (r.status === 404 || r.status === 410) {
+    return 'There is nothing at that address. If you renamed the file in ImageKit its address '
+         + 'changed too — use the Copy URL button there rather than typing the name.';
+  }
+  if (!r.ok && r.status !== 206) {
+    return `That address answered with an error (${r.status}). WhatsApp would get the same thing.`;
+  }
+
+  // 206 is the partial content the Range asked for; 200 means it ignored the
+  // Range and sent the lot, which is also fine.
+  const type = String(r.headers.get('content-type') || '').toLowerCase();
+  if (type && !type.startsWith('image/')) {
+    return `That address serves ${type.split(';')[0]}, not an image. WhatsApp will refuse it.`;
+  }
+  if (!type) {
+    return 'That address does not say what kind of file it is. WhatsApp needs an image with a '
+         + 'proper type — make sure the filename ends in .jpg or .png.';
+  }
+  return null;
+}
+
+/** AbortSignal.timeout is not in every Node this runs on; this is. */
+function setTimeoutController(ms) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  return { signal: ctl.signal, done: () => clearTimeout(t) };
+}
+
 function listImages(req, res, next) {
   handle(req, res, next, async () => {
     // ── The active-only rule ────────────────────────────────────────────────
@@ -121,6 +210,11 @@ function createImage(req, res, next) {
     const bad = badImageUrl(d.imagekit_url);
     if (bad) return res.status(422).json({ error: bad });
 
+    // Shape first, then reality. The order matters only for the error message:
+    // a typo'd scheme should say so rather than time out reaching nothing.
+    const dead = await probeImageUrl(d.imagekit_url);
+    if (dead) return res.status(422).json({ error: dead, code: 'URL_UNREACHABLE' });
+
     const r = await pool.query(
       `INSERT INTO wa_images (name, imagekit_url, imagekit_file_id, is_active, created_by, updated_by)
        VALUES ($1, $2, $3, COALESCE($4, TRUE), $5, $5)
@@ -131,6 +225,94 @@ function createImage(req, res, next) {
       userId: req.user?.id, userName: req.user?.name, action: 'CREATE',
       entity: 'wa_image', entityId: r.rows[0].id,
       description: `WhatsApp image added: ${d.name}`,
+    });
+    res.status(201).json({ item: r.rows[0] });
+  });
+}
+
+/**
+ * POST /api/whatsapp/images/upload — the file, not the address.
+ *
+ * ── WHY THIS EXISTS ALONGSIDE PASTING A URL ─────────────────────────────────
+ *
+ * Pasting an ImageKit address looks like the simpler option and is not. It
+ * asks an admin to copy a string exactly, from a different product, and every
+ * one of the ways that goes wrong (a renamed file, a sanitised space, a paste
+ * landing in the middle of the old value, a file uploaded private) produces
+ * the same useless outcome: a saved row that cannot be delivered.
+ *
+ * This path removes every one of them. The bytes go up through THIS server
+ * using the same uploader the WhatsApp paperclip already uses — which is
+ * demonstrably reachable, because its images arrive on customers' phones — and
+ * the address comes back from ImageKit rather than being typed. Nothing is
+ * ever public that we did not just put there ourselves, and nothing is
+ * private, because we never ask for it to be.
+ *
+ * Pasting stays, for the case it is actually good at: an image that is already
+ * on ImageKit and already known to work.
+ *
+ * ── WHY THE FILENAME IS THROWN AWAY ─────────────────────────────────────────
+ *
+ * The original name is user text that would end up in a public URL, and it is
+ * also the source of the space-sanitising confusion this endpoint exists to
+ * end. A generated name plus ImageKit's useUniqueFileName means the address is
+ * never something anybody has to read, spell or copy.
+ */
+function uploadImage(req, res, next) {
+  handle(req, res, next, async () => {
+    if (!req.file?.buffer?.length) {
+      return res.status(400).json({ error: 'Choose an image file to upload.' });
+    }
+
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(422).json({ error: 'Give the image a name.' });
+    if (name.length > 120) return res.status(422).json({ error: 'That name is too long.' });
+
+    /* The duplicate check runs BEFORE the upload, not after.
+       Both orders end with the admin seeing "another entry already uses that
+       name", and only this one avoids leaving an orphaned file on ImageKit
+       that no row points at and nothing will ever clean up. It is a check, not
+       a lock — two admins racing the same name still end at the unique index,
+       which is the thing that actually guarantees it. */
+    const clash = await pool.query(
+      `SELECT 1 FROM wa_images WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`, [name]);
+    if (clash.rowCount) {
+      return res.status(409).json({ error: 'Another entry already uses that name.' });
+    }
+
+    const ext = req.file.mimetype === 'image/png' ? '.png' : '.jpg';
+    let up;
+    try {
+      const { uploadToImageKit } = require('../utils/imagekit');
+      up = await uploadToImageKit(req.file.buffer, `wa-lib${ext}`, 'whatsapp-library');
+    } catch (err) {
+      console.error('[wa-library] ImageKit upload failed —', err.message);
+      return res.status(502).json({
+        error: 'The image could not be uploaded to ImageKit. Try again in a moment.',
+        code: 'UPLOAD_FAILED',
+      });
+    }
+    if (!up?.url) {
+      return res.status(502).json({
+        error: 'The image uploaded but no public address came back, so it cannot be sent.',
+        code: 'UPLOAD_NO_URL',
+      });
+    }
+
+    /* fileId is stored, and it is the reason this path is better than pasting
+       in one more way: a row created from a pasted address has no handle on
+       the file, so deleting the row can never delete the picture. A row
+       created here does. Nothing uses it yet. */
+    const r = await pool.query(
+      `INSERT INTO wa_images (name, imagekit_url, imagekit_file_id, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $4)
+       RETURNING ${IMAGE_COLS}`,
+      [name, up.url, up.fileId || null, req.user?.id || null]);
+
+    logActivity({
+      userId: req.user?.id, userName: req.user?.name, action: 'CREATE',
+      entity: 'wa_image', entityId: r.rows[0].id,
+      description: `WhatsApp image uploaded: ${name}`,
     });
     res.status(201).json({ item: r.rows[0] });
   });
@@ -147,6 +329,8 @@ function updateImage(req, res, next) {
     if (d.imagekit_url !== undefined) {
       const bad = badImageUrl(d.imagekit_url);
       if (bad) return res.status(422).json({ error: bad });
+      const dead = await probeImageUrl(d.imagekit_url);
+      if (dead) return res.status(422).json({ error: dead, code: 'URL_UNREACHABLE' });
     }
 
     // COALESCE per column, so a PATCH carrying only is_active cannot null the
@@ -356,7 +540,7 @@ function saveLibrarySettings(req, res, next) {
 }
 
 module.exports = {
-  listImages, createImage, updateImage, deleteImage,
+  listImages, createImage, uploadImage, updateImage, deleteImage,
   listQuickReplies, createQuickReply, updateQuickReply, deleteQuickReply,
   getLibrarySettings, saveLibrarySettings,
   // Used by whatsapp.messages.controller to gate the upload endpoint, and by
