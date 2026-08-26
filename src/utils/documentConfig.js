@@ -172,6 +172,7 @@ const DEFAULT_DOC_BASE = {
 
   header_fields: {
     vehicle_number: true,
+    odometer: true,           // reading at the time of the job; drives KM warranties
     po_number: false,
     eway_bill: false,
     place_of_supply: false,   // required on a GST invoice once IGST is in play
@@ -294,6 +295,7 @@ const docSchema = z.object({
   }).partial(),
   header_fields: z.object({
     vehicle_number:  z.boolean(),
+    odometer:        z.boolean(),
     po_number:       z.boolean(),
     eway_bill:       z.boolean(),
     place_of_supply: z.boolean(),

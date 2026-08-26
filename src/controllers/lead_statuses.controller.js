@@ -30,12 +30,19 @@ const statusSchema = z.object({
   // other has already paid you.
   is_reenquiry:            z.boolean().default(false),
   is_repeat_customer:      z.boolean().default(false),
+  // Opens the reason picker, and the API refuses the transition without one
+  // (migration 172). Per-status rather than a name match on "lost", so it
+  // survives a rename the way nothing in LeadsPage.jsx used to.
+  needs_lost_reason:       z.boolean().default(false),
+  // Where the retarget sweep moves a lead when its date arrives (migration
+  // 173). One holder only, same as is_reenquiry.
+  is_retarget_target:      z.boolean().default(false),
 });
 
 const SELECT_COLS = `
   id, name, color, bg_color, sort_order, is_active, is_default,
   needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, is_closed,
-  is_reenquiry, is_repeat_customer, created_at
+  is_reenquiry, is_repeat_customer, needs_lost_reason, is_retarget_target, created_at
 `;
 
 function listStatuses(req, res, next) {
@@ -76,13 +83,20 @@ function createStatus(req, res, next) {
       if (data.is_repeat_customer) {
         await client.query('UPDATE lead_statuses SET is_repeat_customer = FALSE WHERE is_repeat_customer');
       }
+      // Same treatment for the retarget destination: its partial unique index
+      // would be correct and would surface as a 500 with a Postgres constraint
+      // name in it. Ticking a box somewhere else is a choice, not an error.
+      if (data.is_retarget_target) {
+        await client.query('UPDATE lead_statuses SET is_retarget_target = FALSE WHERE is_retarget_target');
+      }
       const r = await client.query(
         `INSERT INTO lead_statuses
-           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, is_closed, is_reenquiry, is_repeat_customer)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING ${SELECT_COLS}`,
+           (name, color, bg_color, sort_order, is_active, is_default, needs_follow_up, converts_to_appointment, is_pipeline, logs_call, is_locked, is_closed, is_reenquiry, is_repeat_customer, needs_lost_reason, is_retarget_target)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING ${SELECT_COLS}`,
         [data.name, data.color, data.bg_color, nextOrder, data.is_active, data.is_default,
          data.needs_follow_up, data.converts_to_appointment, data.is_pipeline, data.logs_call ?? false, data.is_locked ?? false, data.is_closed ?? false,
-         data.is_reenquiry ?? false, data.is_repeat_customer ?? false]
+         data.is_reenquiry ?? false, data.is_repeat_customer ?? false,
+         data.needs_lost_reason ?? false, data.is_retarget_target ?? false]
       );
       await client.query('COMMIT');
       getIO().emit('invalidate', { topic: 'lead_statuses' });
@@ -131,6 +145,9 @@ function updateStatus(req, res, next) {
       }
       if (data.is_repeat_customer === true) {
         await client.query('UPDATE lead_statuses SET is_repeat_customer = FALSE WHERE is_repeat_customer AND id != $1', [id]);
+      }
+      if (data.is_retarget_target === true) {
+        await client.query('UPDATE lead_statuses SET is_retarget_target = FALSE WHERE is_retarget_target AND id != $1', [id]);
       }
 
       const fields = []; const params = [];

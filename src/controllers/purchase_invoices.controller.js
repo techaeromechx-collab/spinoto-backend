@@ -4,6 +4,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
@@ -599,20 +600,28 @@ function generatePurchaseInvoice(req, res, next) {
     const txDiscountType  = est.transaction_discount_type || 'percent';
     const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
 
-    // Sum of total_inc_gst across all eligible items (base for proportional split)
-    const totalIncGstSum = itemsRow.rows.reduce((s, it) => s + Number(it.total_inc_gst ?? 0), 0);
-
-    // Compute the total transaction discount amount (inc-GST)
-    let txDiscountTotal = 0;
-    if (txDiscountMode === 'transaction' && txDiscountValue > 0 && totalIncGstSum > 0) {
-      if (txDiscountType === 'percent') {
-        txDiscountTotal = parseFloat((totalIncGstSum * txDiscountValue / 100).toFixed(2));
-      } else {
-        txDiscountTotal = Math.min(txDiscountValue, totalIncGstSum);
-      }
-    }
-
     const roundFn = getRoundingFunction(new Date());
+
+    /* ── The customer's discounted EX-GST value, line by line ─────────────
+       This used to apportion the discount across the items by their inclusive
+       amounts and then divide the GST back out. That matched the old rule,
+       where a transaction discount came off the inclusive total.
+
+       It no longer does: the discount reduces the TAXABLE value and the tax
+       follows it down (see utils/transactionDiscount.js). The hub's share is
+       derived from the customer's rate, so the basis has to move with it — a
+       purchase invoice computed on the old rule would pay the hub a share of a
+       customer value that was never charged.
+
+       The same helper the estimate and the customer invoice use, so all three
+       documents for one job agree by construction rather than by three
+       separate authors reaching the same answer. */
+    const custTotals = applyTransactionDiscount({
+      items:         itemsRow.rows,
+      discountType:  txDiscountMode === 'transaction' ? txDiscountType : null,
+      discountValue: txDiscountMode === 'transaction' ? txDiscountValue : 0,
+      roundFn,
+    });
 
     // Warranty redo: the claim's cost_bearer decides who pays for the redo.
     //   'hub'     → hub did faulty work, redo is on them: hub payable forced to ₹0
@@ -633,21 +642,16 @@ function generatePurchaseInvoice(req, res, next) {
     }
 
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
-    const items = itemsRow.rows.map(item => {
+    const items = itemsRow.rows.map((item, idx) => {
       const qty    = Number(item.quantity);
       const gstPct = Number(item.gst_percent);
 
-      // Determine post-discount inc-GST for this item:
-      // 1. Start with line-item discount (total_inc_gst already reflects it)
-      // 2. Then apply this item's proportional share of the transaction discount
-      const itemIncGst = Number(item.total_inc_gst ?? 0);
-      const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
-        ? roundFn(itemIncGst / totalIncGstSum * txDiscountTotal, 4)
-        : 0;
-      const postDiscIncGst = roundFn(itemIncGst - itemTxDiscount, 4);
-
-      // custRate = post-discount ex-GST per unit
-      const custRate = roundFn(postDiscIncGst / qty / (1 + gstPct / 100), 4);
+      /* custRate = the customer's post-discount EX-GST value, per unit.
+         Taken straight from the shared calculation above — the line-item
+         discount is already inside total_inc_gst, and the transaction
+         discount's share of this line has been taken off the taxable value
+         there. No dividing GST back out: the figure is already ex-GST. */
+      const custRate = qty > 0 ? roundFn(custTotals.lines[idx].taxable / qty, 4) : 0;
 
       // Rate basis: normally the customer rate; for company-borne warranty
       // redos, the original item's rate (the redo's customer rate is ~₹0).
@@ -896,12 +900,20 @@ function approvePurchaseInvoice(req, res, next) {
         pi.grand_total = grandTotal;
       }
 
-      // A ₹0 PI (hub-borne warranty redo) has nothing to pay out — mark its
-      // payment_status 'paid' at approval so it never lingers in the payouts
-      // queue (payouts lists status='approved' AND payment_status != 'paid').
-      // NOTE: 'paid' lives in payment_status, NOT status — the status column's
-      // CHECK only allows pending_approval/approved/cancelled. Normal PIs
-      // always have grand_total > 0 and are untouched by this.
+      /* A ₹0 PI has nothing to pay out, and says so.
+         It is NOT marked 'paid' — that was the old behaviour and it was a lie
+         with consequences: every downstream guard reads 'paid' as "money left
+         the bank" and refused to let the invoice be edited or synced, so a PI
+         that came to zero (every line at 100% commission, not only the
+         hub-borne warranty redo this was written for) was frozen the moment it
+         was approved. Migration 174 has the full account.
+
+         'not_required' keeps the original purpose — the payouts queue lists
+         status='approved' AND payment_status NOT IN ('paid','not_required'), so
+         a nil invoice still never lingers there.
+
+         NOTE: this lives in payment_status, NOT status — the status column's
+         CHECK only allows pending_approval/approved/cancelled. */
       const zeroPayable = parseFloat(pi.grand_total) <= 0.011;
 
       // The hub's invoice number is claimed HERE, at approval — not at
@@ -939,7 +951,7 @@ function approvePurchaseInvoice(req, res, next) {
              payment_status=$4,
              invoice_number = COALESCE(invoice_number, $5)
          WHERE id=$3 AND status = 'pending_approval'`,
-        [req.user?.id || null, payout_schedule, id, zeroPayable ? 'paid' : 'pending', invoiceNumber]
+        [req.user?.id || null, payout_schedule, id, zeroPayable ? 'not_required' : 'pending', invoiceNumber]
       );
 
       if (!approved.rowCount) {
@@ -1021,6 +1033,13 @@ function addHubPayment(req, res, next) {
     const pi = piRow.rows[0];
     if (pi.status !== 'approved') {
       return res.status(400).json({ error: 'Can only record payments against approved purchase invoices' });
+    }
+    /* A nil invoice is refused with its own sentence. It would be refused two
+       lines below anyway (balance is 0, so any amount exceeds it), but
+       "Payment ₹500 exceeds outstanding balance ₹0.00" describes the arithmetic
+       rather than the situation. */
+    if (parseFloat(pi.grand_total) <= 0.011) {
+      return res.status(400).json({ error: 'This invoice comes to ₹0 — there is nothing to pay.' });
     }
     if (pi.payment_status === 'paid') {
       return res.status(400).json({ error: 'Purchase invoice is already fully paid' });
@@ -1589,7 +1608,7 @@ function deleteHubPaymentBatch(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH /api/purchase-invoices/:id
 // Update take rates per item after approval.
-// Blocked if payment_status = 'paid' or any payment exists.
+// Blocked when money has actually moved — not when the label says 'paid'.
 // ─────────────────────────────────────────────────────────────────────────────
 function updatePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
@@ -1613,7 +1632,12 @@ function updatePurchaseInvoice(req, res, next) {
     // hardcoded cutover date (utils/math.js). Keyed to a backdatable field
     // it would silently change the totals of an already-issued document.
     const roundFn = getRoundingFunction(pi.created_at);
-    if (pi.payment_status === 'paid' || parseFloat(pi.amount_paid) > 0) {
+    /* ── "Has money moved?", not "does it say paid?" ─────────────────────
+       These are the same question for every ordinary invoice and different for
+       a nil one, which is settled without a rupee having moved. Asked the old
+       way, a ₹0 invoice could never have its commission corrected — the one
+       thing anybody would want to do with it. */
+    if (parseFloat(pi.amount_paid) > 0) {
       return res.status(400).json({ error: 'Cannot edit — payment has already been recorded.' });
     }
 
@@ -1675,7 +1699,7 @@ function updatePurchaseInvoice(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/purchase-invoices/:id/sync-from-estimate
 // Re-derives all line items + totals from the linked estimate.
-// Blocked if PI payment_status = 'paid'.
+// Blocked when money has actually moved — see updatePurchaseInvoice.
 // ─────────────────────────────────────────────────────────────────────────────
 function syncPurchaseInvoiceFromEstimate(req, res, next) {
   handle(req, res, next, async () => {
@@ -1707,8 +1731,9 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
     if (!piRow.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
     const pi = piRow.rows[0];
 
-    if (pi.payment_status === 'paid') {
-      return res.status(400).json({ error: 'Cannot sync — Purchase Invoice is already paid.' });
+    // Same rule as updatePurchaseInvoice: the money, not the word.
+    if (parseFloat(pi.amount_paid || 0) > 0) {
+      return res.status(400).json({ error: 'Cannot sync — payment has already been recorded against this invoice.' });
     }
 
     // Re-fetch estimate discount fields
@@ -1750,25 +1775,25 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
     const txDiscountMode  = est.discount_mode || 'none';
     const txDiscountType  = est.transaction_discount_type || 'percent';
     const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
-    const totalIncGstSum  = itemsRow.rows.reduce((s, it) => s + Number(it.total_inc_gst ?? 0), 0);
-    let txDiscountTotal = 0;
-    if (txDiscountMode === 'transaction' && txDiscountValue > 0 && totalIncGstSum > 0) {
-      txDiscountTotal = txDiscountType === 'percent'
-        ? roundFn(totalIncGstSum * txDiscountValue / 100)
-        : Math.min(txDiscountValue, totalIncGstSum);
-    }
+    /* The same shared calculation generatePurchaseInvoice uses. These two
+       functions produce the SAME invoice from the same estimate — one at
+       generation, one when the estimate is later re-synced — so any drift
+       between them shows up as an invoice that changes amount for no reason
+       anybody can point at. They now read one implementation. */
+    const custTotals = applyTransactionDiscount({
+      items:         itemsRow.rows,
+      discountType:  txDiscountMode === 'transaction' ? txDiscountType : null,
+      discountValue: txDiscountMode === 'transaction' ? txDiscountValue : 0,
+      roundFn,
+    });
 
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
-    const items = itemsRow.rows.map(item => {
+    const items = itemsRow.rows.map((item, idx) => {
       const qty    = Number(item.quantity);
       const gstPct = Number(item.gst_percent);
 
-      const itemIncGst     = Number(item.total_inc_gst ?? 0);
-      const itemTxDiscount = txDiscountTotal > 0 && totalIncGstSum > 0
-        ? roundFn(itemIncGst / totalIncGstSum * txDiscountTotal, 4)
-        : 0;
-      const postDiscIncGst = roundFn(itemIncGst - itemTxDiscount, 4);
-      const custRate       = roundFn(postDiscIncGst / qty / (1 + gstPct / 100), 4);
+      // Post-discount ex-GST per unit — see the note in generatePurchaseInvoice.
+      const custRate = qty > 0 ? roundFn(custTotals.lines[idx].taxable / qty, 4) : 0;
 
       let appliedRatePct, hubRate;
       if (useCommission) {
@@ -1902,7 +1927,7 @@ function listPayouts(req, res, next) {
           ORDER BY (c.purchase_invoice_id = pi.id) DESC, c.id
           LIMIT 1
        ) ci ON TRUE
-       WHERE pi.status = 'approved' AND pi.payment_status != 'paid'${hubScope ? ` AND ${hubScope}` : ''}
+       WHERE pi.status = 'approved' AND pi.payment_status NOT IN ('paid', 'not_required')${hubScope ? ` AND ${hubScope}` : ''}
        ORDER BY pi.payout_due_date ASC NULLS LAST`,
       params
     );
@@ -2131,7 +2156,10 @@ function exportPayouts(req, res, next) {
     };
 
     if (type === 'outstanding') {
-      const conditions = ["pi.status = 'approved'", "pi.payment_status != 'paid'"];
+      /* NOT IN, not != 'paid'. A nil invoice is settled and must stay out of
+         this queue — with a bare != it would reappear the day migration 174
+         relabelled it, asking somebody to pay ₹0. */
+      const conditions = ["pi.status = 'approved'", "pi.payment_status NOT IN ('paid', 'not_required')"];
       const params = [];
 
       // The CSV builds its own WHERE, so scoping applied only to listPayouts
@@ -2316,12 +2344,26 @@ async function rejectPurchaseInvoiceApproval(req, res, next) {
         [id]
       );
 
+      /* payment_status goes back too, and its absence here was a bug.
+         Approval SETS payment_status ('pending', or 'not_required' for a nil
+         invoice). Un-approving cleared approved_by, approved_at,
+         payout_due_date and the schedule but left the payment label standing —
+         so a rejected nil invoice returned to pending_approval still carrying
+         the old 'paid', and updatePurchaseInvoice went on refusing to edit it.
+         The escape hatch did not escape.
+
+         'pending' is right regardless of the total: re-approving recomputes it,
+         and an unapproved invoice has no payment position to describe. Guarded
+         on amount_paid because rejectApproval already refuses an invoice with
+         payments — this is the assertion that says so in the SQL. */
       await client.query(
         `UPDATE purchase_invoices
          SET status = 'pending_approval',
              approved_by = NULL,
              approved_at = NULL,
              payout_due_date = NULL,
+             payment_status = CASE WHEN COALESCE(amount_paid, 0) > 0
+                                   THEN payment_status ELSE 'pending' END,
              updated_at = NOW()
          WHERE id = $1`,
          [id]
@@ -2344,4 +2386,103 @@ async function rejectPurchaseInvoiceApproval(req, res, next) {
   });
 }
 
-module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts };
+/**
+ * Cancel a purchase invoice.
+ *
+ * ── Why cancel and not delete ───────────────────────────────────────────────
+ *
+ * Approving a PI claims a number from the hub's own invoice series
+ * (claimHubInvoiceNumber), and that series must not have holes — a supplier
+ * jumping from 0041 to 0043 has to explain 0042 to their accountant, and the
+ * explanation "the customer deleted it" is not one. Cancelling keeps the
+ * number, keeps the document, and marks it void, which is what every
+ * accounting system in the world does with a wrong invoice.
+ *
+ * `status = 'cancelled'` has been legal since migration 065 and nothing has
+ * ever set it. The list screen already has the badge and the filter option.
+ *
+ * ── What it frees ──────────────────────────────────────────────────────────
+ *
+ * Migration 174 replaced UNIQUE(estimate_id) with a partial unique index that
+ * ignores cancelled rows, so cancelling releases the estimate and a corrected
+ * PI can be generated for it. Without that this endpoint would be a trap: one
+ * dead end traded for a worse one.
+ *
+ * ── What it refuses ────────────────────────────────────────────────────────
+ *
+ * Any invoice money has moved against. A payout that has left the bank is a
+ * fact about the bank, and no status on this row makes it untrue — reverse the
+ * payment first, deliberately, and then decide.
+ */
+async function cancelPurchaseInvoice(req, res, next) {
+  handle(req, res, next, async () => {
+    const id = idParam.parse(req.params.id);
+
+    await _assertPiHub(req, id);
+
+    const r = await pool.query(
+      `SELECT pi.status, pi.payment_status, COALESCE(pi.amount_paid, 0) AS amount_paid,
+              pi.invoice_number,
+              (SELECT COUNT(*)::int FROM hub_payments WHERE purchase_invoice_id = pi.id) AS payment_count
+         FROM purchase_invoices pi WHERE pi.id = $1`, [id]);
+
+    if (!r.rows[0]) return res.status(404).json({ error: 'Purchase invoice not found' });
+    const pi = r.rows[0];
+
+    if (pi.status === 'cancelled') {
+      return res.status(400).json({ error: 'This purchase invoice is already cancelled.' });
+    }
+
+    /* Both checks, not one. amount_paid is DERIVED from hub_payments by
+       recalcHubInvoiceState, so in a healthy database they agree — and the one
+       time they do not is exactly the time this must refuse. */
+    if (pi.payment_count > 0 || parseFloat(pi.amount_paid) > 0) {
+      return res.status(400).json({
+        error: `Cannot cancel — ₹${Number(pi.amount_paid).toFixed(2)} has already been paid against this invoice. `
+             + `Reverse the payment first if that is what you mean to do.`,
+        code: 'PI_HAS_PAYMENTS',
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // The schedule describes future payouts on an invoice that will not be
+      // paid. Deleted rather than left, exactly as rejectApproval does.
+      await client.query(`DELETE FROM pi_payment_schedule WHERE purchase_invoice_id = $1`, [id]);
+
+      /* invoice_number is deliberately NOT cleared — see the header. The number
+         stays on the cancelled document so the hub's series stays whole.
+
+         payment_status goes to 'not_required': nothing is owed on a cancelled
+         invoice and nothing was paid, which is precisely what that value means
+         (migration 174). Leaving it 'pending' would keep the invoice looking
+         like an outstanding liability on a document that has been voided. */
+      await client.query(
+        `UPDATE purchase_invoices
+            SET status = 'cancelled',
+                payment_status = 'not_required',
+                payout_due_date = NULL,
+                updated_at = NOW()
+          WHERE id = $1`, [id]);
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    console.log(`[purchase_invoices] ${pi.invoice_number || `#${id}`} cancelled by user ${req.user?.id}`);
+
+    const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
+    full.rows[0].items        = await _getItems(id);
+    full.rows[0].hub_payments = await _getHubPayments(id);
+    full.rows[0].schedule     = await _getPaymentSchedule(id);
+    res.json({ item: full.rows[0] });
+  });
+}
+
+module.exports = { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts, cancelPurchaseInvoice };

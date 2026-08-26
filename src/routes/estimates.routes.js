@@ -30,6 +30,23 @@ const canApprove         = requirePermissionOrHub('APPROVE_ESTIMATE', 'EDIT_ESTI
 const canRevise          = requirePermissionOrHub('REVISE_ESTIMATE',  'EDIT_ESTIMATE');
 const canExecute         = requirePermissionOrHub('EXECUTE_ESTIMATE', 'EDIT_ESTIMATE');
 
+/* Recording the CUSTOMER's decision is staff-only, and cannot share canExecute.
+ *
+ * canExecute has to keep its hub bypass — it also gates the per-item work-status
+ * updates, which are the hub's own job while a car is on the ramp. But it let a
+ * hub open "Mark Customer Approval" in the portal and tick the customer's lines
+ * for them, and the controller wrote no provenance at all: no decision_source,
+ * no timestamp, no user. An approved line had nothing behind it.
+ *
+ * requirePermission, not ...OrHub: the latter grants a hub login with zero
+ * permissions assigned EVERYTHING, which is the default a hub is created with.
+ * The controller refuses hub sessions on the role as well — a hub can
+ * legitimately hold EDIT_ESTIMATE and would otherwise pass this gate.
+ *
+ * The customer's own link is unaffected: it is a public route with its own
+ * last-4 identity check, and it is the path that records who decided. */
+const canRecordCustomerDecision = requirePermission('EXECUTE_ESTIMATE', 'EDIT_ESTIMATE');
+
 router.use(requireAuth);
 // Customer mobile numbers are masked to 98382xxxxx for hub logins — see
 // middleware/maskMobile.middleware.js. Mounted at the router so every response
@@ -53,7 +70,7 @@ router.patch('/:id',                               canEdit,    updateEstimate);
 router.post('/:id/submit',                         canSubmit,  submitEstimate);
 router.post('/:id/company-approve',                canApprove, companyApprove);
 router.post('/:id/company-revise',                 canRevise,  companyRevise);
-router.post('/:id/customer-approval',              canExecute,   customerApproval);
+router.post('/:id/customer-approval',              canRecordCustomerDecision, customerApproval);
 router.patch('/:id/items/:itemId/work-status',     canExecute, updateItemWorkStatus);
 router.delete('/:id',                              requireAuth, deleteEstimate);
 

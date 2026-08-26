@@ -230,7 +230,7 @@ function render({ doc, cfg, pageSize }) {
 
   <div class="bill-section">
     <div class="bill-box">
-      <div class="hd">${doc.docType === 'purchase_invoice' ? 'Bill To / Hub' : 'Bill To / Party'}</div>
+      <div class="hd">Bill To / Party</div>
       <div class="name">${esc(doc.buyer.name)}</div>
       ${buyerRows.map(r => `<div>${r.label}: ${r.value}</div>`).join('')}
     </div>

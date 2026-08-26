@@ -50,9 +50,22 @@ async function recalcHubInvoiceState(client, purchaseInvoiceId) {
   // The 0.011 tolerance is the existing one, kept exactly. Rupee amounts that
   // have been through a GST split can miss by a paisa, and an invoice stuck at
   // 'partially_paid' for one paisa blocks the payout it was meant to release.
-  const status = amtPaid <= 0
-    ? 'pending'
-    : amtPaid >= total - 0.011 ? 'paid' : 'partially_paid';
+  /* ── The nil case comes FIRST, and it has to ────────────────────────────
+     A ₹0 invoice satisfies `amtPaid >= total - 0.011` with nothing paid, so
+     without this branch it would be labelled 'paid' — the exact lie migration
+     174 exists to remove. Below it, the ordering would instead call it
+     'pending' the moment this function ran, undoing the label approval set and
+     dropping the invoice back into the payouts queue for a payment nobody can
+     ever make.
+
+     Put here rather than only in approvePurchaseInvoice because THIS is the
+     one function that derives payment_status. Two places deciding the same
+     thing is how they end up disagreeing. */
+  const status = total <= 0.011
+    ? 'not_required'
+    : amtPaid <= 0
+      ? 'pending'
+      : amtPaid >= total - 0.011 ? 'paid' : 'partially_paid';
 
   await client.query(
     `UPDATE purchase_invoices

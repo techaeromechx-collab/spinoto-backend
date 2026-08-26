@@ -40,8 +40,19 @@ const path = require('path');
 const { Pool } = require('pg');
 
 const BE = path.resolve(__dirname, '..');
+const { applyProcessTimezone, istToday, istAddDays, istWeekday, istEndOfDayISO } =
+  require(path.join(BE, 'src/utils/appTime'));
+
+// Before any Date is formatted. Node caches the zone on first use, so a test
+// that sets this late would pass while proving nothing about the server.
+applyProcessTimezone();
+
 const DBNAME = 'spinoto_followup_test';
+/* The session timezone the app's own pool sets (src/config/db.js). Without it
+   this suite would connect on UTC and cheerfully verify the behaviour the
+   timezone work exists to replace. */
 const DB = { host: '/tmp', port: 5433, user: 'postgres', database: DBNAME,
+             options: '-c timezone=Asia/Kolkata',
              connectionTimeoutMillis: 1500 };
 let n = 0;
 
@@ -71,13 +82,14 @@ function liftQuery(marker, vars) {
   return new Function(...names, `return ${SRC.slice(start, end + 1)};`)(...names.map(k => vars[k]));
 }
 
-// Copied from the controller, which builds the same fragment in both handlers.
-const NOT_CONVERTED = `
-  AND l.status NOT IN (
-    SELECT name FROM lead_statuses
-    WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
-      AND is_active = TRUE
-  )`;
+/* LIFTED, not copied. This fragment used to be pasted into all four handlers
+   under four different names; it is one module constant now, and a copy here
+   would test the copy — including its old, wrong flag list. */
+const FINISHED_LEAD_SQL = (() => {
+  const i = SRC.indexOf('const FINISHED_LEAD_SQL = `');
+  assert.ok(i > -1, 'the shared finished-lead filter is gone; the rule is being pasted per handler again');
+  return SRC.slice(SRC.indexOf('`', i) + 1, SRC.indexOf('`', SRC.indexOf('`', i) + 1));
+})();
 
 /* The pre-170 shape of the tables the changed SQL touches, from the migrations
    that own them (037 lead_events, 040 due_at, 013 leads.status as VARCHAR).
@@ -139,11 +151,17 @@ const TODAY = '2026-08-21';
   assert.strictEqual(before.rows[0].n, 0,
     'the test schema already has the 170 columns, so applying the migration proves nothing'); n++;
 
-  const mig = fs.readFileSync(path.join(BE, 'db/migrations/170_lead_events_done_by.sql'), 'utf8');
-  await db.query(mig);
-  // Applied twice: migrations get re-run against a database that already has
-  // them more often than anybody plans for.
-  await db.query(mig);
+  for (const f of ['170_lead_events_done_by.sql', '171_lead_events_created_by.sql']) {
+    const mig = fs.readFileSync(path.join(BE, 'db/migrations', f), 'utf8');
+    await db.query(mig);
+    // Applied twice: migrations get re-run against a database that already has
+    // them more often than anybody plans for.
+    await db.query(mig);
+  }
+  const c171 = await db.query(
+    `SELECT count(*)::int AS n FROM information_schema.columns
+      WHERE table_name = 'lead_events' AND column_name = 'created_by'`);
+  assert.strictEqual(c171.rows[0].n, 1, '171 did not add created_by'); n++;
 
   const cols = await db.query(
     `SELECT column_name, is_nullable, column_default FROM information_schema.columns
@@ -164,12 +182,15 @@ const TODAY = '2026-08-21';
       ('New',       FALSE, FALSE, FALSE, FALSE),
       ('Attempt 1', TRUE,  FALSE, FALSE, FALSE),
       ('Booked',    FALSE, TRUE,  FALSE, FALSE),
-      ('Lost',      FALSE, FALSE, TRUE,  TRUE )`);
+      ('Lost',      FALSE, FALSE, TRUE,  TRUE ),
+      -- closed but NOT locked: the case all four old filter copies missed
+      ('Not Interested', FALSE, FALSE, FALSE, TRUE)`);
   await db.query(`
     INSERT INTO leads (name, status, created_by, assigned_to) VALUES
       ('Live lead',      'New',    1, 1),
       ('Converted lead', 'Booked', 1, 1),
-      ('Lost lead',      'Lost',   1, 1)`);
+      ('Lost lead',      'Lost',   1, 1),
+      ('Closed lead',    'Not Interested', 1, 1)`);
 
   // One row per bucket, plus the two that used to be counted as work.
   await db.query(`
@@ -181,11 +202,12 @@ const TODAY = '2026-08-21';
       (1, 'Attempt 1', DATE '2026-08-01', TRUE,  TIMESTAMPTZ '2026-08-05', TRUE ),  -- auto (was late)
       (1, 'Attempt 1', DATE '2099-01-01', FALSE, NULL,                     FALSE),  -- future
       (2, 'Attempt 1', DATE '2026-08-01', FALSE, NULL,                     FALSE),  -- CONVERTED lead
-      (3, 'Attempt 1', DATE '2026-08-01', FALSE, NULL,                     FALSE)`);// LOCKED lead
+      (3, 'Attempt 1', DATE '2026-08-01', FALSE, NULL,                     FALSE),  -- LOCKED lead
+      (4, 'Attempt 1', DATE '2026-08-01', FALSE, NULL,                     FALSE)`);// CLOSED, not locked
 
   // ── Compliance ───────────────────────────────────────────────────────────
   const complianceSQL = liftQuery('AS total_due,', {
-    pOffset: 0, visibilitySQL: '', COMPLIANCE_NOT_CONVERTED: NOT_CONVERTED,
+    pOffset: 0, visibilitySQL: '', FINISHED_LEAD_SQL,
   });
   const c = (await db.query(complianceSQL, [TODAY])).rows[0];
 
@@ -210,7 +232,7 @@ const TODAY = '2026-08-21';
     + 'in, or the future-dated one is being counted as due'); n++;
 
   // ── Stats (what the Dashboard renders today) ─────────────────────────────
-  const statsSQL = liftQuery('AS overdue_new,', { targetExtra: '', NOT_CONVERTED });
+  const statsSQL = liftQuery('AS overdue_new,', { targetExtra: '', FINISHED_LEAD_SQL });
   const s = (await db.query(statsSQL, [TODAY, null, null, TODAY, TODAY])).rows[0];
 
   assert.strictEqual(s.completed, 2,
@@ -310,6 +332,147 @@ const TODAY = '2026-08-21';
   assert.match(bulkFn, /converts_to_appointment, needs_follow_up/,
     'needs_follow_up is not read from lead_statuses, so target.needs_follow_up is undefined and the '
     + 'guard is dead code that always passes'); n++;
+
+  /* ── A closed status is finished, even when nobody ticked "locked" ────────
+     All four old copies of this filter tested converts_to_appointment and
+     is_locked only. The current status set hides that, because 'Lost' carries
+     all three flags — so the seed above adds one that does not: 'Not
+     Interested', closed but unlocked, with an overdue follow-up on it. Under
+     the old rule that lead's chase sat in the list forever. */
+  const closedLeak = await db.query(
+    `SELECT count(*)::int AS n FROM lead_events e JOIN leads l ON l.id = e.lead_id
+      WHERE l.status = 'Not Interested' ${FINISHED_LEAD_SQL}`);
+  assert.strictEqual(closedLeak.rows[0].n, 0,
+    'a follow-up on a lead whose status is CLOSED but not locked is still in the chase list — the '
+    + 'filter is only testing converts_to_appointment and is_locked'); n++;
+
+  /* ── The clock ────────────────────────────────────────────────────────────
+     The pool session runs on Asia/Kolkata, so `done_at::date` answers in IST.
+     This row is completed at 02:00 IST the DAY AFTER it was due, which is late.
+     On UTC that instant renders as 20:30 the previous day — the due date itself
+     — and the old code counted it on_time. Every follow-up finished in the
+     small hours was being scored a day early, always in the flattering
+     direction. */
+  await db.query(`
+    INSERT INTO lead_events (lead_id, status_name, due_date, is_done, done_at, auto_closed)
+    VALUES (1, 'Attempt 1', DATE '2026-08-01', TRUE, TIMESTAMPTZ '2026-08-02 02:00:00+05:30', FALSE)`);
+  const tz = (await db.query(complianceSQL, [TODAY])).rows[0];
+  assert.strictEqual(tz.late, 2,
+    `late is ${tz.late}, expected 2 — a follow-up completed at 2am IST the day AFTER it was due is `
+    + 'being dated in UTC, which puts it back on the due date and scores it on_time'); n++;
+  assert.strictEqual(tz.on_time, 1,
+    `on_time is ${tz.on_time}, expected 1 — the 2am completion has leaked into the on-time bucket`); n++;
+
+  const sess = await db.query(`SELECT current_setting('TimeZone') AS tz`);
+  assert.strictEqual(sess.rows[0].tz, 'Asia/Kolkata',
+    'the connection is not on IST, so every ::date in this suite answered in the wrong zone'); n++;
+  // And the app's own pool must ask for it — in the startup packet, not a SET.
+  /* Comments stripped first. Without that, this pair matched the PROSE in
+     db.js explaining why a per-connection SET is the wrong approach — a test
+     that reads the argument for a decision and reports it as the decision. */
+  const strip = t => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const DBCFG = strip(fs.readFileSync(path.join(BE, 'src/config/db.js'), 'utf8'));
+  assert.match(DBCFG, /options:\s*'-c timezone=Asia\/Kolkata'/,
+    'src/config/db.js no longer pins the session timezone, so every ::date in the app is back on UTC'); n++;
+  assert.ok(!/SET TIME ZONE/i.test(DBCFG),
+    'the timezone is being set with a per-connection SET — a pool opens connections on its own '
+    + 'schedule, so one missed reconnect means one query, occasionally, answering in UTC'); n++;
+
+  // Node's clock too: this is what decides that a 09:00 follow-up means 09:00.
+  assert.strictEqual(new Date('2026-08-25T09:00:00').toISOString(), '2026-08-25T03:30:00.000Z',
+    'a zoneless 09:00 is still being read as UTC, so every morning follow-up is filed at 2:30pm IST — '
+    + 'which is what the code has always done despite its comment saying otherwise'); n++;
+  for (const f of ['src/server.js', 'db/migrate.js']) {
+    assert.match(fs.readFileSync(path.join(BE, f), 'utf8'), /applyProcessTimezone\(\)/,
+      `${f} does not set the process timezone`); n++;
+  }
+
+  // The date helpers, including the boundaries that make them worth having.
+  assert.strictEqual(istToday(new Date('2026-08-25T00:30:00+05:30')), '2026-08-25',
+    'istToday returns the UTC date for an instant just after IST midnight'); n++;
+  assert.strictEqual(istAddDays('2026-12-31', 1), '2027-01-01', 'istAddDays breaks over a year end'); n++;
+  assert.strictEqual(istAddDays('2028-02-28', 1), '2028-02-29', 'istAddDays breaks on a leap day'); n++;
+  assert.strictEqual(istWeekday('2026-08-23'), 0, 'istWeekday does not report Sunday as 0'); n++;
+  assert.strictEqual(istEndOfDayISO('2026-08-25'), '2026-08-25T18:29:59.999Z',
+    'end of an IST day is not being converted to the right instant'); n++;
+
+  /* ── markDone is scoped ───────────────────────────────────────────────────
+     The controller is invoked for real rather than having its SQL lifted: the
+     scope is built in JavaScript from req.user, so a string test would prove
+     only that some text exists. */
+  process.env.DATABASE_URL = `postgres://postgres@/${DBNAME}?host=/tmp&port=5433`;
+  const events = require(path.join(BE, 'src/controllers/lead_events.controller'));
+
+  await db.query(`INSERT INTO users (name) VALUES ('Other advisor')`);           // id 2
+  await db.query(`INSERT INTO leads (name, status, created_by, assigned_to)
+                  VALUES ('Somebody else''s lead', 'New', 2, 2)`);               // id 5
+  const foreign = (await db.query(
+    `INSERT INTO lead_events (lead_id, status_name, due_date)
+     VALUES (5, 'Attempt 1', DATE '2026-08-01') RETURNING id`)).rows[0].id;
+
+  const call = (id, user) => new Promise((resolve) => {
+    const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(b) { resolve({ code: this.statusCode, body: b }); } };
+    events.markDone({ params: { id: String(id) }, user }, res, e => resolve({ code: 500, body: { error: e.message } }));
+  });
+  const advisor = { id: 1, is_super_admin: false, permissions: new Set(['VIEW_OWN_LEADS']) };
+  const admin2  = { id: 1, is_super_admin: true,  permissions: new Set() };
+
+  const denied = await call(foreign, advisor);
+  assert.strictEqual(denied.code, 404,
+    `an advisor closed a follow-up on a lead belonging to somebody else (HTTP ${denied.code}) — the `
+    + 'read endpoints are all scoped and the one WRITE was scoped by nothing at all'); n++;
+  const stillOpen = (await db.query(`SELECT is_done, done_by FROM lead_events WHERE id = $1`, [foreign])).rows[0];
+  assert.strictEqual(stillOpen.is_done, false,
+    'the row was closed anyway — the 404 is cosmetic and the UPDATE still ran'); n++;
+  assert.strictEqual(stillOpen.done_by, null,
+    'somebody else\'s follow-up now carries this user\'s name against it'); n++;
+
+  // The other half of the rule: the advisor's OWN follow-up still works.
+  const mine = (await db.query(
+    `INSERT INTO lead_events (lead_id, status_name, due_date)
+     VALUES (1, 'Attempt 1', DATE '2026-08-01') RETURNING id`)).rows[0].id;
+  const ok = await call(mine, advisor);
+  assert.strictEqual(ok.code, 200,
+    `an advisor cannot tick their own follow-up (HTTP ${ok.code}) — the scope is too tight and the `
+    + 'feature is broken for everybody without VIEW_LEAD'); n++;
+  const done = (await db.query(`SELECT is_done, done_by, auto_closed FROM lead_events WHERE id = $1`, [mine])).rows[0];
+  assert.strictEqual(done.done_by, 1, 'done_by was not recorded on a real completion'); n++;
+  assert.strictEqual(done.auto_closed, false, 'a hand-ticked follow-up is flagged auto_closed'); n++;
+
+  // A super admin reaches anything, which is the point of the flag.
+  assert.strictEqual((await call(foreign, admin2)).code, 200,
+    'a super admin cannot close a follow-up they can plainly see'); n++;
+
+  /* ── Deleting an appointment gives the lead a follow-up back ──────────────
+     The regression this whole round introduced. Booking now closes the chase;
+     deleting the appointment returns the lead to the status it came from —
+     usually one that needs chasing — and without this it lands there with
+     nothing scheduled and no way to notice, because the Follow-up list is built
+     from OPEN rows. */
+  const iUn = APPT.indexOf('Appointment deleted');
+  const unconvert = APPT.slice(Math.max(0, iUn - 4000), iUn);
+  assert.match(unconvert, /needs_follow_up = TRUE AND is_active = TRUE/,
+    'the un-convert path does not check whether the status it returns the lead to needs a follow-up'); n++;
+  assert.match(unconvert, /INSERT INTO lead_events[\s\S]{0,200}CURRENT_DATE/,
+    'the un-convert path schedules no follow-up, so a lead whose appointment was deleted sits in a '
+    + 'chase status with nobody chasing it and nothing on any list'); n++;
+  assert.ok(!/due_date\s*=\s*back\.|old_due/.test(unconvert),
+    'the un-convert path revives the ORIGINAL due date — a months-old reminder for a call that stopped '
+    + 'being owed when the customer booked'); n++;
+  // The guard against a second open row.
+  assert.match(unconvert, /SELECT 1 FROM lead_events WHERE lead_id = \$1 AND is_done = FALSE/,
+    'nothing stops a second open follow-up being created, which would list the lead twice'); n++;
+
+  /* ── Who scheduled it ─────────────────────────────────────────────────────
+     Both insert sites, counted. One is the single-lead update and one is the
+     bulk path; missing either leaves a whole route writing anonymous rows. */
+  const inserts = (LEADS.match(/INSERT INTO lead_events \(lead_id, status_name, due_date, due_at, note, created_by\)/g) || []).length;
+  assert.strictEqual(inserts, 2,
+    `${inserts} of 2 follow-up inserts record who scheduled them`); n++;
+  assert.ok(!/INSERT INTO lead_events \(lead_id, status_name, due_date, due_at, note\)\s/.test(LEADS),
+    'a follow-up insert still omits created_by'); n++;
+  assert.match(SRC, /cu\.name AS created_by_name/,
+    'the follow-up list does not return who scheduled it, so the column is written and never read'); n++;
 
   await db.end();
   console.log(`followup (postgres): ${n} checks passed`);

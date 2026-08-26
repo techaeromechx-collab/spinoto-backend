@@ -36,6 +36,7 @@ const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument
 const { applyItemApprovals } = require('../services/estimateApproval.service');
 const { fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { getIO } = require('../socket');
 
 /**
  * The allowlist.
@@ -329,6 +330,33 @@ async function decidePublicEstimate(req, res, next) {
       // Refusing every line means the job is not happening.
       advanceAppointmentStatus(row.appointment_id, 'cancelled').catch(err =>
         console.error('[estimate:decision] appointment cancel failed:', err.message));
+    }
+
+    /* ── Tell the CRM, now ────────────────────────────────────────────────
+       Nothing here emitted, so an estimate approved by a customer sat stale in
+       every open browser until somebody reloaded the page. Staff got the push
+       notification and then found the old status on screen, which reads as the
+       approval not having worked.
+
+       The same 'invalidate' the master-data writes use — see responseCache.js
+       and useSync on the frontend. Broadcast rather than targeted: an estimate
+       is visible to whoever is looking at that list, and the payload carries no
+       data, only "this topic moved, go and re-read it".
+
+       'appointments' as well, and only when the job is off: an all-rejected
+       decision cancels the appointment a few lines above, so the appointments
+       screen goes stale in exactly the same way. Emitting it unconditionally
+       would make every other screen re-fetch for nothing.
+
+       Wrapped, because getIO() throws if the socket server has not started —
+       which is a perfectly ordinary state in a test or a script, and must not
+       turn a customer's successful approval into a 500 on their phone. Same
+       reason the two calls above are .catch()ed rather than awaited. */
+    try {
+      getIO().emit('invalidate', { topic: 'estimates' });
+      if (result.allRejected) getIO().emit('invalidate', { topic: 'appointments' });
+    } catch (err) {
+      console.error('[estimate:decision] invalidate emit failed:', err.message);
     }
 
     notifyStaff(row, { ...d, decision: result.allRejected ? 'rejected' : 'approved' }).catch(err =>

@@ -21,7 +21,8 @@ const { fireWhatsAppEventDetached } = require('../services/whatsappAutomations.s
 const { applyItemApprovals } = require('../services/estimateApproval.service');
 const { getRoundingFunction } = require('../utils/math');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
-const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
+const { hubScopeSql, assertHubOwns, isHubUser } = require('../utils/hubScope');
+const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 const { logActivity } = require('../services/activityLog.service');
 const { getIO } = require('../socket');
 
@@ -582,16 +583,13 @@ function computeItem(data, roundFn = parseFloat) {
 }
 
 async function recalcTotals(client, estimateId) {
-  // Step 1: sum items (per-item discounts already baked into total_inc_gst)
-  const sumRes = await client.query(`
-    SELECT
-      COALESCE(SUM(total_inc_gst - gst_amount), 0) AS subtotal_ex_gst,
-      COALESCE(SUM(gst_amount), 0)                 AS total_gst,
-      COALESCE(SUM(total_inc_gst), 0)              AS grand_total_before
-    FROM estimate_items WHERE estimate_id = $1
-  `, [estimateId]);
-
-  const { subtotal_ex_gst, total_gst, grand_total_before } = sumRes.rows[0];
+  /* Step 1: the lines, per-item discounts already baked into total_inc_gst.
+     Rows rather than SUMs now — a transaction discount is apportioned across
+     the lines and taxed at each line's own rate, which a pre-aggregated total
+     cannot express. See utils/transactionDiscount.js. */
+  const itemRes = await client.query(
+    `SELECT total_inc_gst, gst_amount, gst_percent
+       FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
 
   // Step 2: fetch discount mode and created_at for this estimate
   const modeRes = await client.query(
@@ -602,19 +600,18 @@ async function recalcTotals(client, estimateId) {
   const { discount_mode, transaction_discount_type, transaction_discount_value, created_at } = modeRes.rows[0] || {};
   const roundFn = getRoundingFunction(created_at);
 
-  // Step 3: apply transaction-level discount if applicable
-  let transactionDiscountAmount = 0;
-  let grandTotal = parseFloat(grand_total_before);
-
-  if (discount_mode === 'transaction' && parseFloat(transaction_discount_value) > 0) {
-    const val = parseFloat(transaction_discount_value);
-    if (transaction_discount_type === 'percent') {
-      transactionDiscountAmount = roundFn(grandTotal * val / 100);
-    } else if (transaction_discount_type === 'flat') {
-      transactionDiscountAmount = Math.min(val, grandTotal);
-    }
-    grandTotal = roundFn(grandTotal - transactionDiscountAmount);
-  }
+  /* Step 3: the discount reduces the TAXABLE value, and the tax follows it
+     down. This used to subtract the discount from grand_total alone and leave
+     subtotal_ex_gst and total_gst at their pre-discount figures — so the
+     document printed three numbers that did not add up, and declared tax on a
+     sale that no longer carried it. */
+  const isTx = discount_mode === 'transaction';
+  const totals = applyTransactionDiscount({
+    items:         itemRes.rows,
+    discountType:  isTx ? transaction_discount_type : null,
+    discountValue: isTx ? parseFloat(transaction_discount_value) || 0 : 0,
+    roundFn,
+  });
 
   await client.query(`
     UPDATE estimates SET
@@ -625,10 +622,10 @@ async function recalcTotals(client, estimateId) {
       updated_at               = NOW()
     WHERE id = $5
   `, [
-    subtotal_ex_gst,
-    total_gst,
-    grandTotal.toFixed(2),
-    transactionDiscountAmount.toFixed(2),
+    totals.subtotalExGst.toFixed(2),
+    totals.totalGst.toFixed(2),
+    totals.grandTotal.toFixed(2),
+    totals.discountAmount.toFixed(2),
     estimateId,
   ]);
 }
@@ -706,7 +703,18 @@ const EST_SELECT = `
     e.hub_id,
     e.status,
     e.notes,
-    e.odometer_km,
+    /* The appointment is where the reading is actually taken — a service
+       advisor notes it when the vehicle arrives, often AFTER the estimate was
+       drafted. e.odometer_km is only set when somebody typed one onto the
+       estimate itself, which is rare, so on its own this column was almost
+       always NULL and the estimate showed no reading at all.
+
+       COALESCE, exactly as the vehicle_number / make / model / body_type rows
+       above already do: the estimate's own value wins if it has one, otherwise
+       the appointment answers. That also means a reading entered on the
+       appointment after the fact appears on estimates already drafted, with no
+       backfill. */
+    COALESCE(e.odometer_km, a.odometer_km) AS odometer_km,
     e.warranty_claim_id,
     e.subtotal_ex_gst,
     e.total_gst,
@@ -1770,6 +1778,7 @@ function submitEstimate(req, res, next) {
     // Auto-advance appointment status
     await advanceAppointmentStatus(estimate.appointment_id, 'estimate-submitted');
 
+    announceEstimateChange(true);
     return res.json({ item: estimate });
   });
 }
@@ -1834,6 +1843,7 @@ function companyApprove(req, res, next) {
       dedupeKey: `sent:${id}`,
     });
 
+    announceEstimateChange(true);
     return res.json({ item: estimate });
   });
 }
@@ -1871,6 +1881,10 @@ function companyRevise(req, res, next) {
       params
     );
 
+    // Estimate only: asking the hub for a revision does not move the
+    // appointment, so nothing on that screen has gone stale.
+    announceEstimateChange();
+
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
     estimate.items = await _getItems(id);
@@ -1881,10 +1895,78 @@ function companyRevise(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/estimates/:id/customer-approval — Company marks customer approvals
 // ─────────────────────────────────────────────────────────────────────────────
+/* "Something about estimates moved — go and re-read it."
+ *
+ * Every transition on this controller changes what the CRM should be showing,
+ * and until now none of them said so: an estimate the hub submitted, or marked
+ * work-completed, sat stale in every open browser until somebody hit refresh.
+ * Staff would get the push notification and then find the old status on screen,
+ * which reads as the action not having worked.
+ *
+ * ── Why one helper and not the emit inline ─────────────────────────────────
+ *
+ * Six call sites, each needing the same try/catch and the same decision about
+ * whether the appointment moved too. Written out six times, five of them would
+ * be right and the sixth would be the one nobody notices — which is exactly the
+ * state this file was already in, with two emits in updateEstimate and none
+ * anywhere else.
+ *
+ * ── Why it is wrapped ──────────────────────────────────────────────────────
+ *
+ * getIO() throws when the socket server has not started — an ordinary state in
+ * a test, a script or a worker. A notification failing must never be the reason
+ * a status change fails: the write has already committed by the time this runs.
+ *
+ * ── Why the payload is empty ───────────────────────────────────────────────
+ *
+ * It says which topic moved, not what changed. A pushed row would have to
+ * arrive in the shape of whatever filter, page and permission scope the
+ * receiver happens to be on, and the emitter cannot know any of that. The
+ * re-fetch is what reads the new state, through the same endpoint and the same
+ * scoping as the first load.
+ *
+ * @param {boolean} alsoAppointments  true when the appointment status advanced
+ *   as well — the appointments screen goes stale in exactly the same way, and
+ *   emitting it unconditionally would make every other screen re-fetch for
+ *   nothing.
+ */
+function announceEstimateChange(alsoAppointments = false) {
+  try {
+    getIO().emit('invalidate', { topic: 'estimates' });
+    if (alsoAppointments) getIO().emit('invalidate', { topic: 'appointments' });
+  } catch (err) {
+    console.error('[estimates] invalidate emit failed:', err.message);
+  }
+}
+
 function customerApproval(req, res, next) {
   handle(req, res, next, async () => {
     const id   = idParam.parse(req.params.id);
     const data = customerApprovalSchema.parse(req.body);
+
+    /* ── The customer's decision is not the workshop's to record ──────────
+       This endpoint writes what the CUSTOMER said, and it writes it with no
+       provenance — no decision_source, no timestamp, no user id (unlike the
+       public link, which records all three plus IP and user-agent). A hub
+       ticking these boxes therefore produces an approved estimate that is
+       indistinguishable from one the customer actually approved, on the
+       document that authorises the work and the bill.
+
+       Checked on the ROLE, not a permission code: a hub login can legitimately
+       carry EDIT_ESTIMATE and would sail through the route gate. That gate is
+       staff-only too; this is the guard that holds regardless of how the route
+       is wired later — the same belt-and-braces syncPurchaseInvoiceFromEstimate
+       uses, and for the same reason.
+
+       The hub's own actions are untouched: submitting the estimate, and the
+       per-item work-status updates while the car is on the ramp. */
+    if (isHubUser(req)) {
+      return res.status(403).json({
+        error: 'The customer\'s approval cannot be recorded from the hub portal. '
+             + 'Send them the estimate link, or ask Spinoto to record their decision.',
+        code: 'CUSTOMER_DECISION_STAFF_ONLY',
+      });
+    }
 
     await _assertEstimateHub(req, id);
 
@@ -1910,6 +1992,42 @@ function customerApproval(req, res, next) {
       // these items make this estimate" is how those two views drift apart.
       await applyItemApprovals(client, id, data.approvals);
 
+      /* ── Who recorded this, and when ──────────────────────────────────
+         Migration 118 added these columns to answer "someone approved
+         ₹15,000 of work and it wasn't me", and only the customer's own link
+         ever wrote to them. This route — the one an advisor uses — wrote
+         nothing, so a decision taken in the office was indistinguishable
+         from one the customer actually made, on the document that
+         authorises both the work and the bill.
+
+         decision_source is set only when it is still NULL, so it keeps
+         naming whoever decided FIRST. Staff may re-record afterwards (this
+         endpoint accepts partially_approved, fully_approved and
+         work_in_progress — a customer changing their mind mid-job is real),
+         and overwriting 'customer_link' with 'staff' on that second pass
+         would erase the fact the customer ever decided.
+
+         decided_by and decided_at are overwritten every time: they answer
+         "who last recorded a decision", which is the other half of the
+         question and the half that changes.
+
+         IP and user agent are NOT written here. They are evidence about a
+         stranger on a phone; inside an office every advisor shares one WAN
+         address and a similar browser, so they would look like evidence
+         while identifying nobody. decided_by is the real answer.
+
+         Same transaction as the items: a decision and the record of who took
+         it are one fact, and a crash between them leaves the worse half. */
+      await client.query(
+        `UPDATE estimates
+            SET decision_source = COALESCE(decision_source, 'staff'),
+                decided_by      = $2,
+                decided_at      = NOW(),
+                updated_at      = NOW()
+          WHERE id = $1`,
+        [id, req.user?.id || null]
+      );
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -1917,6 +2035,11 @@ function customerApproval(req, res, next) {
     } finally {
       client.release();
     }
+
+    // The staff-side twin of the emit on the public decision route: this moves
+    // the same rows, so a second person with the list open needs to hear about
+    // it for the same reason the customer's own approval does.
+    announceEstimateChange();
 
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
@@ -2016,6 +2139,11 @@ function updateItemWorkStatus(req, res, next) {
       await advanceAppointmentStatus(apptId, 'work-completed');
     }
 
+    /* The one the hub uses most, and the one that was most obviously missing:
+       a car marked finished on the ramp did not reach the CRM until somebody
+       reloaded. `apptId` is only set when the estimate's own status moved, so
+       it doubles as "did the appointment advance too". */
+    announceEstimateChange(Boolean(apptId));
     return res.json({ item: { ...est.rows[0], items } });
   });
 }
@@ -2046,13 +2174,30 @@ function deleteEstimate(req, res, next) {
       return res.status(400).json({ error: 'Cannot delete — Customer Invoice is already paid.' });
     }
 
-    // Check ALL PIs (an estimate can have more than one purchase invoice)
+    /* Check ALL PIs (an estimate can have more than one purchase invoice —
+       more so since migration 174, whose partial unique index lets cancelled
+       ones accumulate alongside one live invoice).
+
+       Tested on MONEY, not on the word 'paid', and that closes a hole rather
+       than just tidying one. `payment_status === 'paid'` is false for a
+       PARTIALLY paid invoice — so an estimate whose PI had ₹2,000 of ₹5,000
+       already transferred to the hub deleted cleanly, taking the record of that
+       transfer with it. amount_paid > 0 catches every invoice money has
+       actually moved against.
+
+       It also stops a nil invoice blocking the delete: nothing was ever paid on
+       it, so it is not a reason to keep the estimate. */
     const piRows = await pool.query(
-      `SELECT id, payment_status FROM purchase_invoices WHERE estimate_id = $1 ORDER BY id DESC`, [id]
+      `SELECT id, payment_status, COALESCE(amount_paid, 0) AS amount_paid
+         FROM purchase_invoices WHERE estimate_id = $1 ORDER BY id DESC`, [id]
     );
     const pis = piRows.rows;
-    if (pis.some(p => p.payment_status === 'paid')) {
-      return res.status(400).json({ error: 'Cannot delete — a Purchase Invoice is already paid.' });
+    const paidPi = pis.find(p => parseFloat(p.amount_paid) > 0);
+    if (paidPi) {
+      return res.status(400).json({
+        error: `Cannot delete — ₹${Number(paidPi.amount_paid).toFixed(2)} has already been paid `
+             + `against a Purchase Invoice on this estimate.`,
+      });
     }
 
     const client = await pool.connect();

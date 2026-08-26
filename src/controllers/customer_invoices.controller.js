@@ -4,6 +4,7 @@ const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const { getRoundingFunction } = require('../utils/math');
+const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 // syncPayoutDueDate is no longer required here: it moved inside
 // recalcInvoiceState along with the status recalculation it belongs to, so
 // every path that changes what an invoice has been paid re-anchors the hub
@@ -1606,31 +1607,41 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     // (Recomputing from rate × qty here would silently drop line discounts.)
     const roundFn = getRoundingFunction(new Date());
 
-    let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
-    const ciItems = itemsRow.rows.map(item => {
-      const totalIncGst = parseFloat(item.total_inc_gst) || 0;
-      const gstAmt      = parseFloat(item.gst_amount)    || 0;
-      const amtExGst    = roundFn(totalIncGst - gstAmt);
-      subtotalExGst += amtExGst;
-      totalGst      += gstAmt;
-      grandTotal    += totalIncGst;
-      return { ...item, gst_amount: gstAmt, total_inc_gst: totalIncGst };
+    const discountMode    = est.discount_mode              || 'line_item';
+    const txDiscountType  = est.transaction_discount_type  || null;
+    const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
+    const isTx            = discountMode === 'transaction';
+
+    /* ── The discount reduces the taxable value, not just the total ────────
+       This used to sum the lines, then subtract the discount from grandTotal
+       alone — leaving subtotal_ex_gst and total_gst at their pre-discount
+       figures. The invoice then printed a taxable value and a tax that did not
+       add up to its own grand total, and declared more output tax than the
+       sale carried.
+
+       The SAME helper the estimate and the purchase invoice now use, so the
+       three documents describing one job cannot disagree about the arithmetic
+       — which they did, in three different ways, before it existed. */
+    const totals = applyTransactionDiscount({
+      items:         itemsRow.rows,
+      discountType:  isTx ? txDiscountType : null,
+      discountValue: isTx ? txDiscountValue : 0,
+      roundFn,
     });
 
-    // Apply transaction-level discount on CI grand total if applicable
-    const discountMode     = est.discount_mode              || 'line_item';
-    const txDiscountType   = est.transaction_discount_type  || null;
-    const txDiscountValue  = parseFloat(est.transaction_discount_value)  || 0;
-    let   txDiscountAmount = 0;
+    const subtotalExGst    = totals.subtotalExGst;
+    const totalGst         = totals.totalGst;
+    const grandTotal       = totals.grandTotal;
+    const txDiscountAmount = totals.discountAmount;
 
-    if (discountMode === 'transaction' && txDiscountValue > 0) {
-      if (txDiscountType === 'percent') {
-        txDiscountAmount = roundFn(grandTotal * txDiscountValue / 100);
-      } else if (txDiscountType === 'flat') {
-        txDiscountAmount = Math.min(txDiscountValue, grandTotal);
-      }
-      grandTotal = roundFn(grandTotal - txDiscountAmount);
-    }
+    /* Each line carries its own post-discount figures now. The invoice's rows
+       must show what was actually charged on them, or the lines will not sum
+       to the total printed beneath them. */
+    const ciItems = totals.lines.map(l => ({
+      ...l.item,
+      gst_amount:    l.gst,
+      total_inc_gst: l.total,
+    }));
 
     // What the advance auto-apply put onto this invoice, so the response can
     // tell the user their customer's ₹2,000 has already been accounted for
@@ -2258,32 +2269,33 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
     // creation timestamp.
     const roundFn = getRoundingFunction(ci.created_at);
 
-    // Use the estimate items' STORED amounts — discounts + GST already baked
-    // in, so CI totals always match the estimate (see generate handler).
-    let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
-    const ciItems = itemsRow.rows.map(item => {
-      const totalIncGst = parseFloat(item.total_inc_gst) || 0;
-      const gstAmt      = parseFloat(item.gst_amount)    || 0;
-      const amtExGst    = roundFn(totalIncGst - gstAmt);
-      subtotalExGst += amtExGst;
-      totalGst      += gstAmt;
-      grandTotal    += totalIncGst;
-      return { ...item, gst_amount: gstAmt, total_inc_gst: totalIncGst };
-    });
-
-    // Apply transaction discount
+    /* The SAME shared calculation the generate handler uses.
+       This function re-syncs an existing invoice from its estimate, so if the
+       two disagreed the invoice would change amount on every sync and settle
+       back on the next generate — the worst kind of drift, because it looks
+       like the data is unstable rather than the code. */
     const discountMode    = est.discount_mode || 'none';
     const txDiscountType  = est.transaction_discount_type || null;
     const txDiscountValue = parseFloat(est.transaction_discount_value) || 0;
-    let txDiscountAmount  = 0;
-    if (discountMode === 'transaction' && txDiscountValue > 0) {
-      if (txDiscountType === 'percent') {
-        txDiscountAmount = roundFn(grandTotal * txDiscountValue / 100);
-      } else if (txDiscountType === 'flat') {
-        txDiscountAmount = Math.min(txDiscountValue, grandTotal);
-      }
-      grandTotal = roundFn(grandTotal - txDiscountAmount);
-    }
+    const isTx            = discountMode === 'transaction';
+
+    const totals = applyTransactionDiscount({
+      items:         itemsRow.rows,
+      discountType:  isTx ? txDiscountType : null,
+      discountValue: isTx ? txDiscountValue : 0,
+      roundFn,
+    });
+
+    const subtotalExGst   = totals.subtotalExGst;
+    const totalGst        = totals.totalGst;
+    const grandTotal      = totals.grandTotal;
+    const txDiscountAmount = totals.discountAmount;
+
+    const ciItems = totals.lines.map(l => ({
+      ...l.item,
+      gst_amount:    l.gst,
+      total_inc_gst: l.total,
+    }));
 
     const client = await pool.connect();
     try {

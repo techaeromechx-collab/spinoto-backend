@@ -1495,6 +1495,57 @@ function deleteAppointment(req, res, next) {
           if (target) {
             await client.query(`UPDATE leads SET status = $1, updated_at = NOW() WHERE id = $2`,
               [target, appt.lead_id]);
+
+            /* ── And give it back a follow-up ────────────────────────────
+               This is the hole the booking-side close above opened.
+
+               The lead is returned to the status it held before it converted,
+               and that status is almost always one that carries
+               needs_follow_up — you convert a lead OUT of "Call Unanswered -
+               Attempt 2" or "Follow-Up - General", so that is where it lands
+               coming back. Meanwhile its follow-up was closed when the
+               appointment was booked. So without this, deleting an appointment
+               puts a lead into a chase status with nothing chasing it, and it
+               is invisible: the Follow-up list is built from OPEN lead_events
+               rows, so a lead with none simply is not there.
+
+               Note that the UPDATE above writes leads.status directly and so
+               walks straight past the needs_follow_up guard in
+               leads.controller.js. That guard is the right shape for a request
+               a person made; this is a consequence of one, and refusing it
+               would mean refusing to delete the appointment.
+
+               Due TODAY, not on the old date. The original due date belonged
+               to a conversation that has since been overtaken twice — the
+               customer booked, and then the booking was cancelled. Reviving it
+               would put a months-old date at the top of somebody's overdue
+               list, which is the exact stale-reminder bug the booking-side
+               close was added to stop. Today is honest: this lead needs a call
+               now, because something just fell through.
+
+               ON CONFLICT is not needed — the booking closed everything open —
+               but the guard is: if a follow-up was somehow scheduled while the
+               appointment stood, two open rows would put the lead in the list
+               twice. */
+            const needsChase = await client.query(
+              `SELECT 1 FROM lead_statuses
+                WHERE name = $1 AND needs_follow_up = TRUE AND is_active = TRUE`, [target]);
+
+            if (needsChase.rows[0]) {
+              const already = await client.query(
+                `SELECT 1 FROM lead_events WHERE lead_id = $1 AND is_done = FALSE LIMIT 1`,
+                [appt.lead_id]);
+
+              if (!already.rows[0]) {
+                await client.query(
+                  `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note, created_by)
+                   VALUES ($1, $2, CURRENT_DATE, NOW(), $3, $4)`,
+                  [appt.lead_id, target,
+                   `Appointment ${appt.appointment_code || `#${id}`} was deleted — lead returned to ${target}`,
+                   req.user.id]
+                );
+              }
+            }
           }
         }
         await client.query(

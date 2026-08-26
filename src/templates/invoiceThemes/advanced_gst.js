@@ -155,6 +155,17 @@ function render({ doc, cfg, pageSize }) {
   // RECEIVED AMOUNT. This also covers advanced_gst_a5, which shares this file.
   const advance = totals.find(t => t.key === 'advance');
 
+  /* Same hand-picking, for the same reason — and this row is exactly the
+     failure the comment above predicted. A transaction discount reaches this
+     theme in doc.totals like every other row, and was dropped on the floor:
+     the line RATE and TAXABLE columns already printed the discounted figures,
+     so the invoice added up perfectly and simply never said a discount had
+     been given. Nothing errored, and the customer had no way to see what they
+     had been allowed.
+
+     Covers advanced_gst_a5, which renders from this same file. */
+  const discount = totals.find(t => t.key === 'discount');
+
   // Built as inner fragments so the same content can be dropped into either a
   // half-width cell or a full-width one, depending on whether both exist.
   const wordsInner = (blocks.amountInWords && grand)
@@ -361,6 +372,9 @@ function render({ doc, cfg, pageSize }) {
      same strip, one step quieter. Uppercase is applied here rather than in the
      label, so the adapter keeps one human-readable string for all 8 themes. */
   .recv-adv { font-weight: 600; text-transform: uppercase; letter-spacing: .2px; }
+  /* Matches .recv-adv's weight so the two qualifying strips read as a pair,
+     rather than one of them competing with the RECEIVED AMOUNT headline. */
+  .recv-disc { font-weight: 600; text-transform: uppercase; letter-spacing: .2px; }
 
   table.hsn { width: 100%; border-collapse: collapse; }
   table.hsn th, table.hsn td { border-right: var(--rule) solid #000; border-bottom: var(--rule) solid #000; padding: 5px 6px; font-size: 8.5px; }
@@ -465,7 +479,7 @@ function render({ doc, cfg, pageSize }) {
 
     <div class="band">
       <div class="cellL">
-        <div class="lbl">${doc.docType === 'purchase_invoice' ? 'BILL TO (HUB)' : 'BILL TO'}</div>
+        <div class="lbl">BILL TO</div>
         <div class="pname">${esc(doc.buyer.name)}</div>
         <div class="prow">
           ${buyerRows.map(r => `<div><span class="k">${r.label}:</span> ${r.value}</div>`).join('')}
@@ -512,6 +526,11 @@ function render({ doc, cfg, pageSize }) {
           the strip below it, because RECEIVED AMOUNT is the headline and this
           qualifies it. Absent entirely when no advance was applied, so an
           ordinary invoice prints exactly as it always did. */''}
+    ${/* Above the money-received strips, because a discount is part of what
+          was CHARGED, not of what was paid. Quieter weight than RECEIVED
+          AMOUNT for the same reason the advance is. buildTotals has already
+          rendered the value with its minus sign. */''}
+    ${discount ? `<div class="recv recv-disc"><span>${discount.label}</span><span>₹ ${discount.value}</span></div>` : ''}
     ${advance ? `<div class="recv recv-adv"><span>${advance.label}</span><span>₹ ${advance.value}</span></div>` : ''}
     ${paid ? `<div class="recv"><span>${advance ? paid.label.toUpperCase() : 'RECEIVED AMOUNT'}</span><span>₹ ${paid.value}</span></div>` : ''}
 

@@ -31,21 +31,38 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-const { runScheduledAlerts } = require('./services/smartAlerts.service');
+const { runScheduledAlerts }  = require('./services/smartAlerts.service');
+const { runRetargetSweep }    = require('./services/retargetSweep.service');
 
 const THIRTY_MIN = 30 * 60 * 1000;
 
+/* ── Why the retarget sweep rides the same timer ─────────────────────────────
+ *
+ * It is a once-a-day job, and the obvious implementation is a once-a-day timer.
+ * A once-a-day timer in setInterval is also the one that quietly stops
+ * happening: the process restarts at 09:05 for a deploy, the timer starts
+ * counting from then, and the sweep now runs at 09:05 tomorrow — or never, if
+ * the next deploy lands before it fires.
+ *
+ * Riding the 30-minute tick has neither problem. The sweep clears each lead's
+ * due date as it moves it, so a second run finds nothing, moves nothing and
+ * notifies nobody — the work is its own "already done today" flag, and it is
+ * the only kind of flag that survives a restart. It declines to run before
+ * 08:00 itself, so the tick at 00:07 costs one indexed lookup and nothing else.
+ */
 function startScheduler() {
-  console.log('[Scheduler] Smart alert scheduler started — every 30 minutes');
+  console.log('[Scheduler] Smart alerts + retarget sweep — every 30 minutes');
+
+  const tick = () => {
+    runScheduledAlerts();
+    // Not awaited and never allowed to throw: a failing sweep must not be able
+    // to stop the alerts, and vice versa. Both log their own failures.
+    runRetargetSweep().catch(err => console.error('[Scheduler] retarget sweep:', err.message));
+  };
 
   // Run shortly after boot (let DB connections settle first).
-  setTimeout(() => {
-    runScheduledAlerts();
-  }, 15_000);
-
-  setInterval(() => {
-    runScheduledAlerts();
-  }, THIRTY_MIN);
+  setTimeout(tick, 15_000);
+  setInterval(tick, THIRTY_MIN);
 }
 
 module.exports = { startScheduler };

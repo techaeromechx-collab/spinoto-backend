@@ -122,7 +122,7 @@ function render({ doc, cfg, pageSize }) {
     return `<div class="trow"><span>${t.label}</span><span>₹ ${t.value}</span></div>`;
   }).join('');
 
-  const billLabel = doc.docType === 'purchase_invoice' ? 'BILL TO (HUB)' : 'BILL TO';
+  const billLabel = 'BILL TO';
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">

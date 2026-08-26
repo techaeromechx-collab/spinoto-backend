@@ -32,6 +32,12 @@ const {
   qrEnabled, ADVANCE_REFUND_TITLE, ADVANCE_REFUND_FOOTER,
 } = require('../utils/documentConfig');
 const { staticLogoDataUri, inlineUploadUrl } = require('../utils/inlineImage');
+// The same calculator the estimate and invoice controllers use, so a document
+// re-costed at render time can never disagree with the totals stored for it.
+const { applyTransactionDiscount } = require('../utils/transactionDiscount');
+// Rounding is keyed on the row's created_at — see utils/math.js for why it must
+// never be keyed on a backdatable date.
+const { getRoundingFunction } = require('../utils/math');
 
 const num = (v) => Number(v || 0);
 
@@ -128,6 +134,22 @@ function vehicleMeta(row, cfg) {
   if (makeModel) meta.push({ key: 'make_model', label: 'Make / Model', value: makeModel });
   if (row.body_type_name) meta.push({ key: 'body_type', label: 'Body Type', value: row.body_type_name });
   if (row.cc_category_name) meta.push({ key: 'cc', label: 'CC Category', value: row.cc_category_name });
+  /* Reading at the time of the job. One row here reaches every theme, because
+     the themes only FORMAT doc.meta — they do not decide what is in it
+     (docShared.buildHeaderFields). So this must not be written per template.
+
+     `!= null` rather than a truthiness check: 0 km is a real reading on a new
+     vehicle, and `if (row.odometer_km)` would silently drop it.
+
+     Grouped in thousands the Indian way, matching every other number on these
+     documents. */
+  if (cfg.header_fields.odometer && row.odometer_km != null) {
+    meta.push({
+      key: 'odometer',
+      label: 'Odometer',
+      value: `${Number(row.odometer_km).toLocaleString('en-IN')} km`,
+    });
+  }
   return meta;
 }
 
@@ -363,8 +385,59 @@ function fromEstimate(row, company, cfg) {
   // visible rows didn't add up to the visible Grand Total — a real support
   // problem on a customer-facing document.
   const src = (row.items || []).filter(i => i.customer_approved !== false);
-  // Inc-GST list price, matching what the estimate screen shows.
-  const items = src.map(i => itemFrom(i, { rate: customerIncRate(i), total: i.total_inc_gst }));
+
+  /* ── Why the lines are re-costed here ───────────────────────────────────────
+     A transaction discount is applied to the ESTIMATE HEADER only —
+     _recalcEstimateTotals writes subtotal_ex_gst / total_gst / grand_total and
+     leaves estimate_items at their quoted rates. That is right for the record:
+     the quote is what was quoted.
+
+     It is wrong for the printed page, which built its item table, its GST
+     breakup AND its HSN tax summary from those undiscounted rows while taking
+     the grand total from the discounted header. The result did not reconcile
+     at all:
+
+         lines total          998.00      (undiscounted)
+         discount           −  84.58
+                              913.42      ← but the total printed was 898.20
+         tax summary          152.24      ← actual tax was 137.02
+
+     The 15.22 gap is GST on the discount, and the tax summary overstated the
+     tax by exactly that — not a cosmetic problem on a document whose HSN block
+     is a tax figure.
+
+     The customer invoice never had this: it stores already-discounted item
+     rows, because generation re-costs each line through this same helper. The
+     estimate now does the equivalent at render time, so both documents print
+     the same way and every number on the page agrees. */
+  const txType  = row.transaction_discount_type || null;
+  const txValue = num(row.transaction_discount_value);
+  const roundFn = getRoundingFunction(row.created_at);
+
+  let items;
+  if (row.discount_mode === 'transaction' && txValue > 0 && src.length) {
+    const spread = applyTransactionDiscount({
+      items: src,
+      discountType: txType,
+      discountValue: txValue,
+      roundFn,
+    });
+    items = src.map((i, idx) => {
+      const line = spread.lines[idx];
+      const qty = num(i.quantity) || 1;
+      /* Rebuilt from the discounted taxable so the RATE column, the TAXABLE
+         column and the tax all move together. Presented inc-GST, which is the
+         column this document has always shown. */
+      const incRate = roundFn((line.taxable + line.gst) / qty);
+      return itemFrom(
+        { ...i, gst_amount: line.gst, total_inc_gst: roundFn(line.taxable + line.gst) },
+        { rate: incRate, total: roundFn(line.taxable + line.gst) },
+      );
+    });
+  } else {
+    // Inc-GST list price, matching what the estimate screen shows.
+    items = src.map(i => itemFrom(i, { rate: customerIncRate(i), total: i.total_inc_gst }));
+  }
 
   const pos = resolvePlaceOfSupply(row, company);
   const interState = isInterState(company, pos.code);
@@ -388,11 +461,20 @@ function fromEstimate(row, company, cfg) {
   // where the hub was, at the end.
   swapMeta(meta, 'hub', 'vehicle');
 
-  const subtotal = num(row.subtotal_ex_gst);
   const totalGst = num(row.total_gst);
   const grand = num(row.grand_total);
   const discount = num(row.transaction_discount_amount) ||
     items.reduce((s, i) => s + i.discount, 0);
+  /* subtotal_ex_gst is stored AFTER the discount — correct for the tax maths,
+     wrong to print directly above a Discount row: the reader deducts it a
+     second time and the column stops reaching the grand total
+     (761.18 − 84.58 + 137.02 = 813.62, beside a Grand Total of 898.20).
+     Adding it back makes the printed column the sum a customer can check by
+     hand. Rounded because two stored 2dp figures can still land a hair off
+     when added in float. */
+  const subtotal = discount
+    ? Math.round((num(row.subtotal_ex_gst) + discount) * 100) / 100
+    : num(row.subtotal_ex_gst);
 
   return {
     docType: 'estimate',
@@ -488,13 +570,22 @@ function fromCustomerInvoice(row, company, cfg) {
     meta.push({ key: 'hub_gstin', label: 'Hub GSTIN', value: row.hub_gst });
   }
 
-  const subtotal = num(row.subtotal_ex_gst);
   const totalGst = num(row.total_gst);
   const grand = num(row.grand_total);
   const paid = num(row.amount_paid);
   const balance = row.balance !== undefined ? num(row.balance) : grand - paid;
   const discount = num(row.transaction_discount_amount) ||
     items.reduce((s, i) => s + i.discount, 0);
+  /* subtotal_ex_gst is stored AFTER the discount — correct for the tax maths,
+     wrong to print directly above a Discount row: the reader deducts it a
+     second time and the column stops reaching the grand total
+     (761.18 − 84.58 + 137.02 = 813.62, beside a Grand Total of 898.20).
+     Adding it back makes the printed column the sum a customer can check by
+     hand. Rounded because two stored 2dp figures can still land a hair off
+     when added in float. */
+  const subtotal = discount
+    ? Math.round((num(row.subtotal_ex_gst) + discount) * 100) / 100
+    : num(row.subtotal_ex_gst);
 
   // ── The advance line, and the trap it exists to avoid ─────────────────────
   //
@@ -635,7 +726,22 @@ function fromPurchaseInvoice(row, company, cfg) {
   const isTaxInvoice = row.hub_has_gst !== false;
 
   const meta = [
-    { key: 'number', label: 'Invoice No.', value: formatNumber(cfg, row.id) },
+    /* The hub's own issued number when it has one, falling back to the
+       derived PI-000045 only while the invoice is still unapproved.
+       ────────────────────────────────────────────────────────────────────────
+       This line used to be formatNumber() unconditionally, so an APPROVED
+       purchase invoice printed PI-000045 in its header box while the real
+       series number sat unused in the row. That is the number the hub files in
+       their GSTR-1 — printing anything else on the document they file means
+       their return and this invoice do not agree.
+
+       doc.number (further down) already had this fallback; the meta row did
+       not, and the meta row is what every theme actually renders in the header
+       grid. Two fields for one number, disagreeing.
+
+       Fixed here in the adapter rather than in a theme: all 8 themes render
+       doc.meta as-is, so this reaches every one of them at once. */
+    { key: 'number', label: 'Invoice No.', value: row.invoice_number || formatNumber(cfg, row.id) },
     // Same rule as the customer invoice: the printed date is the legal date.
     { key: 'date',   label: 'Date',        value: row.invoice_date || row.created_at, isDate: true },
     ...(cfg.flags.show_status && row.status ? [{ key: 'status', label: 'Status', value: row.status }] : []),

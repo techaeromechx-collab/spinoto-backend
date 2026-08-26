@@ -1,9 +1,30 @@
 'use strict';
 const { pool } = require('../config/db');
+const { istToday, istAddDays, istWeekday, istEndOfDayISO } = require('../utils/appTime');
 
 function handle(req, res, next, fn) {
   Promise.resolve().then(fn).catch(next);
 }
+
+/* ── "Finished" leads have no follow-ups ────────────────────────────────────
+   ONE definition, used by all four handlers. It was copy-pasted into each of
+   them under four different names (NOT_CONVERTED, NOT_CONVERTED_COUNT,
+   COMPLIANCE_NOT_CONVERTED, and an inline fourth), which is three chances to
+   fix a rule in the place you are looking at and leave it wrong in the badge —
+   a count of 5 over a list of 3, and no error anywhere.
+
+   is_closed is NEW here. All four copies tested converts_to_appointment and
+   is_locked only. That happens to be harmless in the current status set,
+   because 'Lost' carries all three flags — but the day somebody ticks "closed"
+   on a status in Settings without also ticking "locked", every follow-up on
+   those leads reappears in the chase list and nothing explains why. A status
+   marked closed IS finished; that is what the flag means. */
+const FINISHED_LEAD_SQL = `
+  AND l.status NOT IN (
+    SELECT name FROM lead_statuses
+    WHERE (converts_to_appointment = TRUE OR is_locked = TRUE OR is_closed = TRUE)
+      AND is_active = TRUE
+  )`;
 
 // ─── Date range helpers ────────────────────────────────────────────────────────
 // filter param: 'today' | 'tomorrow' | 'week' | 'custom'
@@ -14,28 +35,42 @@ function handle(req, res, next, fn) {
 // Week    → due_date between today and end of this week (Sunday)
 // Custom  → due_date between date_from and date_to
 //
+/* Every date here is an IST calendar date, computed as a string.
+   It used to be `new Date().toISOString().slice(0, 10)`, which is the UTC date
+   whatever the process timezone is — toISOString() always renders UTC, so even
+   running the process on IST would not have fixed it. Between midnight and
+   05:30 IST the whole screen was therefore showing yesterday: a follow-up due
+   today missing from the Today tab, and one due yesterday still counted as
+   merely due rather than overdue. */
 function getDateRange(query) {
-  const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
+  const todayStr = istToday();
 
   const filter = query.filter || 'today';
 
   if (filter === 'tomorrow') {
-    const tom = new Date(today);
-    tom.setDate(tom.getDate() + 1);
-    const tomStr = tom.toISOString().slice(0, 10);
+    const tomStr = istAddDays(todayStr, 1);
     return { dateFrom: tomStr, dateTo: tomStr, includeOverdue: false };
   }
 
   if (filter === 'week') {
-    const end = new Date(today);
-    // days until Sunday (0 = Sunday)
-    const daysUntilSun = (7 - today.getDay()) % 7 || 7;
-    end.setDate(today.getDate() + daysUntilSun);
-    end.setHours(23, 59, 59, 999); // end of Sunday
-    const endDateStr = end.toISOString().slice(0, 10);
-    const endAtStr   = end.toISOString(); // full timestamp for due_at comparison
-    return { dateFrom: todayStr, dateTo: endDateStr, endAt: endAtStr, includeOverdue: false, isWeek: true };
+    /* The `|| 7` is PRESERVED, not inherited by accident: on a Sunday the old
+       code ran the window to the FOLLOWING Sunday rather than ending it today,
+       so "This Week" shows eight days once a week. That is arguably wrong, but
+       it is a week-boundary question and not a timezone one, and quietly
+       changing what a tab means while fixing clocks is how a timezone fix gets
+       blamed for a missing follow-up. Left alone deliberately. */
+    const endStr = istAddDays(todayStr, (7 - istWeekday(todayStr)) % 7 || 7);
+    return {
+      dateFrom: todayStr,
+      dateTo: endStr,
+      // An absolute instant for the due_at comparison: the end of that day in
+      // IST, which is 18:29:59.999Z. The old code sent 23:59:59.999 in UTC —
+      // 05:29 IST the NEXT morning — so the week window quietly leaked five and
+      // a half hours of the following day into every "this week" list.
+      endAt: istEndOfDayISO(endStr),
+      includeOverdue: false,
+      isWeek: true,
+    };
   }
 
   if (filter === 'custom') {
@@ -100,14 +135,24 @@ function listEvents(req, res, next) {
     if (leadIdFilter) {
       const SELECT = `
         e.id, e.lead_id, e.status_name, e.due_date, e.due_at, e.note, e.is_done, e.done_at, e.created_at,
+        e.auto_closed,
         l.name AS lead_name, l.mobile AS lead_mobile,
-        au.name AS assigned_to_name
+        au.name AS assigned_to_name,
+        /* Who set it and who completed it. On the lead's own timeline this is
+           the whole point of 170/171: a follow-up nobody recognises setting is
+           the one that gets ignored, and "done" with no name against it cannot
+           be questioned. NULL for anything scheduled before those migrations —
+           rendered as "—", not as a blank that reads like a missing join. */
+        cu.name AS created_by_name,
+        du.name AS done_by_name
       `;
       const r = await pool.query(
         `SELECT ${SELECT}
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users au ON au.id = l.assigned_to
+         LEFT JOIN users cu ON cu.id = e.created_by
+         LEFT JOIN users du ON du.id = e.done_by
          WHERE e.lead_id = $1
          ORDER BY e.due_date ASC, e.created_at ASC`,
         [leadIdFilter]
@@ -124,7 +169,8 @@ function listEvents(req, res, next) {
       l.mobile      AS lead_mobile,
       l.status      AS lead_current_status,
       l.assigned_to AS lead_assigned_to_id,
-      au.name       AS assigned_to_name
+      au.name       AS assigned_to_name,
+      cu.name       AS created_by_name
     `;
 
     let r;
@@ -150,12 +196,6 @@ function listEvents(req, res, next) {
 
     // Exclude leads whose current status is terminal (locked) or already converted to an
     // appointment — follow-ups on those leads are no longer actionable.
-    const NOT_CONVERTED = `
-      AND l.status NOT IN (
-        SELECT name FROM lead_statuses
-        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
-          AND is_active = TRUE
-      )`;
 
     if (is_super_admin) {
       r = await pool.query(
@@ -163,9 +203,10 @@ function listEvents(req, res, next) {
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users au ON au.id = l.assigned_to
+         LEFT JOIN users cu ON cu.id = e.created_by
          WHERE e.is_done = FALSE
            AND (${due.sql})
-           ${NOT_CONVERTED}
+           ${FINISHED_LEAD_SQL}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         due.args
       );
@@ -183,10 +224,11 @@ function listEvents(req, res, next) {
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users au ON au.id = l.assigned_to
+         LEFT JOIN users cu ON cu.id = e.created_by
          WHERE e.is_done = FALSE
            AND (l.created_by = ANY($${offset + 2}) OR l.assigned_to = ANY($${offset + 2}))
            AND (${due.sql})
-           ${NOT_CONVERTED}
+           ${FINISHED_LEAD_SQL}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         [...due.args, userId, allIds]
       );
@@ -199,10 +241,11 @@ function listEvents(req, res, next) {
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users au ON au.id = l.assigned_to
+         LEFT JOIN users cu ON cu.id = e.created_by
          WHERE e.is_done = FALSE
            AND (l.created_by = $${offset + 1} OR l.assigned_to = $${offset + 1})
            AND (${due.sql})
-           ${NOT_CONVERTED}
+           ${FINISHED_LEAD_SQL}
          ORDER BY e.due_date ASC, e.created_at ASC`,
         [...due.args, userId]
       );
@@ -216,19 +259,12 @@ function listEvents(req, res, next) {
 // Always counts today + overdue (used for bell badge — never changes with filter tabs)
 function pendingCount(req, res, next) {
   handle(req, res, next, async () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = istToday();
     const { id: userId, is_super_admin, permissions } = req.user;
     const isManager = !is_super_admin && permissions.has('VIEW_TEAM_LEADS');
     const now = new Date().toISOString();
 
     let r;
-
-    const NOT_CONVERTED_COUNT = `
-      AND l.status NOT IN (
-        SELECT name FROM lead_statuses
-        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
-          AND is_active = TRUE
-      )`;
 
     if (is_super_admin) {
       r = await pool.query(
@@ -239,7 +275,7 @@ function pendingCount(req, res, next) {
              (e.due_at IS NOT NULL AND e.due_at <= $1)
              OR (e.due_at IS NULL AND e.due_date <= $2)
            )
-           ${NOT_CONVERTED_COUNT}`,
+           ${FINISHED_LEAD_SQL}`,
         [now, today]
       );
 
@@ -259,7 +295,7 @@ function pendingCount(req, res, next) {
              (e.due_at IS NOT NULL AND e.due_at <= $1)
              OR (e.due_at IS NULL AND e.due_date <= $2)
            )
-           ${NOT_CONVERTED_COUNT}`,
+           ${FINISHED_LEAD_SQL}`,
         [now, today, allIds]
       );
 
@@ -273,7 +309,7 @@ function pendingCount(req, res, next) {
              (e.due_at IS NOT NULL AND e.due_at <= $1)
              OR (e.due_at IS NULL AND e.due_date <= $2)
            )
-           ${NOT_CONVERTED_COUNT}`,
+           ${FINISHED_LEAD_SQL}`,
         [now, today, userId]
       );
     }
@@ -291,7 +327,7 @@ function getStats(req, res, next) {
   handle(req, res, next, async () => {
     const { id: userId, is_super_admin, permissions } = req.user;
     const isManager = !is_super_admin && permissions.has('VIEW_TEAM_LEADS');
-    const today = new Date().toISOString().slice(0, 10);
+    const today = istToday();
 
     // ── Target user resolution ──────────────────────────────────────────
     const requestedId = req.query.user_id;
@@ -328,28 +364,36 @@ function getStats(req, res, next) {
     let periodStart = null;
     let periodEnd   = null;
 
-    const d   = new Date();
-    const dow = d.getDay();
-    const mon = new Date(d); mon.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
+    /* All string arithmetic on IST dates.
+       These were JS Date objects built with local-time setters and then read
+       back with toISOString() — a combination that is wrong in two independent
+       ways. toISOString() always renders UTC, so Monday 00:00 IST came back as
+       the SUNDAY date; and the local setters answered to whatever zone the
+       process happened to run in, which was UTC. Every "this week" bound was a
+       day early, so Sunday's completed follow-ups were being counted into the
+       previous week and Monday's fell out of both. */
+    const dow = istWeekday(today);                       // 0 = Sunday
+    const mon = istAddDays(today, -(dow === 0 ? 6 : dow - 1));
 
     if (period === 'today') {
       periodStart = today;
       periodEnd   = today;
     } else if (period === 'week') {
-      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-      periodStart = mon.toISOString().slice(0, 10);
-      periodEnd   = sun.toISOString().slice(0, 10);
+      periodStart = mon;
+      periodEnd   = istAddDays(mon, 6);
     } else if (period === 'month') {
       periodStart = `${today.slice(0, 7)}-01`;
-      const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-      periodEnd = lastDay.toISOString().slice(0, 10);
+      // Day 0 of next month is the last day of this one. Built from the IST
+      // date string rather than the process clock, so it cannot land in the
+      // wrong month on the 1st before 05:30.
+      const [y, m] = today.split('-').map(Number);
+      periodEnd = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
     }
     // 'all' → periodStart = null, periodEnd = null
 
     // ── This-week / last-week for avg response delta ──────────────────────
-    const lastMon = new Date(mon); lastMon.setDate(mon.getDate() - 7);
-    const thisWeekStart = mon.toISOString().slice(0, 10);
-    const lastWeekStart = lastMon.toISOString().slice(0, 10);
+    const thisWeekStart = mon;
+    const lastWeekStart = istAddDays(mon, -7);
 
     // ── Build query params ────────────────────────────────────────────────
     // $1=today $2=periodStart $3=periodEnd $4=thisWeekStart $5=lastWeekStart
@@ -360,13 +404,6 @@ function getStats(req, res, next) {
       queryParams.push(targetIds);
       targetExtra = `AND (l.created_by = ANY($6) OR l.assigned_to = ANY($6))`;
     }
-
-    const NOT_CONVERTED = `
-      AND l.status NOT IN (
-        SELECT name FROM lead_statuses
-        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
-          AND is_active = TRUE
-      )`;
 
     const r = await pool.query(
       `SELECT
@@ -416,7 +453,7 @@ function getStats(req, res, next) {
 
        FROM lead_events e
        JOIN leads l ON l.id = e.lead_id
-       WHERE TRUE ${targetExtra} ${NOT_CONVERTED}`,
+       WHERE TRUE ${targetExtra} ${FINISHED_LEAD_SQL}`,
       queryParams
     );
 
@@ -453,12 +490,46 @@ function getStats(req, res, next) {
 function markDone(req, res, next) {
   handle(req, res, next, async () => {
     const id = parseInt(req.params.id, 10);
+
+    /* ── Whose follow-up is this ─────────────────────────────────────────
+       The UPDATE was `WHERE id = $1` and nothing else. Every read on this
+       router is carefully scoped — listEvents, pendingCount, getStats and
+       getCompliance each rebuild the same three-tier rule — and the one WRITE
+       was scoped by nothing at all. Any holder of any of the six permissions
+       on canFollowUp (which includes plain CREATE_LEAD) could PATCH an
+       arbitrary id and close a follow-up on a lead they cannot open, cannot
+       list, and will never see again.
+
+       It is not reachable by clicking: the UI can only tick what the list
+       handed it. It is one curl away, and it got sharper the moment done_by
+       started recording a name — a closed follow-up now carries an assertion
+       about who did the work, so an unscoped write is a way to put somebody
+       else's name on your call, or your name on theirs.
+
+       404 rather than 403 for an out-of-scope id, matching the not-found case
+       below. A 403 would confirm the row exists, which is exactly the fact the
+       scope is there to withhold. */
+    const params = [id, req.user.id];
+    let scope = '';
+    if (!(req.user.is_super_admin || req.user.permissions.has('VIEW_LEAD'))) {
+      if (req.user.permissions.has('VIEW_TEAM_LEADS')) {
+        const team = await pool.query(
+          `SELECT id FROM users WHERE manager_id = $1 AND is_active = TRUE`, [req.user.id]);
+        params.push([req.user.id, ...team.rows.map(x => x.id)]);
+        scope = `AND EXISTS (SELECT 1 FROM leads l WHERE l.id = lead_events.lead_id
+                              AND (l.created_by = ANY($3) OR l.assigned_to = ANY($3)))`;
+      } else {
+        scope = `AND EXISTS (SELECT 1 FROM leads l WHERE l.id = lead_events.lead_id
+                              AND (l.created_by = $2 OR l.assigned_to = $2))`;
+      }
+    }
+
     const r = await pool.query(
       `UPDATE lead_events
        SET is_done = TRUE, done_at = NOW(), done_by = $2, auto_closed = FALSE
-       WHERE id = $1
+       WHERE id = $1 ${scope}
        RETURNING *`,
-      [id, req.user.id]
+      params
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Event not found' });
     res.json({ item: r.rows[0] });
@@ -496,13 +567,6 @@ function getCompliance(req, res, next) {
 
     const pOffset = visibilityParams.length;
 
-    const COMPLIANCE_NOT_CONVERTED = `
-      AND l.status NOT IN (
-        SELECT name FROM lead_statuses
-        WHERE (converts_to_appointment = TRUE OR is_locked = TRUE)
-          AND is_active = TRUE
-      )`;
-
     /* ── Auto-closed follow-ups are not compliance, either way ──────────────
        A follow-up closed by a status change is not evidence the advisor made
        the call, and it is not evidence they skipped it. It is evidence the
@@ -530,8 +594,8 @@ function getCompliance(req, res, next) {
          COUNT(*) FILTER (WHERE e.is_done = TRUE  AND e.auto_closed)::int                                       AS auto
        FROM lead_events e
        JOIN leads l ON l.id = e.lead_id
-       WHERE TRUE ${visibilitySQL} ${COMPLIANCE_NOT_CONVERTED}`,
-      [...visibilityParams, new Date().toISOString().slice(0, 10)]
+       WHERE TRUE ${visibilitySQL} ${FINISHED_LEAD_SQL}`,
+      [...visibilityParams, istToday()]
     );
 
     // Per-agent breakdown (only for super admin or manager)
@@ -548,12 +612,12 @@ function getCompliance(req, res, next) {
          FROM lead_events e
          JOIN leads l ON l.id = e.lead_id
          LEFT JOIN users u ON u.id = COALESCE(l.assigned_to, l.created_by)
-         WHERE TRUE ${visibilitySQL} ${COMPLIANCE_NOT_CONVERTED}
+         WHERE TRUE ${visibilitySQL} ${FINISHED_LEAD_SQL}
          GROUP BY u.id, u.name
          HAVING COUNT(*) FILTER (WHERE e.due_date <= $${pOffset + 1}) > 0
          ORDER BY total_due DESC
          LIMIT 20`,
-        [...visibilityParams, new Date().toISOString().slice(0, 10)]
+        [...visibilityParams, istToday()]
       );
       byAgent = agentRes.rows;
     }

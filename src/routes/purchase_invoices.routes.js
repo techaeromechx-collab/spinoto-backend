@@ -2,7 +2,7 @@
 const express = require('express');
 const { maskCustomerContact } = require('../middleware/maskMobile.middleware');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
-const { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts } = require('../controllers/purchase_invoices.controller');
+const { listPurchaseInvoices, getPurchaseInvoice, getPurchaseInvoicePdf, getPurchaseInvoiceByToken, generatePurchaseInvoice, approvePurchaseInvoice, rejectPurchaseInvoiceApproval, updatePurchaseInvoice, addHubPayment, deleteHubPayment, deleteHubPaymentBatch, updateHubPaymentDate, updateHubPaymentBatchDate, listPayouts, recalculatePurchaseInvoice, syncPurchaseInvoiceFromEstimate, listHubPayments, getTechRateSummary, bulkPayment, exportPayouts, cancelPurchaseInvoice } = require('../controllers/purchase_invoices.controller');
 const router = express.Router();
 
 const canView     = requirePermissionOrHub('VIEW_HUB', 'MANAGE_HUBS', 'VIEW_INVOICE', 'VIEW_PURCHASE_INVOICE');   // hub users: VIEW_INVOICE (or no perms = open)
@@ -58,6 +58,10 @@ router.get('/:id',           canView,     getPurchaseInvoice);
 router.get('/:id/pdf',       canView,     getPurchaseInvoicePdf);
 router.post('/:id/approve',     canApprovePI,     approvePurchaseInvoice);
 router.post('/:id/reject-approval', canApprovePI, rejectPurchaseInvoiceApproval);
+// Void an invoice that should not exist. Same gate as approve/reject — the
+// person who can approve a payout is the person who can void one. NOT a DELETE:
+// the row and the hub's invoice number both survive, see the controller.
+router.post('/:id/cancel',          canApprovePI, cancelPurchaseInvoice);
 router.patch('/:id',            canApprovePI,     updatePurchaseInvoice);
 router.post('/:id/recalculate',        canRecalculatePI, recalculatePurchaseInvoice);
 router.post('/:id/sync-from-estimate', canSyncPI,        syncPurchaseInvoiceFromEstimate);

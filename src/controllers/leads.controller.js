@@ -162,6 +162,13 @@ const LEAD_SELECT = `
     l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
     l.priority, l.tags,
     l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
+    l.lost_competitor_id, l.competitor_service_date, l.retarget_due_date,
+    cmp.name AS lost_competitor_name,
+    /* Derived, never stored. The retarget treatment on the leads list has to
+       disappear the moment somebody works the lead — a stored flag would have
+       to be un-set by whoever did that, and nobody ever remembers to. */
+    EXISTS (SELECT 1 FROM lead_events lr WHERE lr.lead_id = l.id
+              AND lr.kind = 'retarget' AND lr.is_done = FALSE) AS has_open_retarget,
     s.name  AS state_name,  l.state_id,
     c.name  AS city_name,   l.city_id,
     a.name  AS area_name,   l.area_id,
@@ -197,6 +204,7 @@ ${ACTIVITY_COLS},
   LEFT JOIN vehicle_makes mk ON mk.id = l.make_id
   LEFT JOIN vehicle_models md ON md.id = l.model_id
   LEFT JOIN body_types    bt ON bt.id = l.body_type_id
+  LEFT JOIN competitors   cmp ON cmp.id = l.lost_competitor_id
   LEFT JOIN users         u  ON u.id  = l.created_by
   LEFT JOIN users         au ON au.id = l.assigned_to
 ${ACTIVITY_JOIN}
@@ -434,6 +442,13 @@ function listLeads(req, res, next) {
         l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
         l.priority, l.tags,
         l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
+        l.lost_competitor_id, l.competitor_service_date, l.retarget_due_date,
+        cmp.name AS lost_competitor_name,
+        /* Derived, never stored. The retarget treatment on the leads list has to
+           disappear the moment somebody works the lead — a stored flag would have
+           to be un-set by whoever did that, and nobody ever remembers to. */
+        EXISTS (SELECT 1 FROM lead_events lr WHERE lr.lead_id = l.id
+                  AND lr.kind = 'retarget' AND lr.is_done = FALSE) AS has_open_retarget,
         s.name  AS state_name,  l.state_id,
         c.name  AS city_name,   l.city_id,
         a.name  AS area_name,   l.area_id,
@@ -481,6 +496,7 @@ function listLeads(req, res, next) {
       LEFT JOIN vehicle_makes mk ON mk.id = l.make_id
       LEFT JOIN vehicle_models md ON md.id = l.model_id
       LEFT JOIN body_types    bt ON bt.id = l.body_type_id
+      LEFT JOIN competitors   cmp ON cmp.id = l.lost_competitor_id
       LEFT JOIN users         u  ON u.id  = l.created_by
       LEFT JOIN users         au ON au.id = l.assigned_to${ACTIVITY_JOIN}
     `;
@@ -524,7 +540,7 @@ function listLeads(req, res, next) {
     const vParams = [];
     const vAll    = [...scopeConditions(user, teamIds, vParams), ...filterConditions(q, vParams)];
 
-    const [total, statusCounts, sourceCounts, assigneeCounts, ownerCounts, value] = await Promise.all([
+    const [total, statusCounts, sourceCounts, assigneeCounts, creatorList, ownerCounts, value] = await Promise.all([
       // No joins: every condition above references l.* only, so counting does
       // not need the nine LEFT JOINs the page itself carries.
       pool.query(`SELECT COUNT(*)::int AS n FROM leads l ${where}`, whereParams),
@@ -555,6 +571,25 @@ function listLeads(req, res, next) {
                 MAX(u.name) AS name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
+          ${countScope.length ? `WHERE ${countScope.join(' AND ')}` : ''}
+          GROUP BY 1`, cParams),
+
+      /* The created-by dropdown's LIST — same reasoning as the assignee list
+         directly above, and the same bug it had. Derived in the browser from
+         the rows on screen, it offered whoever happened to appear on the page
+         you were looking at: filter by city and the list changed underneath
+         you, and a creator with no lead in the current result set could not be
+         selected at all.
+
+         Scoped with countScope, not the full WHERE, so the options do not
+         narrow to whatever is already filtered — a dropdown that only offers
+         what you have already selected is not a filter. */
+      pool.query(
+        `SELECT l.created_by::text AS k,
+                COUNT(*)::int AS n,
+                MAX(u.name) AS name
+           FROM leads l
+           JOIN users u ON u.id = l.created_by
           ${countScope.length ? `WHERE ${countScope.join(' AND ')}` : ''}
           GROUP BY 1`, cParams),
 
@@ -592,6 +627,11 @@ function listLeads(req, res, next) {
          options and its counts in one list, so the two cannot disagree. */
       assignees: assigneeCounts.rows
         .filter(r => r.k !== 'unassigned')
+        .map(r => ({ id: r.k, name: r.name || `#${r.k}`, count: r.n }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      /* Everyone who has created a lead in scope, with how many. Same shape as
+         `assignees` so the frontend renders both dropdowns the same way. */
+      creators: creatorList.rows
         .map(r => ({ id: r.k, name: r.name || `#${r.k}`, count: r.n }))
         .sort((a, b) => a.name.localeCompare(b.name)),
       counts: {
@@ -710,12 +750,139 @@ function getLeadByToken(req, res, next) {
   });
 }
 
+/* ── Everything a lost reason implies, in one place ──────────────────────────
+ *
+ * Called by both updateLead and bulkStatus, because a status change is the
+ * same act whether it happens to one lead or fifty and the two used to drift.
+ *
+ * Answers four questions the caller cannot answer for itself, all of them
+ * database facts rather than request shapes — which is why none of this can
+ * live in the zod schema:
+ *
+ *   Does this status even ask for a reason?      lead_statuses.needs_lost_reason
+ *   Is the one supplied on the master list?      lost_reasons
+ *   Does that reason also need a competitor?     lost_reasons.requires_competitor
+ *   And when should the lead come back?          lost_reasons.retarget_after_months
+ *
+ * Returns { ok: false, status, body } for the caller to send verbatim, or
+ * { ok: true, ... } with the canonical spelling and the stamped due date.
+ *
+ * ── Why the date is worked out HERE and stored ─────────────────────────────
+ *
+ * Not derived at read time from service date + interval. An admin changing the
+ * interval from 3 to 6 next March would otherwise move the due date of every
+ * lead already waiting, including ones due tomorrow. The number they change
+ * governs leads marked from then on. Migration 173 says the same thing from
+ * the schema side.
+ *
+ * @param {boolean} allowServiceDate  false in bulk: one service DATE cannot be
+ *   true of fifty customers, so bulk anchors the countdown on today instead —
+ *   the day they were marked lost. The competitor is still required, because
+ *   "we lost this batch to them" genuinely can be true of fifty.
+ */
+async function resolveLostReason(db, { statusName, lostReason, competitorId, serviceDate, allowServiceDate = true }) {
+  const st = await db.query(
+    `SELECT name, needs_lost_reason FROM lead_statuses
+      WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`, [statusName]);
+
+  // Not a lost status. Clearing the due date is deliberate and is the reason
+  // this returns rather than short-circuits: a lead being worked again must
+  // not still be queued for a retarget three months out.
+  if (!st.rows[0]?.needs_lost_reason) {
+    return { ok: true, required: false, reasonName: null, dueDate: null };
+  }
+  const label = st.rows[0].name;
+
+  if (!lostReason || !String(lostReason).trim()) {
+    return { ok: false, status: 422, body: {
+      error: `"${label}" needs a reason. Send lost_reason with the status change.`,
+      code: 'LOST_REASON_REQUIRED', status: label } };
+  }
+
+  /* Matched case-insensitively and trimmed, then the CANONICAL spelling from
+     the table is what gets stored — so leads.lost_reason always matches a
+     lost_reasons row exactly and the settings screen's per-reason counts, and
+     any report grouping on the name, cannot split one reason into two. */
+  const rs = await db.query(
+    `SELECT id, name, requires_competitor, retarget_after_months, is_active
+       FROM lost_reasons WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`, [lostReason]);
+  const reason = rs.rows[0];
+
+  if (!reason) {
+    return { ok: false, status: 422, body: {
+      error: `"${lostReason}" is not on the reason list. Pick one from Settings → Master Data → Lost Reasons, or add it there first.`,
+      code: 'UNKNOWN_LOST_REASON' } };
+  }
+  /* Refused rather than accepted, and only for NEW writes. A deactivated
+     reason is one somebody deliberately stopped offering; the leads already
+     carrying it keep it, which is exactly why deactivate exists and delete is
+     refused while in use. */
+  if (!reason.is_active) {
+    return { ok: false, status: 422, body: {
+      error: `"${reason.name}" has been deactivated and is no longer offered. Pick another reason.`,
+      code: 'INACTIVE_LOST_REASON' } };
+  }
+
+  if (reason.requires_competitor) {
+    if (!competitorId) {
+      return { ok: false, status: 422, body: {
+        error: `"${reason.name}" needs to know which competitor took the job. Send lost_competitor_id.`,
+        code: 'COMPETITOR_REQUIRED' } };
+    }
+    const cp = await db.query('SELECT id, name, is_active FROM competitors WHERE id = $1', [competitorId]);
+    if (!cp.rows[0]) {
+      return { ok: false, status: 422, body: {
+        error: 'That competitor does not exist.', code: 'UNKNOWN_COMPETITOR' } };
+    }
+    if (!cp.rows[0].is_active) {
+      return { ok: false, status: 422, body: {
+        error: `"${cp.rows[0].name}" has been deactivated. Pick another competitor.`, code: 'INACTIVE_COMPETITOR' } };
+    }
+    if (allowServiceDate && !serviceDate) {
+      return { ok: false, status: 422, body: {
+        error: `"${reason.name}" needs the date the competitor did the service — that is what the retarget is counted from.`,
+        code: 'SERVICE_DATE_REQUIRED' } };
+    }
+  }
+
+  /* A service date in the future is not a service that happened; it is a typo,
+     and left alone it schedules the retarget past the typo. Compared in the
+     server timezone via ::date, the same way the list filters compare dates. */
+  if (serviceDate) {
+    const fut = await db.query('SELECT ($1::date > CURRENT_DATE) AS future', [serviceDate]);
+    if (fut.rows[0].future) {
+      return { ok: false, status: 422, body: {
+        error: 'The service date cannot be in the future.', code: 'SERVICE_DATE_FUTURE' } };
+    }
+  }
+
+  /* Month arithmetic in SQL rather than JavaScript. `new Date()` with a month
+     offset turns 30 November + 3 into 2 March, and the whole point of this
+     date is that somebody rings the customer at roughly the right time.
+     Postgres clamps to the last day of the target month instead. */
+  let dueDate = null;
+  if (reason.retarget_after_months) {
+    const d = await db.query(
+      `SELECT (COALESCE($1::date, CURRENT_DATE) + make_interval(months => $2::int))::date AS due`,
+      [serviceDate || null, reason.retarget_after_months]);
+    dueDate = d.rows[0].due;
+  }
+
+  return { ok: true, required: true, reasonName: reason.name, reason, dueDate };
+}
+
 function updateLead(req, res, next) {
   handle(req, res, next, async () => {
     const id = parseInt(req.params.id, 10);
     const updateSchema = z.object({
       status:          z.string().trim().min(1).max(100).optional(),
       lost_reason:     z.string().trim().max(120).optional().nullable(),
+      // Who took the job and when they did it. Only meaningful on a reason
+      // flagged requires_competitor; validated against that in
+      // resolveLostReason rather than here, because zod cannot see the table.
+      lost_competitor_id:      z.coerce.number().int().positive().optional().nullable(),
+      competitor_service_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/,
+        'The service date must look like 2026-03-10.').optional().nullable(),
       notes:           z.string().trim().optional().nullable(),
       name:            z.string().trim().max(160).optional().nullable(),
       mobile:          z.string().trim().min(1).max(20).optional(),
@@ -802,6 +969,34 @@ function updateLead(req, res, next) {
         }
       }
 
+      /* ── A status that needs a lost reason must arrive with one ──────────
+         Same shape as the follow-up guard above and for the same reason: the
+         browser already refuses to confirm without one, so no request the
+         frontend sends today can hit this — but the frontend is not the only
+         caller, and a lead sitting in Lost with no reason is invisible to
+         every report the reason exists to feed.
+
+         Only on the TRANSITION. Saving a note on a lead already sitting in
+         Lost must not demand a reason it may predate. */
+      let retargetPlan = null;
+      if (coreData.status && coreData.status !== prevLead?.status) {
+        const lr = await resolveLostReason(client, {
+          statusName:   coreData.status,
+          lostReason:   coreData.lost_reason,
+          competitorId: coreData.lost_competitor_id,
+          serviceDate:  coreData.competitor_service_date,
+        });
+        if (!lr.ok) { await client.query('ROLLBACK'); return res.status(lr.status).json(lr.body); }
+
+        if (lr.required) coreData.lost_reason = lr.reasonName;  // canonical spelling
+        /* Written on every transition, including to NULL. A lead moving off
+           Lost because somebody is working it again must stop being queued for
+           a retarget — otherwise the sweep moves it back, months later, on top
+           of whatever the agent has since done with it. */
+        coreData.retarget_due_date = lr.dueDate;
+        retargetPlan = lr;
+      }
+
       // Update core lead fields if any provided
       const fields = [];
       const params = [];
@@ -874,9 +1069,10 @@ function updateLead(req, res, next) {
         const dueAt   = new Date(`${dateStr}T${timeStr}:00`);
 
         await client.query(
-          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [id, coreData.status, dateStr, dueAt.toISOString(), req.body.follow_up_note || 'Follow-up scheduled']
+          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, coreData.status, dateStr, dueAt.toISOString(),
+           req.body.follow_up_note || 'Follow-up scheduled', req.user.id]
         );
 
         // Notify the lead's creator, assigned agent, and the person who scheduled it.
@@ -910,6 +1106,38 @@ function updateLead(req, res, next) {
            WHERE lead_id = $1 AND is_done = FALSE`,
           [id]
         );
+      }
+
+      /* ── The retarget task ───────────────────────────────────────────────
+         A lead_events row, because that table already IS the "somebody must do
+         something about this lead on this date" mechanism — the Follow-up
+         drawer, the Today/Overdue tabs and the compliance report are all built
+         on it, and none of them need changing to show a retarget.
+
+         AFTER the auto-close above, and that ordering is the whole trick: that
+         statement closes every open event on any status change, and this row is
+         being created BY that same status change. Inserted a few lines earlier
+         it would be marked done in the same breath, and nobody would find out
+         for three months.
+
+         kind='retarget' is what tells it apart from a promise a person made on
+         a call — it drives the row treatment on the leads list and the label in
+         the drawer. */
+      if (retargetPlan?.dueDate) {
+        const compName = coreData.lost_competitor_id
+          ? (await client.query('SELECT name FROM competitors WHERE id = $1', [coreData.lost_competitor_id])).rows[0]?.name
+          : null;
+        const svc  = coreData.competitor_service_date;
+        const note = compName
+          ? `Due for service — ${compName} serviced this vehicle${svc ? ` on ${svc}` : ''}.`
+          : `Due for retargeting — marked ${coreData.lost_reason}.`;
+
+        await client.query(
+          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note, created_by, kind)
+           VALUES ($1, $2, $3, $3::date + TIME '09:00', $4, $5, 'retarget')`,
+          [id, coreData.status, retargetPlan.dueDate, note, req.user.id]
+        );
+        console.log(`[leads] lead ${id} queued for retarget on ${retargetPlan.dueDate}`);
       }
 
       // ── Log status change to activity timeline ─────────────────────────
@@ -1254,6 +1482,8 @@ function exportLeads(req, res, next) {
       SELECT
         l.id, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
         l.lead_source, l.notes, l.created_at,
+        l.lost_reason, l.competitor_service_date,
+        cmp.name AS lost_competitor_name,
         s.name  AS state_name,
         c.name  AS city_name,
         a.name  AS area_name,
@@ -1282,6 +1512,7 @@ function exportLeads(req, res, next) {
       LEFT JOIN vehicle_makes mk ON mk.id = l.make_id
       LEFT JOIN vehicle_models md ON md.id = l.model_id
       LEFT JOIN body_types    bt ON bt.id = l.body_type_id
+      LEFT JOIN competitors   cmp ON cmp.id = l.lost_competitor_id
       LEFT JOIN users         u  ON u.id  = l.created_by
       LEFT JOIN users         au ON au.id = l.assigned_to`;
 
@@ -1300,6 +1531,11 @@ function exportLeads(req, res, next) {
       'State', 'City', 'Area',
       'Vehicle Type', 'Make', 'Model', 'Body Type',
       'Lead Source', 'Total Price',
+      // The point of collecting a reason is being able to sort a spreadsheet
+      // by it. Three columns rather than one, because "lost to whom" and
+      // "lost why" are different questions and the marketing spend is tuned
+      // on the answer to both.
+      'Lost Reason', 'Lost To', 'Competitor Service Date',
       'Service Category', 'Service Name', 'Notes',
       'Assigned To', 'Created By', 'Created At',
     ];
@@ -1319,6 +1555,10 @@ function exportLeads(req, res, next) {
       l.body_type_name || '',
       l.lead_source || '',
       l.total_price || '',
+      l.lost_reason || '',
+      l.lost_competitor_name || '',
+      l.competitor_service_date
+        ? new Date(l.competitor_service_date).toISOString().slice(0, 10) : '',
       l.service_categories || '',
       l.service_names || '',
       l.notes ? l.notes.replace(/\r?\n/g, ' ') : '',
@@ -1490,6 +1730,18 @@ function bulkStatus(req, res, next) {
       status:      z.string().trim().min(1).max(100),
       lost_reason: z.string().trim().max(120).optional().nullable(),
 
+      /* ── The competitor, but NOT a service date ────────────────────────
+         One competitor genuinely can be true of fifty leads — a batch lost to
+         the workshop that opened down the road is exactly the case this is
+         for. One service DATE cannot: fifty customers did not all have their
+         cars done on the same Tuesday.
+
+         So bulk collects the competitor and lets resolveLostReason anchor the
+         retarget countdown on today, the day they were marked lost, rather
+         than on a date somebody invented for the batch. Migration 173 spells
+         out the same fallback from the schema side. */
+      lost_competitor_id: z.coerce.number().int().positive().optional().nullable(),
+
       /* ── One follow-up for the whole selection ─────────────────────────
          A status flagged needs_follow_up asks for a date when it is set on
          one lead, and used to ask for nothing at all in bulk — which meant
@@ -1513,7 +1765,7 @@ function bulkStatus(req, res, next) {
         'The follow-up time must look like 09:00.').optional().nullable(),
       follow_up_note: z.string().trim().max(500).optional().nullable(),
     });
-    const { lead_ids, status, lost_reason,
+    const { lead_ids, status, lost_reason, lost_competitor_id,
             follow_up_date, follow_up_time, follow_up_note } = schema.parse(req.body);
 
     // The status must exist. Matched case-insensitively because leads.status
@@ -1553,6 +1805,23 @@ function bulkStatus(req, res, next) {
         status: target.name,
       });
     }
+
+    /* ── And the same for a lost reason ──────────────────────────────────
+       The identical helper updateLead calls, so the rules cannot drift between
+       "I marked one lead Lost" and "I marked fifty" — which is exactly what
+       happened to the follow-up rule before it was hoisted.
+
+       Resolved on the pool BEFORE the transaction opens: everything it does is
+       a read, and failing here costs nothing where failing inside would mean
+       opening and rolling back a transaction over fifty leads to say "you did
+       not pick a reason". */
+    const lostPlan = await resolveLostReason(pool, {
+      statusName:   target.name,
+      lostReason:   lost_reason,
+      competitorId: lost_competitor_id,
+      allowServiceDate: false,
+    });
+    if (!lostPlan.ok) return res.status(lostPlan.status).json(lostPlan.body);
 
     // Canonical spelling from the table, not whatever the client sent — so the
     // string written to leads.status always matches lead_statuses.name exactly
@@ -1603,18 +1872,35 @@ function bulkStatus(req, res, next) {
           status: statusName,
           follow_ups: 0,
           follow_up_date: null,
+          retargets: 0,
+          retarget_date: null,
         });
       }
 
       const ids = changeable.map(r => r.id);
 
+      /* COALESCE on the two lost columns keeps the previous behaviour: they
+         are written when this move supplies them and left alone when it does
+         not, so a bulk move to a non-lost status cannot blank a reason
+         somebody recorded by hand.
+
+         retarget_due_date is the exception and is written UNCONDITIONALLY,
+         including to NULL. A lead moving off Lost in bulk must stop being
+         queued for a retarget — otherwise the sweep drags it back months
+         later, on top of whatever has been done with it since. Same rule
+         updateLead applies, for the same reason. */
       await client.query(
         `UPDATE leads
-            SET status = $1,
-                ${lost_reason ? 'lost_reason = $3,' : ''}
-                updated_at = NOW()
+            SET status             = $1,
+                lost_reason        = COALESCE($3, lost_reason),
+                lost_competitor_id = COALESCE($4, lost_competitor_id),
+                retarget_due_date  = $5,
+                updated_at         = NOW()
           WHERE id = ANY($2)`,
-        lost_reason ? [statusName, ids, lost_reason] : [statusName, ids]
+        [statusName, ids,
+         lostPlan.required ? lostPlan.reasonName : (lost_reason || null),
+         lostPlan.required ? (lost_competitor_id || null) : null,
+         lostPlan.dueDate]
       );
 
       // Any status change closes the open follow-ups — the same rule
@@ -1659,16 +1945,42 @@ function bulkStatus(req, res, next) {
         // rows, so 500 leads cost a single round trip inside the transaction
         // rather than 500.
         await client.query(
-          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note)
-           SELECT id, $2, $3, $4, $5 FROM unnest($1::int[]) AS t(id)`,
-          [ids, statusName, follow_up_date, dueAt.toISOString(), note]
+          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note, created_by)
+           SELECT id, $2, $3, $4, $5, $6 FROM unnest($1::int[]) AS t(id)`,
+          [ids, statusName, follow_up_date, dueAt.toISOString(), note, req.user.id]
         );
         followUpCount = ids.length;
       }
 
+      /* ── One retarget task per lead that actually moved ────────────────
+         After the auto-close, necessarily — that statement closes every open
+         event on these leads and this row is being created by the same status
+         change. Same ordering trap the follow-up insert above documents.
+
+         unnest again: fifty leads cost one round trip, not fifty. */
+      let retargetCount = 0;
+      if (lostPlan.dueDate) {
+        const compName = lost_competitor_id
+          ? (await client.query('SELECT name FROM competitors WHERE id = $1', [lost_competitor_id])).rows[0]?.name
+          : null;
+        const rNote = compName
+          ? `Due for service — ${compName} serviced this vehicle.`
+          : `Due for retargeting — marked ${lostPlan.reasonName}.`;
+        await client.query(
+          `INSERT INTO lead_events (lead_id, status_name, due_date, due_at, note, created_by, kind)
+           SELECT id, $2, $3, $3::date + TIME '09:00', $4, $5, 'retarget'
+             FROM unnest($1::int[]) AS t(id)`,
+          [ids, statusName, lostPlan.dueDate, rNote, req.user.id]
+        );
+        retargetCount = ids.length;
+        console.log(`[leads] ${retargetCount} lead(s) queued for retarget on ${lostPlan.dueDate}`);
+      }
+
       // One activity row per lead, carrying the status it came FROM — which is
       // why the previous values were read above rather than thrown away.
-      const actNote = lost_reason ? `Lost reason: ${lost_reason}` : null;
+      const actNote = lostPlan.required
+        ? `Lost reason: ${lostPlan.reasonName}`
+        : (lost_reason ? `Lost reason: ${lost_reason}` : null);
       for (const r of changeable) {
         await client.query(
           `INSERT INTO lead_activities (lead_id, type, old_value, new_value, note, created_by)
@@ -1773,6 +2085,10 @@ function bulkStatus(req, res, next) {
         // How many follow-ups were actually written, so the toast can say so
         // rather than the frontend assuming its request took effect.
         follow_ups: followUpCount,
+        // Counted from what was written, not from what was asked for — the
+        // same honesty the follow-up count above is built on.
+        retargets: retargetCount,
+        retarget_date: lostPlan.dueDate,
         follow_up_date: followUpCount ? follow_up_date : null,
         ids,
       });

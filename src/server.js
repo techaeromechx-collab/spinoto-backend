@@ -1,3 +1,9 @@
+/* FIRST. Before dotenv, before any require that might format a Date.
+   Node caches the zone the first time one is used, so setting process.env.TZ
+   after that point changes the variable and not the behaviour — which looks
+   exactly like the fix working until somebody checks a timestamp. */
+require('./utils/appTime').applyProcessTimezone();
+
 require('dotenv').config();
 
 const http    = require('http');
@@ -63,6 +69,8 @@ const v1MasterRoutes             = require('./routes/v1_master.routes');
 // Admin side of the same feature: issuing and revoking those keys.
 const apiKeysRoutes              = require('./routes/api_keys.routes');
 const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
+const lostReasonsRoutes          = require('./routes/lost_reasons.routes');
+const competitorsRoutes          = require('./routes/competitors.routes');
 const pushRoutes                 = require('./routes/push.routes');
 
 const app = express();
@@ -245,6 +253,8 @@ app.use('/api/public/booking',    publicBookingRoutes);
 // public.documents.controller.js before touching it.
 app.use('/api/public/documents',  publicDocumentsRoutes);
 app.use('/api/call-outcomes',     callOutcomesRoutes);
+app.use('/api/lost-reasons',      lostReasonsRoutes);
+app.use('/api/competitors',       competitorsRoutes);
 app.use('/api/whatsapp',          whatsappRoutes);
 app.use('/api/settings',   settingsRoutes);
 

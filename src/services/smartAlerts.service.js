@@ -540,6 +540,7 @@ const TYPE_LABELS = {
   lead_assigned:      'Lead Assigned',
   lead_converted:     'Lead Converted',
   no_activity:        'No Activity',
+  lead_retarget_due:  'Retarget Due',
 };
 
 async function sendSummaryPushes() {

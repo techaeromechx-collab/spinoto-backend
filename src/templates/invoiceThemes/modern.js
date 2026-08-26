@@ -191,7 +191,7 @@ function render({ doc, cfg, pageSize }) {
   </div>
 
   <div class="billto">
-    <span class="chip">${doc.docType === 'purchase_invoice' ? 'BILL TO (HUB)' : 'BILL TO'}</span>
+    <span class="chip">BILL TO</span>
     <div class="party-name">${esc(doc.buyer.name)}</div>
     <div class="party-rows">
       ${buyerRows.map(r => `<div><span class="k">${r.label} :</span> ${r.value}</div>`).join('')}

@@ -268,7 +268,7 @@ function render({ doc, cfg, pageSize }) {
 
   <div class="parties">
     <div class="party">
-      <div class="label">${doc.docType === 'purchase_invoice' ? 'Billed To (Hub)' : 'Billed To'}</div>
+      <div class="label">Billed To</div>
       <div class="name">${esc(doc.buyer.name)}</div>
       <div class="detail">
         ${buyerRows.map(r => `${r.label}: ${r.value}`).join('<br/>')}

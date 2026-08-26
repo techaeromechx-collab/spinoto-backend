@@ -1,3 +1,8 @@
+// Same clock as the server — see src/utils/appTime.js. A migration that
+// backfills a date column would otherwise compute it in UTC and disagree with
+// every query the app then runs against it.
+require('../src/utils/appTime').applyProcessTimezone();
+
 const fs   = require('fs');
 const path = require('path');
 const { Client } = require('pg');
@@ -20,6 +25,11 @@ async function migrate() {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
     ssl,
+    // The same session zone src/config/db.js sets on the pool. A migration
+    // whose backfill uses CURRENT_DATE or ::date must agree with the queries
+    // the app will run afterwards, or the data is written against one calendar
+    // and read against another.
+    options: '-c timezone=Asia/Kolkata',
   });
   await client.connect();
 

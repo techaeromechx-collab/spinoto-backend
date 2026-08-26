@@ -2,7 +2,11 @@
 ALTER TABLE purchase_invoices
   ADD COLUMN IF NOT EXISTS amount_paid     NUMERIC(12,2) NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS payment_status  VARCHAR(30)   NOT NULL DEFAULT 'pending'
-    CHECK (payment_status IN ('pending','partially_paid','paid'));
+    -- 'not_required' added by db/migrations/174: a nil invoice is settled
+    -- without money having moved, and calling that 'paid' froze it (174 has
+    -- the full account). Widened here too so a database built from scratch
+    -- through this file does not then fail 174.
+    CHECK (payment_status IN ('pending','partially_paid','paid','not_required'));
 
 -- Hub payments table (company pays hub)
 CREATE TABLE IF NOT EXISTS hub_payments (
@@ -24,4 +28,4 @@ CREATE INDEX IF NOT EXISTS idx_hub_payments_hub ON hub_payments(hub_id);
 
 COMMENT ON TABLE hub_payments IS 'Payments made by the company to the hub against approved purchase invoices.';
 COMMENT ON COLUMN purchase_invoices.amount_paid    IS 'Total amount paid to hub so far (sum of hub_payments).';
-COMMENT ON COLUMN purchase_invoices.payment_status IS 'Hub payment status: pending → partially_paid → paid.';
+COMMENT ON COLUMN purchase_invoices.payment_status IS 'Hub payment status: pending → partially_paid → paid, or not_required for a nil invoice.';

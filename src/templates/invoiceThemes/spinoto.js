@@ -203,8 +203,8 @@ function render({ doc, cfg, pageSize }) {
 
   <div class="grids">
     <div class="grid">
-      <div class="gh">${doc.docType === 'purchase_invoice' ? 'Bill To (Hub)' : 'Bill To'}</div>
-      <div class="gr"><span class="gk">${doc.docType === 'purchase_invoice' ? 'Hub' : 'Customer'}</span><span class="gv">${esc(doc.buyer.name)}</span></div>
+      <div class="gh">Bill To</div>
+      <div class="gr"><span class="gk">${doc.docType === 'purchase_invoice' ? 'Name' : 'Customer'}</span><span class="gv">${esc(doc.buyer.name)}</span></div>
       ${buyerRows.map(r => `<div class="gr"><span class="gk">${r.label}</span><span class="gv">${r.value}</span></div>`).join('')}
     </div>
     <div class="grid">
