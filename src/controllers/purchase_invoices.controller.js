@@ -103,6 +103,16 @@ const PI_SELECT = `
     COALESCE(a.mobile, est_ctx.mobile)                 AS mobile,
     (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(a.mobile, est_ctx.mobile)) AS customer_token,
     COALESCE(a.vehicle_number, est_ctx.vehicle_number) AS vehicle_number,
+    /* The appointment's reading first, the estimate's as fallback — the same
+       precedence every other vehicle field on this row already uses.
+
+       This column was missing entirely, which made the PDF quietly wrong
+       rather than loudly broken: documentAdapter's vehicleMeta() reads
+       row.odometer_km for the purchase invoice exactly as it does for the
+       estimate and the customer invoice, found undefined, and printed no
+       Odometer line at all. Nothing errored; the row was simply never asked
+       for. */
+    COALESCE(a.odometer_km, est_ctx.odometer_km)       AS odometer_km,
     u.name  AS created_by_name,
     ab.name AS approved_by_name,
     (SELECT id FROM customer_invoices ci WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id LIMIT 1) AS customer_invoice_id,

@@ -86,9 +86,38 @@ async function checkHubSchedule(hubId, scheduledDate, scheduledTime) {
 
 const idParam = z.coerce.number().int().positive();
 
+/** The four source values, and the SQL that recognises each. */
+const SOURCE_PREDICATES = {
+  warranty_redo: 'a.is_warranty_redo',
+  booking:       'a.booking_source IS NOT NULL',
+  lead:          'a.lead_id IS NOT NULL AND NOT a.is_warranty_redo AND a.booking_source IS NULL',
+  direct:        'a.lead_id IS NULL AND NOT a.is_warranty_redo AND a.booking_source IS NULL',
+};
+
+/**
+ * Turns ?source=lead into the WHERE fragment that matches the CASE in
+ * APPT_SELECT. Written once because the list and the calendar both need it and
+ * a second copy is how the two stop agreeing about what "direct" means.
+ *
+ * Each predicate is self-contained rather than relying on the CASE's ordering:
+ * a WHERE clause has no first-match-wins, so 'lead' has to say out loud that it
+ * is not also a redo or a booking.
+ *
+ * An unknown value returns null and the filter is simply not applied — a
+ * mistyped query string should show everything, not nothing.
+ */
+function sourceFilterSql(raw) {
+  const key = String(raw || '').trim().toLowerCase();
+  return SOURCE_PREDICATES[key] || null;
+}
+
 const createSchema = z.object({
   lead_id: z.coerce.number().int().positive().optional().nullable(),
   assigned_to: z.coerce.number().int().positive().optional().nullable(),
+  /* Book this in somebody else's name. Accepted from the body but NOT trusted —
+     the handler decides whether this caller may set it, and ignores it if not.
+     See the createdBy block in createAppointment. */
+  created_by: z.coerce.number().int().positive().optional().nullable(),
   customer_name: z.string().trim().max(160).optional().nullable(),
   // Fix #21: validate mobile format (digits, spaces, dashes, +; 7-15 chars after stripping)
   mobile: z.string().trim().min(1).max(20).regex(
@@ -270,6 +299,30 @@ const APPT_SELECT = `
     u.id    AS created_by_id,
     u.name  AS created_by_name,
 
+    /* WHERE THIS APPOINTMENT CAME FROM.
+       Derived, not stored. Every creation path already leaves its own mark, so
+       a column would be a second copy of a fact the row can answer for itself —
+       one that needs backfilling for existing rows and can drift the first time
+       somebody inserts without setting it.
+
+       Order matters. The tests are not mutually exclusive: a warranty redo has
+       no lead_id and no booking_source, but a booking-site appointment could
+       one day also carry a lead, and the FIRST match wins. Most specific first.
+
+         warranty_redo  is_warranty_redo — warranty_claims.controller.js
+         booking        booking_source (migration 093) — bookingAppointment.service.js
+         lead           lead_id set — converted from a lead
+         direct         none of the above — the New Appointment button
+
+       'direct' is the fall-through on purpose: it is the only path that leaves
+       no mark of its own, because there is nothing to mark. */
+    CASE
+      WHEN a.is_warranty_redo               THEN 'warranty_redo'
+      WHEN a.booking_source IS NOT NULL     THEN 'booking'
+      WHEN a.lead_id IS NOT NULL            THEN 'lead'
+      ELSE 'direct'
+    END AS source_type,
+
     -- Linked estimate (used to lock fields in edit mode + status prerequisite checks)
     (SELECT e.id     FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_id,
     (SELECT e.public_token FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_token,
@@ -327,6 +380,54 @@ function createAppointment(req, res, next) {
     if (data.lead_id && !assignedTo) {
       const leadRow = await pool.query(`SELECT assigned_to FROM leads WHERE id = $1`, [data.lead_id]);
       assignedTo = leadRow.rows[0]?.assigned_to || null;
+    }
+
+    /* ── BOOKING IN SOMEBODY ELSE'S NAME ──────────────────────────────────
+       The caller's own id unless they both asked for someone else AND are
+       allowed to. Default is req.user.id, which is what this always was.
+
+       ── Why the permission gate is not optional ────────────────────────────
+       created_by is not decoration. It is one of the three things that make an
+       appointment VISIBLE to a user without VIEW_APPOINTMENT — see the scoping
+       block in listAppointments:
+
+           a.created_by = ANY($n) OR a.assigned_to = ANY($n) OR (lead is mine)
+
+       So an agent who books in a colleague's name hands away the only claim
+       they had on the row, and it vanishes from their own list the moment they
+       save. They conclude it did not save, and make it again.
+
+       Gating on VIEW_APPOINTMENT closes that off completely: the only people
+       who can reassign authorship are the people who see every appointment
+       regardless, so nothing can disappear on the person doing it.
+
+       ── And the target must be real ───────────────────────────────────────
+       Checked against the users table, and against ACTIVE users specifically:
+       created_by is a foreign key, so a bad id would fail at the INSERT with a
+       constraint error nobody can read, and a disabled account would silently
+       become the owner of new work. */
+    let createdBy = req.user.id;
+    if (data.created_by && data.created_by !== req.user.id) {
+      const mayReassign = req.user.is_super_admin || req.user.permissions.has('VIEW_APPOINTMENT');
+      if (!mayReassign) {
+        return res.status(403).json({
+          error: 'You cannot create an appointment in another user\'s name.',
+        });
+      }
+      const uRow = await pool.query(
+        `SELECT id FROM users WHERE id = $1 AND is_active = TRUE`,
+        [data.created_by]
+      );
+      if (!uRow.rows[0]) {
+        return res.status(400).json({ error: 'That user does not exist or is inactive.' });
+      }
+      createdBy = data.created_by;
+      /* Option A: authorship and ownership move together. Leaving assigned_to
+         empty here would file the appointment under someone who is not on the
+         hook for it — and on a tier-3 login the two columns are read as one
+         question ("is this mine"), so splitting them serves nobody.
+         An explicit assigned_to in the request still wins. */
+      if (!assignedTo) assignedTo = createdBy;
     }
 
     // Fix #22: guard against duplicate lead conversion
@@ -404,7 +505,7 @@ function createAppointment(req, res, next) {
           data.drop_pincode || null,     // $30
           data.drop_maps_link || null,     // $31
           assignedTo,                            // $32
-          req.user.id,                           // $33
+          createdBy,                             // $33
           generatePublicToken(),                 // $34
           data.odometer_km ?? null,              // $35
         ]
@@ -686,6 +787,10 @@ function listAppointmentsCalendar(req, res, next) {
           OR LOWER(COALESCE(a.vehicle_number,'')) LIKE $${n})`
       );
     }
+    // Same helper the list uses — the calendar and the list must agree about
+    // what each source means, and one function is how that stays true.
+    const sourceSqlCal = sourceFilterSql(req.query.source);
+    if (sourceSqlCal) conditions.push(sourceSqlCal);
 
     params.push(dateFrom);
     conditions.push(`a.scheduled_date >= $${params.length}`);
@@ -811,6 +916,10 @@ function listAppointments(req, res, next) {
       params.push(Number(vehicleType));
       conditions.push(`a.vehicle_type_id = $${params.length}`);
     }
+    // No parameter to push — the predicate is a fixed fragment chosen from a
+    // whitelist, never interpolated user input.
+    const sourceSql = sourceFilterSql(req.query.source);
+    if (sourceSql) conditions.push(sourceSql);
     if (dateFrom) {
       params.push(dateFrom);
       conditions.push(`a.scheduled_date >= $${params.length}`);
@@ -837,7 +946,7 @@ function listAppointments(req, res, next) {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const countWhere = countConditions.length ? `WHERE ${countConditions.join(' AND ')}` : '';
 
-    const [dataRes, countRes, statusCountsRes] = await Promise.all([
+    const [dataRes, countRes, statusCountsRes, sourceCountsRes] = await Promise.all([
       pool.query(
         `${APPT_SELECT} ${where} ORDER BY a.created_at DESC, a.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
@@ -849,12 +958,32 @@ function listAppointments(req, res, next) {
          GROUP BY a.status_id`,
         countParams
       ),
+      /* Counts per source, so the filter can show numbers the way the status
+         tabs do. Off countConditions — the same snapshot the status counts use,
+         taken BEFORE the status filter is applied — but note that countWhere
+         DOES include the source filter itself, so picking "Direct" makes the
+         other three read 0. That is the honest answer to "how many of each are
+         in what I am looking at", and it is what the status tabs already do
+         with every other filter. */
+      pool.query(
+        `SELECT CASE
+                  WHEN a.is_warranty_redo           THEN 'warranty_redo'
+                  WHEN a.booking_source IS NOT NULL THEN 'booking'
+                  WHEN a.lead_id IS NOT NULL        THEN 'lead'
+                  ELSE 'direct'
+                END AS source_type,
+                COUNT(*)::int AS count
+         FROM appointments a ${countWhere}
+         GROUP BY 1`,
+        countParams
+      ),
     ]);
 
     return res.json({
       items: dataRes.rows,
       total: parseInt(countRes.rows[0].count, 10),
       status_counts: statusCountsRes.rows, // [{ status_id, count }]
+      source_counts: sourceCountsRes.rows, // [{ source_type, count }]
       page,
       limit,
     });
