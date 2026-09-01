@@ -81,7 +81,13 @@ function render({ doc, cfg, pageSize }) {
   // gets the boxed emphasis; anything else (paid, balance) follows it.
   const taxable = totals.find(t => t.key === 'subtotal');
   const grand   = totals.find(t => t.key === 'grand');
-  const rest    = totals.filter(t => !['subtotal', 'gst', 'grand'].includes(t.key));
+  /* round_off is pulled out of `rest` deliberately. `rest` renders BELOW the
+     grand total, which is right for what it holds — discount, advance, paid,
+     balance all qualify a total that has already been stated. A round-off does
+     the opposite: it is one of the figures the grand total is made OF, so it
+     has to appear above it or the column does not add up. */
+  const roundOff = totals.find(t => t.key === 'round_off');
+  const rest    = totals.filter(t => !['subtotal', 'gst', 'grand', 'round_off'].includes(t.key));
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -243,6 +249,7 @@ function render({ doc, cfg, pageSize }) {
     <div class="foot-right">
       ${taxable ? `<div class="tot-row"><span class="k">Taxable Amount</span><span>₹ ${taxable.value}</span></div>` : ''}
       ${gstLines.map(g => `<div class="tot-row"><span class="k">${g.label}</span><span>₹ ${g.value}</span></div>`).join('')}
+      ${roundOff ? `<div class="tot-row"><span class="k">${roundOff.label}</span><span>₹ ${roundOff.value}</span></div>` : ''}
       ${grand ? `<div class="tot-grand"><span>Total Amount</span><span>₹ ${grand.value}</span></div>` : ''}
       ${rest.map(t => `<div class="tot-row"><span class="k">${t.label}</span><span>₹ ${t.value}</span></div>`).join('')}
 

@@ -2,13 +2,13 @@
   "name": "spinoto-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Spinoto Lead Management & POS \u2014 backend API (Node + Express + PostgreSQL)",
+  "description": "Spinoto Lead Management & POS — backend API (Node + Express + PostgreSQL)",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
     "db:migrate": "node db/migrate.js",
-    "dev": "nodemon src/server.js",
+    "dev": " npm run db:migrate && nodemon src/server.js",
     "test": "node test/run.js"
   },
   "dependencies": {

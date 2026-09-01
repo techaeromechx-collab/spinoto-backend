@@ -572,6 +572,8 @@ function fromCustomerInvoice(row, company, cfg) {
 
   const totalGst = num(row.total_gst);
   const grand = num(row.grand_total);
+  // Signed, and ALREADY inside grand_total — displayed, never added.
+  const roundOff = num(row.round_off);
   const paid = num(row.amount_paid);
   const balance = row.balance !== undefined ? num(row.balance) : grand - paid;
   const discount = num(row.transaction_discount_amount) ||
@@ -649,6 +651,18 @@ function fromCustomerInvoice(row, company, cfg) {
       { key: 'subtotal', label: 'Subtotal (ex-GST)', value: subtotal, kind: 'normal' },
       discount ? { key: 'discount', label: 'Total Discount', value: -discount, kind: 'normal' } : null,
       { key: 'gst',     label: 'Total GST',   value: totalGst, kind: 'normal' },
+      /* The whole-rupee round-off, printed as its own row so the block still
+         reconciles: subtotal + GST + round-off = grand total. Without it the
+         three numbers above would not add up to the one below — the exact
+         defect the transaction discount had before it was fixed.
+
+         Suppressed at zero rather than printed as "0.00": every document
+         raised before the cutoff carries 0 here, and a Round Off row reading
+         nothing is noise on an invoice that was never rounded.
+
+         BETWEEN gst and grand, because that is the order it is applied in and
+         the order it has to be read in. */
+      roundOff ? { key: 'round_off', label: 'Round Off', value: roundOff, kind: 'normal' } : null,
       { key: 'grand',   label: 'Grand Total', value: grand,    kind: 'grand'  },
       // Present only when an advance was actually applied. With no advance the
       // rows below are byte-identical to what every invoice printed before this
@@ -775,6 +789,8 @@ function fromPurchaseInvoice(row, company, cfg) {
   const subtotal = num(row.subtotal_ex_gst);
   const totalGst = num(row.total_gst);
   const grand = num(row.grand_total);
+  // Signed, and ALREADY inside grand_total — displayed, never added.
+  const roundOff = num(row.round_off);
   const paid = num(row.amount_paid);
 
   return {
@@ -825,6 +841,18 @@ function fromPurchaseInvoice(row, company, cfg) {
       // Dropped entirely, not zeroed: a Bill of Supply showing "Total GST ₹0.00"
       // still reads as a document that considered charging tax.
       ...(isTaxInvoice ? [{ key: 'gst', label: 'Total GST', value: totalGst, kind: 'normal' }] : []),
+      /* The whole-rupee round-off, printed as its own row so the block still
+         reconciles: subtotal + GST + round-off = grand total. Without it the
+         three numbers above would not add up to the one below — the exact
+         defect the transaction discount had before it was fixed.
+
+         Suppressed at zero rather than printed as "0.00": every document
+         raised before the cutoff carries 0 here, and a Round Off row reading
+         nothing is noise on an invoice that was never rounded.
+
+         BETWEEN gst and grand, because that is the order it is applied in and
+         the order it has to be read in. */
+      roundOff ? { key: 'round_off', label: 'Round Off', value: roundOff, kind: 'normal' } : null,
       { key: 'grand', label: isHubView ? 'Grand Total Receivable' : 'Grand Total Payable to Hub', value: grand, kind: 'grand' },
       { key: 'paid',    label: isHubView ? 'Paid to You' : 'Paid to Hub', value: paid, kind: 'normal' },
       { key: 'balance', label: 'Balance Due', value: grand - paid, kind: 'strong' },

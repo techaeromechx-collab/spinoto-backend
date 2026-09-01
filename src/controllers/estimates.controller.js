@@ -24,7 +24,7 @@ const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = requir
 const { hubScopeSql, assertHubOwns, isHubUser } = require('../utils/hubScope');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 const { logActivity } = require('../services/activityLog.service');
-const { getIO } = require('../socket');
+const { emitInvalidate } = require('../socket');
 
 // ─── Validators ───────────────────────────────────────────────────────────────
 
@@ -1721,8 +1721,8 @@ function updateEstimate(req, res, next) {
         action: 'estimate_hub_reassigned', entity: 'estimate', entityId: id,
         description: `Hub reassigned ${oldHubName} → ${newHubName}${deletedPiId ? ` (PI-${String(deletedPiId).padStart(6, '0')} deleted for regeneration)` : ''}`,
       });
-      getIO().emit('invalidate', { topic: 'appointments' });
-      getIO().emit('invalidate', { topic: 'purchase_invoices' });
+      emitInvalidate('appointments', req);
+      emitInvalidate('purchase_invoices', req);
     }
 
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
@@ -1778,7 +1778,7 @@ function submitEstimate(req, res, next) {
     // Auto-advance appointment status
     await advanceAppointmentStatus(estimate.appointment_id, 'estimate-submitted');
 
-    announceEstimateChange(true);
+    announceEstimateChange(req, true);
     return res.json({ item: estimate });
   });
 }
@@ -1843,7 +1843,7 @@ function companyApprove(req, res, next) {
       dedupeKey: `sent:${id}`,
     });
 
-    announceEstimateChange(true);
+    announceEstimateChange(req, true);
     return res.json({ item: estimate });
   });
 }
@@ -1883,7 +1883,7 @@ function companyRevise(req, res, next) {
 
     // Estimate only: asking the hub for a revision does not move the
     // appointment, so nothing on that screen has gone stale.
-    announceEstimateChange();
+    announceEstimateChange(req);
 
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
@@ -1930,13 +1930,14 @@ function companyRevise(req, res, next) {
  *   emitting it unconditionally would make every other screen re-fetch for
  *   nothing.
  */
-function announceEstimateChange(alsoAppointments = false) {
-  try {
-    getIO().emit('invalidate', { topic: 'estimates' });
-    if (alsoAppointments) getIO().emit('invalidate', { topic: 'appointments' });
-  } catch (err) {
-    console.error('[estimates] invalidate emit failed:', err.message);
-  }
+function announceEstimateChange(req, alsoAppointments = false) {
+  /* `req` is threaded through so the browser that made this change is left OUT
+     of the broadcast — it already has the server's response and has usually
+     applied it locally. Without that, the author's own screens re-fetched on
+     every edit: on the Estimates page both the list and the open drawer, the
+     drawer blanking behind its loading state each time. See emitInvalidate. */
+  emitInvalidate('estimates', req);
+  if (alsoAppointments) emitInvalidate('appointments', req);
 }
 
 function customerApproval(req, res, next) {
@@ -2039,7 +2040,7 @@ function customerApproval(req, res, next) {
     // The staff-side twin of the emit on the public decision route: this moves
     // the same rows, so a second person with the list open needs to hear about
     // it for the same reason the customer's own approval does.
-    announceEstimateChange();
+    announceEstimateChange(req);
 
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
@@ -2143,7 +2144,7 @@ function updateItemWorkStatus(req, res, next) {
        a car marked finished on the ramp did not reach the CRM until somebody
        reloaded. `apptId` is only set when the estimate's own status moved, so
        it doubles as "did the appointment advance too". */
-    announceEstimateChange(Boolean(apptId));
+    announceEstimateChange(req, Boolean(apptId));
     return res.json({ item: { ...est.rows[0], items } });
   });
 }

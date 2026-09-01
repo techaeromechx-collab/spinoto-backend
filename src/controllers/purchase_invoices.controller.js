@@ -4,6 +4,7 @@ const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
+const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
@@ -75,6 +76,9 @@ const PI_SELECT = `
     est_ctx.warranty_claim_id,
     pi.commission_percent, pi.rate_mode, pi.status,
     pi.subtotal_ex_gst, pi.total_gst, pi.grand_total,
+    -- Signed, and ALREADY INCLUDED in grand_total — it is printed as its own
+    -- row so the summary block reconciles, never added to anything.
+    pi.round_off,
     pi.notes, pi.approved_by, pi.approved_at,
     pi.created_by, pi.created_at, pi.updated_at,
     -- Legal date of the PI (migration 099). ::text so pg-types 2.x can't
@@ -691,26 +695,38 @@ function generatePurchaseInvoice(req, res, next) {
       return { ...item, custRate, hubRate, appliedRatePct, techDeductAmt, gstAmount, totalPayable };
     });
 
+
+    /* Whole-rupee round-off, applied last — it rounds the PAYABLE only.
+       subtotalExGst and totalGst stay exact to the paisa and are what gets
+       declared; see utils/invoiceRounding.js for why it is done this way round.
+
+       new Date() because the row does not exist yet — that is the created_at it
+       is about to receive, and the cutoff must be judged against the same
+       instant the column will hold. */
+    const { grandTotal: piGrandTotal, roundOff: piRoundOff } = applyGrandTotalRounding({
+      grandTotal, createdAt: new Date(),
+    });
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const piRow = await client.query(
         `INSERT INTO purchase_invoices
            (estimate_id, appointment_id, hub_id, commission_percent, rate_mode,
-            subtotal_ex_gst, total_gst, grand_total, created_by, public_token,
+            subtotal_ex_gst, total_gst, grand_total, round_off, created_by, public_token,
             invoice_date, original_invoice_date, backdate_reason, backdated_by, backdated_at,
             updated_by,
             -- Supplier identity frozen at issue (migration 120). Never
             -- re-derived from hubs afterwards.
             hub_legal_name, hub_address, hub_gstin, hub_has_gst, supplier_state_code)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-                 $11::date, $12::date, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21) RETURNING id`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+                 $12::date, $13::date, $14, $15, $16, $17,
+                 $18, $19, $20, $21, $22) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           useCommission ? commissionPct : 0,      // 0 when using tech_rate mode — column is NOT NULL
           rateMode,
-          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), piGrandTotal.toFixed(2), piRoundOff.toFixed(2),
           req.user?.id || null,
           generatePublicToken(),
           piInvoiceDate,
@@ -893,11 +909,18 @@ function approvePurchaseInvoice(req, res, next) {
           }
         }
 
+      /* Round-off recomputed from the new total. pi.created_at, not new Date():
+         an invoice raised before the cutoff keeps its exact-paise total for
+         ever, even when edited today. */
+        const rounded = applyGrandTotalRounding({ grandTotal, createdAt: pi.created_at });
         await client.query(
-          `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3 WHERE id=$4`,
-          [subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), id]
+          `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, round_off=$4 WHERE id=$5`,
+          [subtotalExGst.toFixed(2), totalGst.toFixed(2), rounded.grandTotal.toFixed(2), rounded.roundOff.toFixed(2), id]
         );
-        pi.grand_total = grandTotal;
+        /* The rounded figure, because everything downstream of approval reads
+           this — zeroPayable a few lines below, and the payout the hub is
+           actually sent. */
+        pi.grand_total = rounded.grandTotal;
       }
 
       /* A ₹0 PI has nothing to pay out, and says so.
@@ -1189,12 +1212,38 @@ function recalculatePurchaseInvoice(req, res, next) {
         );
       }
 
+      /* Round-off recomputed from the new total. pi.created_at, not new Date():
+         an invoice raised before the cutoff keeps its exact-paise total for
+         ever, even when edited today. */
+      const rounded = applyGrandTotalRounding({ grandTotal, createdAt: pi.created_at });
       await client.query(
         `UPDATE purchase_invoices
-         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, updated_at=NOW()
-         WHERE id=$4`,
-        [subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), id]
+         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, round_off=$4, updated_at=NOW()
+         WHERE id=$5`,
+        [subtotalExGst.toFixed(2), totalGst.toFixed(2), rounded.grandTotal.toFixed(2), rounded.roundOff.toFixed(2), id]
       );
+
+
+      /* The total just changed, so the paid state derived from it must be
+         re-derived. recalcHubInvoiceState is the ONE place that decides
+         payment_status, and its first branch is the nil case:
+
+           total <= 0.011  ->  'not_required'
+
+         Without this call the column keeps whatever approval wrote. An invoice
+         approved at ₹5,000 is written 'pending' — correct that day — and if its
+         total is later rewritten to ₹0 it stays 'pending' at ₹0, which the
+         payouts queue lists for ever as an OVERDUE row with a Pay button over a
+         zero balance. Migration 176 cleaned up the rows that already reached
+         that state; this is what stops new ones.
+
+         It runs in BOTH directions. A nil invoice whose total comes back above
+         zero returns to 'pending' and re-enters the queue, so a re-sync can
+         never hide a payout that is genuinely owed.
+
+         Safe on a draft: the payouts queue filters on status='approved', and
+         approval re-decides payment_status through zeroPayable regardless. */
+      await _recalcHubPaymentStatus(client, id);
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1675,10 +1724,21 @@ function updatePurchaseInvoice(req, res, next) {
         );
       }
 
+      /* Round-off recomputed from the new total. pi.created_at, not new Date():
+         an invoice raised before the cutoff keeps its exact-paise total for
+         ever, even when edited today. */
+      const rounded = applyGrandTotalRounding({ grandTotal, createdAt: pi.created_at });
       await client.query(
-        `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, updated_at=NOW() WHERE id=$4`,
-        [subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), id]
+        `UPDATE purchase_invoices SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, round_off=$4, updated_at=NOW() WHERE id=$5`,
+        [subtotalExGst.toFixed(2), totalGst.toFixed(2), rounded.grandTotal.toFixed(2), rounded.roundOff.toFixed(2), id]
       );
+
+
+      /* Re-derive the paid state from the new total — see the note in
+         recalculatePurchaseInvoice. Nil totals become 'not_required' and leave
+         the payouts queue; a total that climbs back above zero returns to
+         'pending'. */
+      await _recalcHubPaymentStatus(client, id);
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1842,17 +1902,28 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
       }
 
       // Update PI totals
+      /* Round-off recomputed from the new total. pi.created_at, not new Date():
+         an invoice raised before the cutoff keeps its exact-paise total for
+         ever, even when edited today. */
+      const rounded = applyGrandTotalRounding({ grandTotal, createdAt: pi.created_at });
       await client.query(
         `UPDATE purchase_invoices
-         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3,
-             rate_mode=$4, commission_percent=$5, updated_at=NOW()
-         WHERE id=$6`,
+         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, round_off=$4,
+             rate_mode=$5, commission_percent=$6, updated_at=NOW()
+         WHERE id=$7`,
         [
-          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), rounded.grandTotal.toFixed(2), rounded.roundOff.toFixed(2),
           rateMode, useCommission ? commissionPct : 0,
           id,
         ]
       );
+
+
+      /* Re-derive the paid state from the new total — see the note in
+         recalculatePurchaseInvoice. Nil totals become 'not_required' and leave
+         the payouts queue; a total that climbs back above zero returns to
+         'pending'. */
+      await _recalcHubPaymentStatus(client, id);
 
       await client.query('COMMIT');
     } catch (err) {

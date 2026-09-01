@@ -634,10 +634,27 @@ function listAppointmentsCalendar(req, res, next) {
     } else if (!isAll) {
       params.push([req.user.id]);
       conditions.push(
-        `EXISTS (
-          SELECT 1 FROM leads l
-          WHERE l.id = a.lead_id
-          AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+        /* MINE, by any of the three routes an appointment can belong to me.
+           This used to ask ONLY the last one — "is the linked LEAD mine" — and
+           that silently assumed every appointment comes from a lead. It does
+           not: lead_id is optional on create, so anything raised with the New
+           Appointment button stores lead_id = NULL, `l.id = a.lead_id` never
+           matches a NULL, and the person who just created it could not see it
+           on their own screen. Their appointment was in the database, with
+           their id in created_by, filtered out by a clause that never looked
+           there.
+
+           a.created_by and a.assigned_to are recorded on every row already.
+           Reading them adds nothing to this user's reach beyond appointments
+           that are theirs by name — which is what this tier has always meant. */
+        `(
+          a.created_by  = ANY($${params.length})
+          OR a.assigned_to = ANY($${params.length})
+          OR EXISTS (
+            SELECT 1 FROM leads l
+            WHERE l.id = a.lead_id
+            AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+          )
         )`
       );
     }
@@ -744,10 +761,27 @@ function listAppointments(req, res, next) {
     } else if (!isAll) {
       params.push([req.user.id]);
       conditions.push(
-        `EXISTS (
-          SELECT 1 FROM leads l
-          WHERE l.id = a.lead_id
-          AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+        /* MINE, by any of the three routes an appointment can belong to me.
+           This used to ask ONLY the last one — "is the linked LEAD mine" — and
+           that silently assumed every appointment comes from a lead. It does
+           not: lead_id is optional on create, so anything raised with the New
+           Appointment button stores lead_id = NULL, `l.id = a.lead_id` never
+           matches a NULL, and the person who just created it could not see it
+           on their own screen. Their appointment was in the database, with
+           their id in created_by, filtered out by a clause that never looked
+           there.
+
+           a.created_by and a.assigned_to are recorded on every row already.
+           Reading them adds nothing to this user's reach beyond appointments
+           that are theirs by name — which is what this tier has always meant. */
+        `(
+          a.created_by  = ANY($${params.length})
+          OR a.assigned_to = ANY($${params.length})
+          OR EXISTS (
+            SELECT 1 FROM leads l
+            WHERE l.id = a.lead_id
+            AND (l.created_by = ANY($${params.length}) OR l.assigned_to = ANY($${params.length}))
+          )
         )`
       );
     }

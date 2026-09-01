@@ -4,6 +4,7 @@ const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const { getRoundingFunction } = require('../utils/math');
+const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 // syncPayoutDueDate is no longer required here: it moved inside
 // recalcInvoiceState along with the status recalculation it belongs to, so
@@ -77,6 +78,9 @@ const CI_SELECT = `
     a.pickup_required, a.pickup_address_line1, a.pickup_address_line2,
     a.pickup_city, a.pickup_pincode,
     ci.status, ci.subtotal_ex_gst, ci.total_gst, ci.grand_total, ci.amount_paid,
+    -- Signed, and ALREADY INCLUDED in grand_total — it is printed as its own
+    -- row so the summary block reconciles, never added to anything.
+    ci.round_off,
     ci.notes, ci.odometer_km, ci.created_at, ci.updated_at,
     -- invoice_date is the LEGAL date of the document (migration 099); it is
     -- what the customer, the reports and the printed invoice see. created_at
@@ -209,8 +213,29 @@ async function _getPayments(ciId) {
     // is NULL — the money was taken against the estimate, before this invoice
     // existed — so the edit and delete handlers will not find it, and a pencil
     // that always 404s is worse than no pencil.
+    /* ::text on paid_at, which the other four payment queries in this codebase
+       already do (lines ~773 and ~874 here, and purchase_invoices ~1424/~1516)
+       — this was the one that did not, and it is the one the screen reads.
+
+       paid_at is TIMESTAMPTZ and the session runs in Asia/Kolkata, so a payment
+       dated the 31st is stored as 2026-08-31 00:00:00+05:30. Without the cast
+       node-postgres hands back a JS Date and res.json() serialises it as UTC —
+       2026-08-30T18:30:00.000Z — the PREVIOUS calendar day, every time, because
+       midnight IST is 18:30 the day before in UTC.
+
+       The client cannot recover from that. fmtDate() guards the plain
+       'YYYY-MM-DD' case precisely for this reason, but it receives a full UTC
+       timestamp, slices ten characters off the front and gets a day that has
+       already been shifted. So the list showed the 30th, and the pencil
+       pre-filled the 30th — saving without touching it moved the payment back
+       a day for real.
+
+       The cast makes Postgres render the value in the session zone and send it
+       as a string, so the calendar day that arrives is the calendar day
+       stored. */
     `SELECT cip.payment_id AS id, cip.amount, cip.method, cip.reference_no,
-            cip.paid_at, cip.notes, cip.source, cip.payment_type, cip.voucher_no,
+            cip.paid_at::text AS paid_at,
+            cip.notes, cip.source, cip.payment_type, cip.voucher_no,
             cip.payment_amount, pt.txn_ref,
             u.name AS created_by_name
      FROM invoice_payment_lines cip
@@ -1631,8 +1656,20 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
 
     const subtotalExGst    = totals.subtotalExGst;
     const totalGst         = totals.totalGst;
-    const grandTotal       = totals.grandTotal;
     const txDiscountAmount = totals.discountAmount;
+
+    /* ── Whole-rupee round-off ─────────────────────────────────────────────
+       Applied LAST, after the discount and the tax, because it rounds the
+       payable and nothing else: subtotalExGst and totalGst above are untouched
+       and stay exact to the paisa, which is what gets declared.
+
+       new Date() rather than a column, because this row does not exist yet —
+       that is the created_at it is about to be given, and the cutoff has to be
+       decided against the same instant the column will hold. */
+    const { grandTotal, roundOff } = applyGrandTotalRounding({
+      grandTotal: totals.grandTotal,
+      createdAt:  new Date(),
+    });
 
     /* Each line carries its own post-discount figures now. The invoice's rows
        must show what was actually charged on them, or the lines will not sum
@@ -1671,19 +1708,19 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
         `INSERT INTO customer_invoices
            (estimate_id, appointment_id, hub_id,
             customer_name, mobile, vehicle_number,
-            subtotal_ex_gst, total_gst, grand_total,
+            subtotal_ex_gst, total_gst, grand_total, round_off,
             discount_mode, transaction_discount_type,
             transaction_discount_value, transaction_discount_amount,
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
             notes, public_token, odometer_km,
             invoice_date, original_invoice_date, backdate_reason, backdated_by, backdated_at,
             updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                 $21::date, $22::date, $23, $24, $25, $26) RETURNING id`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+                 $22::date, $23::date, $24, $25, $26, $27) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
-          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), roundOff.toFixed(2),
           discountMode, txDiscountType,
           txDiscountValue, txDiscountAmount.toFixed(2),
           est.is_b2b || false,
@@ -2288,8 +2325,16 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
 
     const subtotalExGst   = totals.subtotalExGst;
     const totalGst        = totals.totalGst;
-    const grandTotal      = totals.grandTotal;
     const txDiscountAmount = totals.discountAmount;
+
+    /* ci.created_at, NOT new Date(). This invoice already exists, and the era
+       it was created in is what decides whether it rounds — re-syncing an
+       invoice raised in August must not hand it a September rule and change a
+       total the customer has already been given and possibly paid. */
+    const { grandTotal, roundOff } = applyGrandTotalRounding({
+      grandTotal: totals.grandTotal,
+      createdAt:  ci.created_at,
+    });
 
     const ciItems = totals.lines.map(l => ({
       ...l.item,
@@ -2432,13 +2477,13 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
       // Update CI totals + discount fields
       await client.query(
         `UPDATE customer_invoices
-         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3,
-             discount_mode=$4, transaction_discount_type=$5,
-             transaction_discount_value=$6, transaction_discount_amount=$7,
+         SET subtotal_ex_gst=$1, total_gst=$2, grand_total=$3, round_off=$4,
+             discount_mode=$5, transaction_discount_type=$6,
+             transaction_discount_value=$7, transaction_discount_amount=$8,
              updated_at=NOW()
-         WHERE id=$8`,
+         WHERE id=$9`,
         [
-          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2),
+          subtotalExGst.toFixed(2), totalGst.toFixed(2), grandTotal.toFixed(2), roundOff.toFixed(2),
           discountMode, txDiscountType,
           txDiscountValue, txDiscountAmount.toFixed(2),
           id,
