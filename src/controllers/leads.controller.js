@@ -313,11 +313,27 @@ function sourceChipSql(key) {
     case 'website':  return `${SRC} = 'website'`;
     case 'meta ads': case 'meta_ads': case 'meta':
       return `${SRC} IN (${META_SOURCES})`;
-    // The absence of a source is a manual lead. Written as a real condition so
-    // the chip and its count cannot disagree.
-    case 'manual':   return `(${SRC} = '' OR ${SRC} IN (${MANUAL_SOURCES}))`;
+
+    /* NOBODY FILLED THE FIELD IN.
+       This used to be folded into 'manual', on the reasoning that an automatic
+       channel always stamps its own source, so a blank one must have been typed
+       by a person. Reasonable, and not reliable: a blank is equally an import
+       from before the field existed, a CSV column left empty, or an advisor who
+       filled the form and skipped the box. Those are missing data, not a source,
+       and counting them as Manual made a data-quality problem look like a real
+       channel — which is exactly the thing this chip exists to surface. */
+    case 'no source': case 'no_source': case 'none':
+      return `${SRC} = ''`;
+
+    /* Blanks are NO LONGER here — they have their own chip above. The count
+       drops by however many were blank, and that lower number is the honest
+       one: it is the leads a person actually recorded as a walk-in, a call or a
+       referral. */
+    case 'manual':   return `${SRC} IN (${MANUAL_SOURCES})`;
     // Defined as the complement, so a source nobody thought of still appears
     // SOMEWHERE instead of being invisible in every filter.
+    // Unchanged, and it did not need to change: it already excluded blanks with
+    // `${SRC} <> ''`, so the new chip takes nothing away from it.
     case 'other':    return `(${SRC} <> '' AND ${SRC} NOT IN ('whatsapp','website',${META_SOURCES},${MANUAL_SOURCES}))`;
     default:         return null;
   }
@@ -556,6 +572,7 @@ function listLeads(req, res, next) {
                 COUNT(*) FILTER (WHERE ${sourceChipSql('website')})::int  AS website,
                 COUNT(*) FILTER (WHERE ${sourceChipSql('meta ads')})::int AS meta,
                 COUNT(*) FILTER (WHERE ${sourceChipSql('manual')})::int   AS manual,
+                COUNT(*) FILTER (WHERE ${sourceChipSql('no source')})::int AS no_source,
                 COUNT(*) FILTER (WHERE ${sourceChipSql('other')})::int    AS other
            FROM leads l ${countScope.length ? `WHERE ${countScope.join(' AND ')}` : ''}`, cParams),
 
@@ -644,7 +661,8 @@ function listLeads(req, res, next) {
         },
         source: {
           all: sc.all_n || 0, whatsapp: sc.whatsapp || 0, website: sc.website || 0,
-          'meta ads': sc.meta || 0, manual: sc.manual || 0, other: sc.other || 0,
+          'meta ads': sc.meta || 0, manual: sc.manual || 0,
+          'no source': sc.no_source || 0, other: sc.other || 0,
         },
       },
       total_value: value.rows[0].v,
