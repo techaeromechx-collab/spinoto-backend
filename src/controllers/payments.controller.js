@@ -198,6 +198,31 @@ const PAY_SELECT = `
          t.gateway_payment_id, t.gateway_order_id, t.payment_link_id,
          t.error_code, t.error_description,
          t.created_at, t.updated_at, t.notes,
+         /* The same instant as created_at, already reduced to the IST CALENDAR
+            DATE, for the CSV export.
+            ────────────────────────────────────────────────────────────────────
+            The export used to build this in Node, as
+              new Date(created_at).toISOString().slice(0, 10)
+            and toISOString ALWAYS renders UTC, whatever the process
+            timezone, and IST is UTC+5:30 — so every instant before 05:30 IST
+            came out as the previous day.
+
+            That is not the rare night-time case it sounds like. A manual
+            payment is entered as a DATE with no time, which Postgres stores as
+            00:00 IST — and midnight IST is always the previous day in UTC. So
+            EVERY hand-entered payment exported one day early: a payment taken
+            on 27 Aug appeared in the file as 26 Aug.
+
+            AT TIME ZONE 'Asia/Kolkata' rather than trusting the session's
+            TimeZone. config/db.js does pin it on the connection, but this value
+            is what an accountant reconciles a bank statement against; it should
+            not depend on a setting one missed connection could drop.
+
+            Added as its own column rather than casting created_at in place:
+            created_at is returned to the payments SCREEN as a timestamptz and
+            formatted in the browser, which is already correct. Changing its
+            type would fix the export by breaking the list. */
+         (t.created_at AT TIME ZONE 'Asia/Kolkata')::date::text AS date_ist,
          t.voucher_no,
          u.name AS created_by_name,
          -- WHO THIS MONEY CAME FROM, in the order the answer is most reliable.
@@ -1551,7 +1576,10 @@ function exportPayments(req, res, next) {
         // against is the reference somebody typed off the receipt.
         r.txn_ref || r.reference_no || '',
         r.kind === 'manual' ? 'Manual' : 'Online',
-        new Date(r.created_at).toISOString().slice(0, 10),
+        // date_ist, NOT new Date(created_at).toISOString() — see PAY_SELECT.
+        // Postgres has already reduced the instant to its IST calendar date;
+        // re-deriving it in Node is what put every manual payment a day early.
+        r.date_ist || '',
         r.status, r.mode, r.amount, r.refunded,
         r.method_detail || '',
         r.customer_name || '',

@@ -27,10 +27,11 @@ const FINISHED_LEAD_SQL = `
   )`;
 
 // ─── Date range helpers ────────────────────────────────────────────────────────
-// filter param: 'today' | 'tomorrow' | 'week' | 'custom'
+// filter param: 'overdue' | 'today' | 'tomorrow' | 'week' | 'custom'
 // For custom: pass date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
 //
-// Today   → due_date <= today      (includes overdue)
+// Overdue → due_date <= yesterday  (everything still open from before today)
+// Today   → due_date = today       (exact day — overdue has its own tab)
 // Tomorrow→ due_date = tomorrow    (exact day, no overdue)
 // Week    → due_date between today and end of this week (Sunday)
 // Custom  → due_date between date_from and date_to
@@ -79,39 +80,175 @@ function getDateRange(query) {
     return { dateFrom, dateTo, includeOverdue: false };
   }
 
-  // default: 'today' — includes overdue (due_date <= today)
-  return { dateFrom: null, dateTo: todayStr, includeOverdue: true };
-}
+  /* EVERYTHING STILL OPEN FROM BEFORE TODAY.
+     Its own filter now, because it used to be folded into 'today' — that tab
+     ran `due_date <= today`, so a follow-up three weeks late sat in a list
+     labelled Today and there was no way to see today's work on its own.
 
-// Builds the WHERE clause for due date filtering
-// includeOverdue = true  → due_date <= dateTo  (past + today/week)
-// includeOverdue = false → due_date BETWEEN dateFrom AND dateTo  (exact range)
-function buildDueFilter(includeOverdue, paramOffset = 0) {
-  // paramOffset lets us shift $1/$2 when other params come first
-  const p1 = `$${paramOffset + 1}`;
-  const p2 = `$${paramOffset + 2}`;
-  const p3 = `$${paramOffset + 3}`;
+     dateTo is YESTERDAY, so 'overdue' and 'today' cannot both contain the same
+     row. The two counts add up, and neither double-counts.
 
-  if (includeOverdue) {
-    // today filter: due <= dateTo (p2), or due_at <= now (p1)
+     isOverdue selects a clause that matches on due_date ALONE. The generic
+     includeOverdue clause is `due_at <= now OR (due_at IS NULL AND due_date <=
+     dateTo)`, and its first half would pull in a follow-up set for 09:00 THIS
+     MORNING once 09:00 has passed — a row whose due_date is today and which
+     therefore also sits in the Today tab. The two tabs would double-count it,
+     which is the exact thing this split exists to stop. due_date is NOT NULL
+     (migration 037), so a date-only comparison loses nothing. */
+  if (filter === 'overdue') {
     return {
-      sql: `(
-        (e.due_at IS NOT NULL AND e.due_at <= ${p1})
-        OR
-        (e.due_at IS NULL AND e.due_date <= ${p2})
-      )`,
-      params: (now, dateTo) => [now, dateTo],
+      dateFrom: null,
+      dateTo: istAddDays(todayStr, -1),
+      includeOverdue: true,
+      isOverdue: true,
     };
   }
 
-  // range filter: due_date BETWEEN dateFrom AND dateTo
-  return {
-    sql: `(
-      e.due_at IS NULL
-      AND e.due_date BETWEEN ${p2} AND ${p3}
-    )`,
-    params: (now, dateFrom, dateTo) => [now, dateFrom, dateTo],
-  };
+  /* default: 'today' — EXACTLY today.
+     This used to be `{ dateTo: todayStr, includeOverdue: true }`, i.e.
+     `due_date <= today`, on the reading that Today meant "my queue right now".
+     Defensible, but it is not what the tab says, and it made the one number
+     people check every morning impossible to trust. Overdue has its own tab
+     above; this one answers only "what is due today". */
+  return { dateFrom: todayStr, dateTo: todayStr, includeOverdue: false };
+}
+
+/* ── What a tab MEANS, in one place ─────────────────────────────────────────
+   Returns the SQL for one filter plus the parameters it needs, numbered from
+   `offset`. The list endpoint calls it once; the tab-count endpoint calls it
+   once per tab and stacks the offsets.
+
+   ONE definition, and that is the entire reason it exists as a function. The
+   counts sit ON the tabs: a badge saying 6 above a list of 4 is worse than no
+   badge at all, because the badge is what people trust when they are deciding
+   whether to click. Two copies of "what does Overdue mean" is exactly how that
+   happens — the same mistake FINISHED_LEAD_SQL above was written to stop.
+
+   It replaces a `buildDueFilter` that nothing called: a stale third opinion on
+   the same question, kept alive only by never being used. */
+function dueClauseFor(query, now, offset = 0) {
+  /* The whole query object, not just the filter name: `custom` carries its
+     range in date_from / date_to, and passing only the name would silently
+     hand it today..today. */
+  const { dateFrom, dateTo, endAt, includeOverdue, isWeek, isOverdue } =
+    getDateRange(query);
+  const p = n => `$${offset + n}`;
+
+  /* Date only. Comparing due_at to `now` would count a follow-up due at 09:00
+     today as overdue from 09:01 — a row whose due_date is today and which is
+     therefore also in the Today tab. See getDateRange. */
+  if (isOverdue) {
+    return { sql: `(e.due_date <= ${p(1)})`, args: [dateTo] };
+  }
+  if (includeOverdue) {
+    return {
+      sql: `((e.due_at IS NOT NULL AND e.due_at <= ${p(1)})
+             OR (e.due_at IS NULL AND e.due_date <= ${p(2)}))`,
+      args: [now, dateTo],
+    };
+  }
+  if (isWeek) {
+    return {
+      sql: `((e.due_at IS NOT NULL AND e.due_at <= ${p(1)})
+             OR (e.due_at IS NULL AND e.due_date BETWEEN ${p(2)} AND ${p(3)}))`,
+      args: [endAt, dateFrom, dateTo],
+    };
+  }
+  // tomorrow / today / custom — an exact range, matched on due_date alone.
+  return { sql: `(e.due_date BETWEEN ${p(1)} AND ${p(2)})`, args: [dateFrom, dateTo] };
+}
+
+/* ── Who may see whose follow-ups ───────────────────────────────────────────
+   The same three-way rule listEvents applies, as a clause the count endpoint
+   can bolt on. Super admin sees everything, a VIEW_TEAM_LEADS manager sees
+   their own plus their direct reports', everyone else sees their own.
+
+   listEvents still spells this out inline, because its manager branch also
+   needs the ids in the SELECT to compute is_team_followup and folding that in
+   would make this function do two jobs. If you change the rule, change it in
+   both — the counts are on the tabs above the list they describe, and a badge
+   that counts a wider set than the list shows is a bug people report as
+   "missing follow-ups". */
+async function visibilityClause(req, offset = 0) {
+  const { id: userId, is_super_admin, permissions } = req.user;
+  if (is_super_admin) return { sql: '', args: [] };
+
+  const p = `$${offset + 1}`;
+  if (permissions.has('VIEW_TEAM_LEADS')) {
+    const team = await pool.query(
+      `SELECT id FROM users WHERE manager_id = $1 AND is_active = TRUE`, [userId]
+    );
+    return {
+      sql: `AND (l.created_by = ANY(${p}) OR l.assigned_to = ANY(${p}))`,
+      args: [[userId, ...team.rows.map(r => r.id)]],
+    };
+  }
+  return { sql: `AND (l.created_by = ${p} OR l.assigned_to = ${p})`, args: [userId] };
+}
+
+/* GET /api/lead-events/tab-counts
+   One number per tab, for the badges on the Follow-ups page. Custom has none —
+   it is whatever range the user types, so there is nothing to count until they
+   type it. */
+function tabCounts(req, res, next) {
+  handle(req, res, next, async () => {
+    const now  = new Date().toISOString();
+    const TABS = ['overdue', 'today', 'tomorrow', 'week'];
+
+    /* One query, four FILTER clauses — not four round trips. Each tab's params
+       are appended in turn and its clause numbered from where the previous one
+       stopped, so the offsets stay in step with the array. */
+    const args = [];
+    const cols = TABS.map(t => {
+      const c = dueClauseFor({ filter: t }, now, args.length);
+      args.push(...c.args);
+      return `COUNT(*) FILTER (WHERE ${c.sql})::int AS ${t}`;
+    });
+
+    const scope = await visibilityClause(req, args.length);
+    args.push(...scope.args);
+
+    /* The page's agent picker, applied HERE as well as on the client.
+
+       The list is narrowed in the browser (`lead_assigned_to_id === agent`), so
+       without this the badges would keep counting the whole team while the rows
+       under them showed one person's — the precise failure a badge is supposed
+       to prevent. `l.assigned_to` is the column that alias comes from, so the
+       two tests are the same test.
+
+       Digits ONLY, tested on the whole string rather than trusting parseInt.
+       parseInt('1; DROP TABLE leads') is 1 — harmless here because the value is
+       parameterised, but it means a malformed id silently becomes a real user's
+       and returns a confident wrong number. Anything that is not a plain
+       positive integer is ignored, which is the same as no filter. */
+    const rawAgent = String(req.query.agent_id ?? '');
+    let agentSql = '';
+    if (/^[1-9][0-9]*$/.test(rawAgent)) {
+      args.push(Number(rawAgent));
+      agentSql = `AND l.assigned_to = $${args.length}`;
+    }
+
+    const r = await pool.query(
+      `SELECT ${cols.join(',\n             ')}
+         FROM lead_events e
+         JOIN leads l ON l.id = e.lead_id
+        WHERE e.is_done = FALSE
+          ${scope.sql}
+          ${agentSql}
+          ${FINISHED_LEAD_SQL}`,
+      args
+    );
+
+    const row = r.rows[0] || {};
+    res.json({
+      counts: {
+        overdue:  Number(row.overdue  || 0),
+        today:    Number(row.today    || 0),
+        tomorrow: Number(row.tomorrow || 0),
+        week:     Number(row.week     || 0),
+      },
+    });
+  });
 }
 
 // GET /api/lead-events?filter=today|tomorrow|week|custom&date_from=&date_to=
@@ -160,39 +297,38 @@ function listEvents(req, res, next) {
       return res.json({ items: r.rows });
     }
 
-    const { dateFrom, dateTo, endAt, includeOverdue, isWeek } = getDateRange(req.query);
+    /* Only for the response body — the SQL takes its dates from dueClauseFor
+       below, which calls getDateRange itself. */
+    const { dateFrom, dateTo } = getDateRange(req.query);
     const now = new Date().toISOString();
 
+    /* lead_token is public_token, and it is what the Follow-ups page needs to
+       open a lead: /leads/:token resolves through
+       `SELECT id FROM leads WHERE public_token = $1` (utils/publicToken.js), so
+       a numeric lead_id NEVER matches — the page loaded and nothing opened.
+
+       Nullable, deliberately not coalesced to the id: migration 165 backfilled
+       every existing lead, but a row that somehow has no token has no URL
+       either, and sending the id would just 404 more quietly. The page disables
+       the button instead. */
     const SELECT = `
       e.id, e.lead_id, e.status_name, e.due_date, e.due_at, e.note, e.is_done, e.done_at, e.created_at,
-      l.name        AS lead_name,
-      l.mobile      AS lead_mobile,
-      l.status      AS lead_current_status,
-      l.assigned_to AS lead_assigned_to_id,
-      au.name       AS assigned_to_name,
-      cu.name       AS created_by_name
+      l.name         AS lead_name,
+      l.mobile       AS lead_mobile,
+      l.status       AS lead_current_status,
+      l.assigned_to  AS lead_assigned_to_id,
+      l.public_token AS lead_token,
+      au.name        AS assigned_to_name,
+      cu.name        AS created_by_name
     `;
 
     let r;
 
-    // ── Build the due-date WHERE clause based on filter type ─────────────────
-    // today    → due_at <= now  OR  due_date <= today        (overdue + today)
-    // week     → due_at <= endOfSunday  OR  due_date <= endOfWeek  (whole week range)
-    // tomorrow/custom → due_date BETWEEN dateFrom AND dateTo (exact range, no due_at)
-    const getDueClause = () => {
-      if (includeOverdue) {
-        // today — overdue + today: due_at <= now OR due_date <= today
-        return { sql: `(e.due_at IS NOT NULL AND e.due_at <= $1) OR (e.due_at IS NULL AND e.due_date <= $2)`, args: [now, dateTo] };
-      }
-      if (isWeek) {
-        // week — due_at within this week OR due_date within this week
-        return { sql: `(e.due_at IS NOT NULL AND e.due_at <= $1) OR (e.due_at IS NULL AND e.due_date BETWEEN $2 AND $3)`, args: [endAt, dateFrom, dateTo] };
-      }
-      // tomorrow / custom — match by due_date regardless of due_at
-      return { sql: `e.due_date BETWEEN $1 AND $2`, args: [dateFrom, dateTo] };
-    };
-
-    const due = getDueClause();
+    /* The due-date clause comes from dueClauseFor, the same helper the tab-count
+       endpoint uses. It used to be an inline getDueClause() here, which meant
+       the badge on a tab and the list under it were two separate opinions about
+       what that tab contained. */
+    const due = dueClauseFor(req.query, now, 0);
 
     // Exclude leads whose current status is terminal (locked) or already converted to an
     // appointment — follow-ups on those leads are no longer actionable.
@@ -648,4 +784,4 @@ function getCompliance(req, res, next) {
   });
 }
 
-module.exports = { listEvents, pendingCount, markDone, getCompliance, getStats };
+module.exports = { listEvents, tabCounts, pendingCount, markDone, getCompliance, getStats };

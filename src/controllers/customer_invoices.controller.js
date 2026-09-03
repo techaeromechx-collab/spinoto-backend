@@ -25,7 +25,79 @@ const { buildSearchSql } = require('../utils/listSearch');
 const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
 const { maskMobile } = require('../utils/maskMobile');
 const { isHubUser } = require('../utils/hubScope');
+/* The SAME three functions the PDF uses to decide CGST/SGST vs IGST and to
+   halve a rate. The CSV must not re-implement any of it: an export that
+   disagrees with the invoice it came from is worse than no export. */
+const { resolvePlaceOfSupply, isInterState, splitGst } = require('../utils/gstStates');
 const maskFor = (req, v) => (isHubUser(req) ? maskMobile(v) : (v || ''));
+
+/* ── GST breakdown columns on the CSV export ────────────────────────────────
+   One column per tax head per rate, because a CSV row is flat and the invoice
+   is not: a bill carrying 18% labour and a 12% part prints four lines (CGST 9%,
+   SGST 9%, CGST 6%, SGST 6%) and has to become four cells.
+
+   Fixed headers, not generated from the data. A column set that changed with
+   whatever happened to be in this month's invoices would give January and
+   February different files — nothing could append them, and no saved pivot
+   would survive. So the standard slabs get permanent columns whether or not
+   they are used this month.
+
+   The halves are what appear on the document: 5→2.5, 12→6, 18→9, 28→14. IGST
+   is not halved, so it keeps the full rate. */
+const GST_RATE_COLS = [
+  'CGST 2.5%', 'SGST 2.5%',
+  'CGST 6%',   'SGST 6%',
+  'CGST 9%',   'SGST 9%',
+  'CGST 14%',  'SGST 14%',
+  'IGST 5%', 'IGST 12%', 'IGST 18%', 'IGST 28%',
+];
+
+/* Percent as it appears in a header: 2.5 stays 2.5, 9.00 becomes 9. Built from
+   the same number splitGst returns, so a column name can never drift from the
+   line the PDF prints. */
+const pctLabel = p => String(Number(p));
+
+/* ── The catch-all ──
+   customer_invoice_items.gst_percent is NUMERIC(5,2) with no CHECK and no
+   master list behind it — 3% or 7.5% is one keystroke away. Without this
+   column that tax would land in no column at all while `GST` still counted it,
+   so the row would silently stop adding up and nobody would know which invoice
+   was wrong.
+
+   It also absorbs any residue between the per-rate sums and the stored
+   total_gst, which is what makes the promise on this export absolute:
+   the rate columns plus Other GST equal the GST column, on every row. */
+const OTHER_GST_COL = 'Other GST';
+
+/* Splits one invoice's tax into the export's columns.
+
+   `perRate` is [{ rate, amount }] summed from customer_invoice_items — those
+   rows are stored ALREADY DISCOUNTED (generation re-costs every line through
+   applyTransactionDiscount before insert), so they add up to ci.total_gst
+   rather than to a pre-discount figure. */
+function gstColumnsFor(perRate, interState, totalGst) {
+  const out = Object.create(null);
+  for (const col of GST_RATE_COLS) out[col] = 0;
+  out[OTHER_GST_COL] = 0;
+
+  for (const { rate, amount } of perRate) {
+    for (const line of splitGst(amount, rate, interState)) {
+      const col = `${line.label} ${pctLabel(line.percent)}%`;
+      if (col in out) out[col] += line.amount;
+      else out[OTHER_GST_COL] += line.amount;
+    }
+  }
+
+  /* Reconcile to the invoice's own stored total. Normally exact — splitGst
+     gives back what it was handed — but an invoice whose item rows went missing
+     would otherwise export a tax total with no breakdown under it. The gap goes
+     to Other GST, where it is visible, instead of nowhere. */
+  const spread = Object.values(out).reduce((s, v) => s + v, 0);
+  const gap = Number((totalGst - spread).toFixed(2));
+  if (Math.abs(gap) >= 0.01) out[OTHER_GST_COL] = Number((out[OTHER_GST_COL] + gap).toFixed(2));
+
+  return out;
+}
 
 // What the customer-invoice search box looks at. Declared once so the list and
 // the CSV export cannot drift — they were already two copies of the same line,
@@ -359,6 +431,51 @@ function listCustomerInvoices(req, res, next) {
         params
       ),
     ]);
+
+    /* ── The Payment column ────────────────────────────────────────────────
+       The most recent payment on each invoice, for the list's Payment cell.
+       `payment_count` already rides along in CI_SELECT, so the "+2 more" chip
+       needs nothing further — this only supplies the one line being shown.
+
+       A separate keyed query rather than a subquery inside CI_SELECT: that
+       constant is shared with the drawer, the PDF path and several other
+       endpoints, none of which want this, and all of which would pay for it on
+       every read. Here it is one statement over the ids of ONE page.
+
+       paid_at::text, NOT the timestamptz. Postgres renders ::text in the
+       session's timezone, which config/db.js pins to Asia/Kolkata; handing the
+       raw timestamptz to JS and slicing its ISO string yields UTC, and in IST
+       that is the PREVIOUS DAY until 05:30 — the same bug fixed on this page's
+       payment list earlier, reappearing one column to the left.
+
+       DISTINCT ON with payment_id as the tiebreaker so two payments recorded on
+       the same day resolve to a stable one rather than alternating between
+       page loads. */
+    if (dataRes.rows.length > 0) {
+      const ids = dataRes.rows.map(row => row.id);
+      const payRes = await pool.query(
+        `SELECT DISTINCT ON (customer_invoice_id)
+                customer_invoice_id,
+                paid_at::text AS paid_at,
+                method,
+                payment_type
+           FROM invoice_payment_lines
+          WHERE customer_invoice_id = ANY($1::int[])
+          ORDER BY customer_invoice_id, paid_at DESC NULLS LAST, payment_id DESC`,
+        [ids]
+      );
+      const lastPay = new Map(payRes.rows.map(row => [row.customer_invoice_id, row]));
+      for (const inv of dataRes.rows) {
+        const p = lastPay.get(inv.id);
+        inv.last_payment_date   = p ? String(p.paid_at).slice(0, 10) : null;
+        inv.last_payment_method = p ? p.method : null;
+        /* An advance was taken BEFORE this invoice existed and applied to it
+           later, so its date can legitimately predate the invoice date. Flagged
+           so that reads as a fact rather than as bad data. */
+        inv.last_payment_is_advance = p ? p.payment_type === 'advance' : false;
+      }
+    }
+
     const c = countRes.rows[0];
     res.json({
       items: dataRes.rows,
@@ -2106,13 +2223,31 @@ function exportCustomerInvoices(req, res, next) {
     // totals as separate keyed lookups instead and merge them in JS below.
     const r = await pool.query(`${CI_SELECT} ${where} ORDER BY ci.invoice_date DESC, ci.id DESC`, params);
 
+    /* Company settings, once for the whole file rather than per row. Needed for
+       the supplier's own state: that against the place of supply is what
+       decides CGST/SGST vs IGST. */
+    const company = await loadCompany();
+
     const ids = r.rows.map(row => row.id);
     let lastPaymentById = new Map();
     let discountById = new Map();
+    /* invoice id → [{ rate, amount }]. Summed PER RATE rather than splitting
+       ci.total_gst in half once, because splitGst rounds each rate's half UP to
+       the paisa: on a bill with both 18% and 12% the two routes can land ₹0.01
+       apart, and the CSV would then disagree with the PDF it describes. */
+    let gstByInvoice = new Map();
     if (ids.length > 0) {
-      const [payRes, discRes] = await Promise.all([
+      const [payRes, discRes, gstRes] = await Promise.all([
+        /* Reduced to the IST calendar date in Postgres, not in Node.
+           MAX(paid_at) is a timestamptz, and the row builder below used to run
+           it through `new Date(...).toISOString().slice(0,10)` — which renders
+           UTC. A manual payment is entered as a date with no time and stored at
+           00:00 IST, and midnight IST is always the PREVIOUS day in UTC, so
+           every hand-entered payment exported one day early. Same defect, same
+           day, as the Payments CSV. */
         pool.query(
-          `SELECT customer_invoice_id, MAX(paid_at) AS last_payment_date
+          `SELECT customer_invoice_id,
+                  (MAX(paid_at) AT TIME ZONE 'Asia/Kolkata')::date::text AS last_payment_date
            FROM invoice_payment_lines WHERE customer_invoice_id = ANY($1::int[])
            GROUP BY customer_invoice_id`,
           [ids]
@@ -2123,9 +2258,26 @@ function exportCustomerInvoices(req, res, next) {
            GROUP BY customer_invoice_id`,
           [ids]
         ),
+        /* Zero-rate and zero-amount lines are dropped here rather than in JS:
+           they contribute nothing and would otherwise produce a "CGST 0%"
+           bucket that matches no column and lands in Other GST as 0.00. */
+        pool.query(
+          `SELECT customer_invoice_id, gst_percent, COALESCE(SUM(gst_amount), 0) AS gst
+           FROM customer_invoice_items
+           WHERE customer_invoice_id = ANY($1::int[])
+             AND COALESCE(gst_percent, 0) > 0
+             AND COALESCE(gst_amount, 0) > 0
+           GROUP BY customer_invoice_id, gst_percent`,
+          [ids]
+        ),
       ]);
       lastPaymentById = new Map(payRes.rows.map(row => [row.customer_invoice_id, row.last_payment_date]));
       discountById = new Map(discRes.rows.map(row => [row.customer_invoice_id, row.discount_sum]));
+      for (const g of gstRes.rows) {
+        const list = gstByInvoice.get(g.customer_invoice_id) || [];
+        list.push({ rate: parseFloat(g.gst_percent), amount: parseFloat(g.gst) });
+        gstByInvoice.set(g.customer_invoice_id, list);
+      }
     }
     for (const inv of r.rows) {
       inv.last_payment_date = lastPaymentById.get(inv.id) || null;
@@ -2141,9 +2293,20 @@ function exportCustomerInvoices(req, res, next) {
       return s;
     };
 
+    /* The GST block sits between Discount and Grand Total, and `GST` comes
+       AFTER its own breakdown rather than before it: the columns read left to
+       right as the parts and then the total, which is the order the invoice
+       prints them and the order somebody checking the arithmetic reads them.
+
+       Round Off is next to Grand Total because that is the only figure it
+       touches — subtotal and tax stay exact to the paisa (see
+       applyGrandTotalRounding). Without this column the sheet could not be made
+       to balance at all on invoices issued from 1 Sep onward. */
     const headers = [
       'Invoice #', 'Date', 'Customer Name', 'Mobile', 'Vehicle Number', 'Vehicle Type', 'Make/Model',
-      'Hub', 'Subtotal (ex-GST)', 'Discount', 'GST', 'Grand Total', 'Paid',
+      'Hub', 'Subtotal (ex-GST)', 'Discount',
+      ...GST_RATE_COLS, OTHER_GST_COL, 'GST',
+      'Round Off', 'Grand Total', 'Paid',
       'Payment Date', 'Balance', 'Status', 'B2B Company / GST Number',
     ];
 
@@ -2167,6 +2330,16 @@ function exportCustomerInvoices(req, res, next) {
       const paid       = parseFloat(inv.amount_paid ?? 0);
       const balance    = Math.max(0, grandTotal - paid);
       const makeModel  = [inv.make_name, inv.model_name].filter(Boolean).join(' ');
+      const totalGst   = parseFloat(inv.total_gst ?? 0);
+
+      /* Per invoice, not per file: place of supply is a property of the SALE.
+         A B2B customer with a Maharashtra GSTIN is IGST on the same day the
+         walk-in before them was CGST+SGST, so one flag for the whole export
+         would mislabel one of them. Same resolution order as the PDF —
+         explicit override, then the B2B customer's GSTIN state, then the
+         supplier's own state. */
+      const interState = isInterState(company, resolvePlaceOfSupply(inv, company).code);
+      const gstCols = gstColumnsFor(gstByInvoice.get(inv.id) || [], interState, totalGst);
       const b2b        = inv.is_b2b
         ? [inv.b2b_company_name, inv.b2b_gst_number ? `GST: ${inv.b2b_gst_number}` : null].filter(Boolean).join(' / ')
         : '';
@@ -2187,10 +2360,18 @@ function exportCustomerInvoices(req, res, next) {
         inv.hub_full_name || inv.hub_name || '',
         parseFloat(inv.subtotal_ex_gst ?? 0).toFixed(2),
         parseFloat(inv.discount_total ?? 0).toFixed(2),
-        parseFloat(inv.total_gst ?? 0).toFixed(2),
+        // The breakdown, then its total — the same left-to-right order as the
+        // header. Spread from the header list so the two cannot fall out of
+        // step if a rate column is ever added.
+        ...GST_RATE_COLS.map(c => gstCols[c].toFixed(2)),
+        gstCols[OTHER_GST_COL].toFixed(2),
+        totalGst.toFixed(2),
+        parseFloat(inv.round_off ?? 0).toFixed(2),
         grandTotal.toFixed(2),
         paid.toFixed(2),
-        inv.last_payment_date ? new Date(inv.last_payment_date).toISOString().slice(0, 10) : '',
+        // Already a 'YYYY-MM-DD' IST date string from the query above. No Date
+        // round trip — that is what shifted it a day.
+        inv.last_payment_date || '',
         balance.toFixed(2),
         (inv.status || '').replace('_', ' '),
         b2b,
