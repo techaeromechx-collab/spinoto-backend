@@ -90,6 +90,18 @@ async function applyItemApprovals(client, estimateId, approvals) {
     throw err;
   }
 
+  /* ── The answers as they stood BEFORE this call ───────────────────────
+     Read first, because the work-status reset below has to tell a line that
+     has just been approved from one approved a week ago and already fitted.
+     After the writes, both look identical. */
+  const touchedIds = approvals.map(a => a.item_id);
+  const beforeRes = await client.query(
+    `SELECT id, customer_approved FROM estimate_items
+      WHERE estimate_id = $1 AND id = ANY($2::int[])`,
+    [estimateId, touchedIds]
+  );
+  const wasApproved = new Map(beforeRes.rows.map(r => [r.id, r.customer_approved === true]));
+
   for (const { item_id, approved } of approvals) {
     // AND estimate_id = $3 is load-bearing, not defensive tidiness. On the
     // public endpoint the item ids arrive in a request body from an
@@ -103,17 +115,42 @@ async function applyItemApprovals(client, estimateId, approvals) {
     );
   }
 
-  // Every approved item goes back to 'pending' work.
-  //
-  // ALL approved items, not just the ones in this call: an estimate can be
-  // re-approved after a revision, and an item that was already fitted under a
-  // previous approval has to re-enter the queue rather than silently counting
-  // as done. Carried over from the staff handler unchanged.
-  await client.query(
-    `UPDATE estimate_items SET work_status = 'pending'
-      WHERE estimate_id = $1 AND customer_approved = TRUE`,
-    [estimateId]
-  );
+  /* ── Only a line whose ANSWER CHANGED re-enters the workshop queue ─────
+
+     This used to reset every approved line on the estimate:
+
+         UPDATE estimate_items SET work_status = 'pending'
+          WHERE estimate_id = $1 AND customer_approved = TRUE
+
+     Read that against what the invoices actually bill —
+
+         WHERE customer_approved = true AND work_status = 'completed'
+
+     — and the consequence is exact: recording ONE decision on a finished job
+     put every fitted line back to 'pending', which dropped every line off both
+     the customer's invoice and the hub's, and took the bill to zero. That is
+     why rejecting a line was impossible and deleting it looked like the only
+     way out.
+
+     The original intent was real: a revised estimate has to be re-fitted rather
+     than silently counting as done. That intent is kept, and made precise — a
+     line resets when the customer's answer to it changed in THIS call (from
+     undecided or refused, to yes). A line whose answer is the same as it was
+     has had nothing change about it, so its work has not changed either.
+
+     A rejection therefore touches exactly one line, and finished work stays
+     finished. */
+  const newlyApproved = approvals
+    .filter(a => a.approved === true && !wasApproved.get(a.item_id))
+    .map(a => a.item_id);
+
+  if (newlyApproved.length) {
+    await client.query(
+      `UPDATE estimate_items SET work_status = 'pending'
+        WHERE estimate_id = $1 AND id = ANY($2::int[])`,
+      [estimateId, newlyApproved]
+    );
+  }
 
   const stats = await client.query(
     `SELECT COUNT(*)::int                                          AS total,

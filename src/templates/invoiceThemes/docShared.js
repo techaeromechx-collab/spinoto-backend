@@ -334,6 +334,19 @@ function buildTotals(doc) {
     label: esc(t.label),
     value: t.value < 0 ? `- ${money(Math.abs(t.value))}` : money(t.value),
     kind: t.kind || 'normal',
+    /* Marks the row the per-rate CGST/SGST lines are printed UNDER.
+       ─────────────────────────────────────────────────────────────────────
+       Themes used to test `t.key === 'gst'` for this. That worked only while
+       every document happened to carry a row with that key — and the moment a
+       customer invoice's "Total GST" row became "Taxable value", five themes
+       would have silently stopped printing CGST and SGST altogether. Nothing
+       would have errored; the tax would simply have been missing from the
+       invoice.
+
+       A flag says what is meant. The adapter decides which row the breakdown
+       belongs under — the taxable value on a customer invoice, the GST total
+       on a purchase invoice — and a theme never has to know the difference. */
+    taxAfter: !!t.taxAfter,
   }));
 }
 
@@ -347,7 +360,10 @@ function buildGstLines(doc) {
   const bk = doc.gstBreakup || { lines: [] };
   return (bk.lines || []).map(l => ({
     key: `${l.key}_${l.percent}`,
-    label: `${l.label} (${l.percent}%)`,
+    /* "CGST 9%", not "CGST (9%)" — it sits in a column of summary rows beside
+       "Taxable value" and "Grand Total", and brackets read as an aside there
+       rather than as the heading of a figure. */
+    label: `${l.label} ${l.percent}%`,
     value: money(l.amount),
   }));
 }
@@ -480,7 +496,85 @@ function buildBlocks(doc) {
     // trusted" is exactly the assumption that rots. Escaping is free and
     // base64/data-URI characters are untouched by it.
     qrDataUri: (b.showQr && doc.qrDataUri) ? esc(doc.qrDataUri) : null,
+
+    /* Ways to pay. Not gated on showQr — the document QR ("Track Your Order")
+       and a payment code answer different questions, and a workshop that turns
+       the tracking QR off has not thereby said it will not take money.
+       utils/renderDocument decides whether these exist at all; by the time a
+       theme sees them the balance test has already been made. */
+    payQrDataUri: doc.payQrDataUri ? esc(doc.payQrDataUri) : null,
+    payUrl:       doc.payUrl ? esc(doc.payUrl) : null,
+    payButton:    !!doc.payButton,
+    upiQrDataUri: doc.upiQrDataUri ? esc(doc.upiQrDataUri) : null,
+    upiVpa:       doc.upiVpa ? esc(doc.upiVpa) : null,
   };
+}
+
+/**
+ * The "how to pay this" strip, or '' when neither way is switched on.
+ *
+ * ONE function for all seven themes, with its styling INLINE rather than in
+ * each theme's stylesheet. That is deliberate: seven copies of a QR block is
+ * how the print layouts drifted apart the last time, and this block has to be
+ * legible on every one of them without inheriting a theme's table rules.
+ *
+ * The codes are sized in mm, not px. A QR has an absolute physical floor —
+ * roughly 10mm before a phone camera stops resolving it — and px would be
+ * scaled by the A5 page zoom into something no one can scan. advanced_gst.js
+ * already learned this; the units here are the same lesson stated once.
+ *
+ * `break-inside: avoid` because a payment code split across a page break is
+ * not a payment code.
+ */
+function payBlockHtml(blocks, { align = 'left' } = {}) {
+  const b = blocks || {};
+  const online = b.payQrDataUri;
+  const button = b.payButton && b.payUrl;
+  const upi = b.upiQrDataUri;
+  if (!online && !upi && !button) return '';
+
+  const cell = (img, heading, sub) => `
+    <div style="text-align:center;min-width:22mm;">
+      ${img ? `<img src="${img}" alt="" style="width:18mm;height:18mm;display:block;margin:0 auto 1mm;image-rendering:pixelated;" />` : ''}
+      <div style="font-size:7.5pt;font-weight:700;line-height:1.2;">${heading}</div>
+      ${sub ? `<div style="font-size:6pt;color:#666;line-height:1.25;word-break:break-word;max-width:24mm;margin:0 auto;">${sub}</div>` : ''}
+    </div>`;
+
+  const cells = [];
+  // "Scan to Pay" over the gateway code, never "Pay Now" — somebody holding
+  // paper cannot press anything, and a paper button is a thing people report
+  // as broken.
+  if (online) cells.push(cell(b.payQrDataUri, 'Scan to Pay', 'Card · UPI · Bank'));
+  if (upi) cells.push(cell(b.upiQrDataUri, 'Pay by UPI', b.upiVpa));
+
+  /* THE BUTTON — a real PDF link, not a picture of one.
+     Puppeteer turns an <a href> into a live annotation in the PDF, so this is
+     tappable in WhatsApp, in Gmail and in every PDF reader. On paper it is
+     just a green box with a web address under it, which is why the address is
+     printed as text: it is the only part of a button that survives a printer.
+
+     background AND border, because a PDF reader that ignores background
+     colours would otherwise render white text on white. The border keeps the
+     label readable in that case; -webkit-print-color-adjust asks Chrome not
+     to drop the fill in the first place. */
+  const buttonHtml = button ? `
+    <div style="min-width:36mm;">
+      <a href="${b.payUrl}" style="display:inline-block;padding:2mm 5mm;border-radius:1.6mm;background:#16b994;border:0.4mm solid #0f8268;color:#ffffff;font-size:9pt;font-weight:700;text-decoration:none;-webkit-print-color-adjust:exact;print-color-adjust:exact;">Pay Now</a>
+      <div style="font-size:6pt;color:#666;margin-top:1.2mm;word-break:break-all;max-width:44mm;">${b.payUrl}</div>
+    </div>` : '';
+
+  /* Its own heading and rule, rather than borrowing the calling theme's block
+     shell. Seven themes name that shell seven different ways (.blk, .block,
+     .block-box, .bill-box), and threading a class name through would put the
+     one piece of this that must never be missing at the mercy of a typo in a
+     template that only fails at render time. */
+  return `
+  <div class="paynow-blk" style="margin-top:3mm;break-inside:avoid;page-break-inside:avoid;text-align:${align === 'right' ? 'right' : 'left'};">
+    <div style="font-size:8pt;font-weight:700;letter-spacing:.02em;margin-bottom:1.5mm;">How to Pay</div>
+    <div style="display:flex;gap:6mm;align-items:center;justify-content:${align === 'right' ? 'flex-end' : 'flex-start'};">
+      ${cells.join('')}${buttonHtml}
+    </div>
+  </div>`;
 }
 
 /** Footer contact line, honouring the icons toggle (emoji depend on the print device's fonts). */
@@ -567,6 +661,7 @@ function grandTotalOf(doc) {
 }
 
 module.exports = {
+  payBlockHtml,
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildHsnSummary, buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, isFree,

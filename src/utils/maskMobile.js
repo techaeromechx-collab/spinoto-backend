@@ -28,22 +28,28 @@ const { isHubUser } = require('./hubScope');
 const MASKED_KEYS = new Set(['mobile', 'whatsapp']);
 
 /**
- * '9838212345' → '98382xxxxx'
+ * '9838212345' → '+91 98*** **345'
  *
- * Keeps the first five digits, which is enough for a human to recognise a
- * number they already know, and hides the rest.
+ * Shows the first TWO digits and the last THREE. Five digits either way, same
+ * as the '98382xxxxx' form this replaces, but split across both ends — the last
+ * three are what somebody reads back off a screen to confirm they have the
+ * right customer, and the leading pair still says which operator block it is.
+ *
+ * Five hidden digits in the middle is 100,000 possibilities; revealing the tail
+ * instead of extending the head does not narrow that.
  */
 function maskMobile(value) {
   if (value == null || value === '') return value;
   const digits = String(value).replace(/\D/g, '');
   // Anything that is not a recognisable Indian mobile is masked WHOLE rather
   // than passed through. A number stored in an unexpected shape is exactly the
-  // case where "leave it alone" quietly leaks it.
-  if (digits.length < 10) return 'xxxxxxxxxx';
+  // case where "leave it alone" quietly leaks it. Same visual shape as a real
+  // one, so a hub sees a masked number rather than something that looks broken.
+  if (digits.length < 10) return '+91 ***** *****';
   // slice(-10) so a stored 91-prefixed number masks the same as a bare one,
-  // instead of showing '91983' and hiding a digit that was never secret.
-  const last10 = digits.slice(-10);
-  return `${last10.slice(0, 5)}xxxxx`;
+  // instead of treating the country code as part of the number.
+  const d = digits.slice(-10);
+  return `+91 ${d.slice(0, 2)}*** **${d.slice(-3)}`;
 }
 
 /**

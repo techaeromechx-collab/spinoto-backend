@@ -920,12 +920,89 @@ async function getLeadsOverTime(req, res, next) {
 // two numbers are meant to reconcile now, not just both be "some kind of
 // margin". Revenue/Collected/Total PI Amount/Outstanding to Hub are a
 // separate, broader calculation (see below) and are unaffected by this.
+// ── Vehicle type, resolved the SAME way the Customer Invoices list does ──────
+//
+// There is no vehicle_type column on customer_invoices. The type lives on the
+// appointment, or — for a standalone estimate with no appointment — on the
+// estimate's own copy of the vehicle columns (migration 082).
+//
+// THE ORDER MATTERS AND IS NOT ARBITRARY. Migration 082's header states it:
+// when estimates.appointment_id IS NOT NULL the estimate's own vehicle columns
+// are left NULL and the appointment remains the source of truth. So a join on
+// e.vehicle_type_id alone returns NULL for every appointment-based job — which
+// is most real data — and this report would show almost everything as "Not
+// set" while looking like it worked.
+//
+// COALESCE(a.vehicle_type_id, e.vehicle_type_id) is copied verbatim from
+// customer_invoices.controller.js's CI_SELECT, deliberately: the hub name in
+// this report links straight to that list, and a report whose split disagrees
+// with the page it links to is worse than no split at all.
+const CI_VTYPE_JOINS = `
+       LEFT JOIN appointments  a_vt ON a_vt.id = ci.appointment_id
+       LEFT JOIN estimates     e_vt ON e_vt.id = ci.estimate_id
+       LEFT JOIN vehicle_types vt   ON vt.id   = COALESCE(a_vt.vehicle_type_id, e_vt.vehicle_type_id)`;
+const CI_VTYPE_ID = `COALESCE(a_vt.vehicle_type_id, e_vt.vehicle_type_id)`;
+
+// Same resolution for the purchase-invoice side. A PI has no appointment_id of
+// its own, so it reaches the appointment THROUGH its estimate. That still lands
+// on the same appointment: customer_invoices.appointment_id is written from
+// est.appointment_id when the invoice is generated (customer_invoices
+// .controller.js), so both halves of this report resolve to one type per job
+// and "our take" can be trusted to sit in the same bucket as the revenue it
+// came from.
+const PI_VTYPE_JOINS = `
+       LEFT JOIN estimates     e_vt ON e_vt.id = pi.estimate_id
+       LEFT JOIN appointments  a_vt ON a_vt.id = e_vt.appointment_id
+       LEFT JOIN vehicle_types vt   ON vt.id   = COALESCE(a_vt.vehicle_type_id, e_vt.vehicle_type_id)`;
+const PI_VTYPE_ID = CI_VTYPE_ID;
+
+// One key space for both queries and for the client. `none` is the bucket for
+// a job whose vehicle type was never recorded — kept VISIBLE rather than
+// dropped, so 2W + 4W + Not set always equals the total on screen. A split that
+// silently omits rows gets reported as a bug in the totals, every time.
+const NO_VTYPE_KEY = 'none';
+const NO_VTYPE_LABEL = 'Not set';
+const vtypeKey = (id) => (id === null || id === undefined ? NO_VTYPE_KEY : String(id));
+
+// The numeric fields, named explicitly. NOT derived with Object.keys(dst) at
+// add time: a hub row is a metrics object with hub_id, hub_name and by_type
+// alongside the numbers, and iterating its own keys made the adder do
+// `hub_name += 0` — turning "Bodakdev Motors" into "Bodakdev Motors00" and
+// by_type into a string, which then iterated as characters and produced a
+// total_by_type keyed 0..17 with every figure zero. An explicit list is the
+// difference between summing metrics and summing whatever the object happens
+// to carry.
+const METRIC_KEYS = [
+  'invoice_count', 'revenue', 'collected',
+  'hub_payable', 'hub_payable_approved', 'outstanding_to_hub',
+  'our_take', 'our_take_est',
+];
+
+/** A zero row. One definition, so every accumulator starts with the same keys. */
+function emptyMetrics() {
+  const m = {};
+  for (const k of METRIC_KEYS) m[k] = 0;
+  return m;
+}
+
+/** Adds `src` into `dst` in place. Used to roll type rows up to hub, and hub
+ *  rows up to the grand total — the SAME function for both, which is why the
+ *  parts cannot fail to sum to the whole. */
+function addMetrics(dst, src) {
+  for (const k of METRIC_KEYS) dst[k] = (dst[k] || 0) + (src[k] || 0);
+  return dst;
+}
+
 async function getHubRevenue(req, res, next) {
   try {
     const { from, to } = req.query;
     const hubId = req.query.hub_id ? Number(req.query.hub_id) : null;
 
     // ── Query A: revenue-side numbers, driven by customer_invoices ──────────
+    // Grouped by (hub, vehicle type) rather than by hub alone. The per-hub and
+    // grand totals are then summed from these rows in JS instead of being a
+    // second query — SUM is associative, so "All vehicles" is by construction
+    // exactly the sum of its parts and the two can never drift.
     const paramsA = [];
     const whereA = [`ci.status != 'cancelled'`];
     const dateWhereA = dateParams(from, to, paramsA, 'ci.invoice_date');
@@ -936,6 +1013,8 @@ async function getHubRevenue(req, res, next) {
       `SELECT
          ci.hub_id,
          COALESCE(h.hub_name, 'No hub') AS hub_name,
+         ${CI_VTYPE_ID}                 AS vtype_id,
+         vt.name                        AS vtype_name,
          COUNT(*)::int                  AS invoice_count,
          COALESCE(SUM(ci.grand_total), 0)::numeric(14,2) AS revenue,
          COALESCE(SUM(ci.amount_paid), 0)::numeric(14,2) AS collected,
@@ -951,21 +1030,22 @@ async function getHubRevenue(req, res, next) {
          -- overpaid/adjusted PI never shows as negative).
          COALESCE(SUM(GREATEST(pi.grand_total - COALESCE(pi.amount_paid, 0), 0)), 0)::numeric(14,2) AS outstanding_to_hub
        FROM customer_invoices ci
-       LEFT JOIN hubs h ON h.id = ci.hub_id
+       LEFT JOIN hubs h ON h.id = ci.hub_id${CI_VTYPE_JOINS}
        LEFT JOIN LATERAL (
          SELECT grand_total, amount_paid, status FROM purchase_invoices
          WHERE estimate_id = ci.estimate_id
          ORDER BY id DESC LIMIT 1
        ) pi ON TRUE
        WHERE ${whereA.join(' AND ')}
-       GROUP BY ci.hub_id, h.hub_name`,
+       GROUP BY ci.hub_id, h.hub_name, ${CI_VTYPE_ID}, vt.name`,
       paramsA
     );
 
     // ── Query B: "our take", matching Payouts' Total Take Rate formula ──────
-    // Grouped by the purchase invoice's own hub_id (not the CI's), filtered
-    // by pi.invoice_date so it still respects the report's date range/hub
-    // filter — Payouts itself has no date filter, but this report does.
+    // Grouped by the purchase invoice's own hub_id (not the CI's) AND by
+    // vehicle type, filtered by pi.invoice_date so it still respects the
+    // report's date range/hub filter — Payouts itself has no date filter, but
+    // this report does.
     const paramsB = [];
     const whereB = [`pi.status = 'approved'`, `pi.rate_mode = 'tech_rate'`];
     const dateWhereB = dateParams(from, to, paramsB, 'pi.invoice_date');
@@ -976,76 +1056,125 @@ async function getHubRevenue(req, res, next) {
       `SELECT
          pi.hub_id,
          COALESCE(h.hub_name, 'No hub') AS hub_name,
+         ${PI_VTYPE_ID}                 AS vtype_id,
+         vt.name                        AS vtype_name,
          COALESCE(SUM((pii.customer_rate - pii.hub_rate) * pii.quantity * (1 + pii.gst_percent / 100)), 0)::numeric(14,2) AS our_take
        FROM purchase_invoice_items pii
        JOIN purchase_invoices pi ON pi.id = pii.purchase_invoice_id
-       LEFT JOIN hubs h ON h.id = pi.hub_id
+       LEFT JOIN hubs h ON h.id = pi.hub_id${PI_VTYPE_JOINS}
        WHERE ${whereB.join(' AND ')}
-       GROUP BY pi.hub_id, h.hub_name`,
+       GROUP BY pi.hub_id, h.hub_name, ${PI_VTYPE_ID}, vt.name`,
       paramsB
     );
 
-    // ── Merge both, keyed by hub_id (null-hub rows merge under the same key) ─
+    // ── Query C: the bucket list ────────────────────────────────────────────
+    // Read from the master table, not from the rows above, so the toggle shows
+    // every type the business actually has — including one with no invoices in
+    // this date range, which is itself information ("we did no 2W work in
+    // August"). An empty column is more honest than a missing one.
+    const typesRes = await pool.query(
+      `SELECT id, name FROM vehicle_types ORDER BY name`);
+
+    // ── Merge, keyed by hub then by vehicle type ────────────────────────────
     const merged = new Map();
     const keyOf = (hid) => (hid === null || hid === undefined ? 'none' : String(hid));
+
+    // Names seen in the DATA, so a type that was renamed or deactivated after
+    // the invoices were raised still gets a label instead of showing as a bare
+    // id the reader cannot interpret.
+    const seenTypeNames = new Map();
+
+    function hubBucket(hubIdVal, hubName) {
+      const key = keyOf(hubIdVal);
+      let row = merged.get(key);
+      if (!row) {
+        row = { hub_id: hubIdVal, hub_name: hubName, by_type: {}, ...emptyMetrics() };
+        merged.set(key, row);
+      }
+      return row;
+    }
+
+    function typeBucket(hubRow, vId, vName) {
+      const k = vtypeKey(vId);
+      if (vId !== null && vId !== undefined && vName) seenTypeNames.set(String(vId), vName);
+      if (!hubRow.by_type[k]) hubRow.by_type[k] = emptyMetrics();
+      return hubRow.by_type[k];
+    }
+
     for (const row of revRes.rows) {
-      merged.set(keyOf(row.hub_id), {
-        hub_id: row.hub_id,
-        hub_name: row.hub_name,
+      const hub = hubBucket(row.hub_id, row.hub_name);
+      addMetrics(typeBucket(hub, row.vtype_id, row.vtype_name), {
         invoice_count: row.invoice_count,
         revenue: Number(row.revenue),
         collected: Number(row.collected),
         hub_payable: Number(row.hub_payable),
         hub_payable_approved: Number(row.hub_payable_approved),
         outstanding_to_hub: Number(row.outstanding_to_hub),
-        our_take: 0,
       });
     }
+
     for (const row of takeRes.rows) {
-      const key = keyOf(row.hub_id);
-      const existing = merged.get(key);
-      if (existing) {
-        existing.our_take = Number(row.our_take);
-      } else {
-        merged.set(key, {
-          hub_id: row.hub_id,
-          hub_name: row.hub_name,
-          invoice_count: 0,
-          revenue: 0,
-          collected: 0,
-          hub_payable: 0,
-          hub_payable_approved: 0,
-          outstanding_to_hub: 0,
-          our_take: Number(row.our_take),
-        });
-      }
+      const hub = hubBucket(row.hub_id, row.hub_name);
+      addMetrics(typeBucket(hub, row.vtype_id, row.vtype_name), {
+        our_take: Number(row.our_take),
+      });
     }
 
     // "All-modes estimate" = the simple Revenue − Total PI Amount figure this
     // report showed before "Our take" was changed to match Payouts exactly.
     // Kept alongside it as a rougher, broader estimate — includes commission
     // jobs and non-approved PIs, unlike the Payouts-matching "our_take".
-    for (const row of merged.values()) {
-      row.our_take_est = row.revenue - row.hub_payable;
+    //
+    // Computed PER TYPE and then rolled up, not on the rolled-up hub figure.
+    // Identical arithmetic either way (both are a difference of sums), but
+    // doing it here means the per-type card and the hub row are the same
+    // number added up, not two independent calculations that happen to agree.
+    for (const hub of merged.values()) {
+      for (const t of Object.values(hub.by_type)) {
+        t.our_take_est = t.revenue - t.hub_payable;
+      }
+      // Roll every type up into the hub's own totals — this is what the
+      // existing per-hub table and CSV read, so their numbers are unchanged.
+      for (const t of Object.values(hub.by_type)) addMetrics(hub, t);
     }
 
-    const items = [...merged.values()].sort((a, b) => b.revenue - a.revenue || a.hub_name.localeCompare(b.hub_name));
+    const items = [...merged.values()]
+      .sort((a, b) => b.revenue - a.revenue || a.hub_name.localeCompare(b.hub_name));
 
-    const total = items.reduce(
-      (acc, row) => ({
-        revenue:              acc.revenue + row.revenue,
-        collected:            acc.collected + row.collected,
-        hub_payable:          acc.hub_payable + row.hub_payable,
-        hub_payable_approved: acc.hub_payable_approved + row.hub_payable_approved,
-        our_take:             acc.our_take + row.our_take,
-        our_take_est:         acc.our_take_est + row.our_take_est,
-        outstanding_to_hub: acc.outstanding_to_hub + row.outstanding_to_hub,
-        invoice_count:      acc.invoice_count + row.invoice_count,
-      }),
-      { revenue: 0, collected: 0, hub_payable: 0, hub_payable_approved: 0, our_take: 0, our_take_est: 0, outstanding_to_hub: 0, invoice_count: 0 }
-    );
+    // Grand total, rolled up from the hub rows with the same adder.
+    const total = items.reduce((acc, row) => addMetrics(acc, row), emptyMetrics());
 
-    res.json({ items, total });
+    // Grand total per vehicle type — what the "By vehicle type" card reads.
+    const total_by_type = {};
+    for (const row of items) {
+      for (const [k, t] of Object.entries(row.by_type)) {
+        if (!total_by_type[k]) total_by_type[k] = emptyMetrics();
+        addMetrics(total_by_type[k], t);
+      }
+    }
+
+    // The bucket list the client renders as a toggle. Master-table order, then
+    // "Not set" last — it is a data-quality bucket, not a kind of vehicle, and
+    // putting it between real types reads like one.
+    const vehicle_types = typesRes.rows.map(t => ({
+      key: String(t.id),
+      id: t.id,
+      name: seenTypeNames.get(String(t.id)) || t.name,
+    }));
+    // A type present in the data but missing from the master table (deleted
+    // after the fact) would otherwise vanish from the toggle while still
+    // counting in the totals — the exact drift this whole endpoint is meant
+    // to avoid. Append it rather than lose it.
+    for (const [id, name] of seenTypeNames) {
+      if (!vehicle_types.some(v => v.key === id)) {
+        vehicle_types.push({ key: id, id: Number(id), name });
+      }
+    }
+    if (total_by_type[NO_VTYPE_KEY]) {
+      vehicle_types.push({ key: NO_VTYPE_KEY, id: null, name: NO_VTYPE_LABEL });
+    }
+
+    res.json({ items, total, vehicle_types, total_by_type });
   } catch (err) { next(err); }
 }
 

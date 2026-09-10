@@ -20,6 +20,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 // Maps docShared's semantic alignment onto this theme's CSS classes.
@@ -160,7 +161,7 @@ function render({ doc, cfg, pageSize }) {
   <div class="totals">
     ${totals.map(t => {
       const cl = t.kind === 'grand' ? 'grand' : t.kind === 'strong' ? 'strong' : '';
-      const gst = t.key === 'gst' && gstLines.length
+      const gst = t.taxAfter && gstLines.length
         ? gstLines.map(g => `<div class="line gst-line"><span>${g.label}</span><span>₹ ${g.value}</span></div>`).join('')
         : '';
       return `<div class="line ${cl}"><span>${t.label}</span><span>₹ ${t.value}</span></div>${gst}`;
@@ -206,6 +207,7 @@ function render({ doc, cfg, pageSize }) {
     </table>
   </div>` : ''}
 
+  ${payBlockHtml(blocks)}
   ${(blocks.terms || blocks.bankDetails || blocks.signature) ? `
   <div class="blocks">
     <div class="bk">

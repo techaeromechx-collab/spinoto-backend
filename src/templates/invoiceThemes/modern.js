@@ -23,6 +23,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 const cls = (align) => (align === 'c' ? 'c' : align === 'r' ? 'r' : '');
@@ -79,7 +80,17 @@ function render({ doc, cfg, pageSize }) {
 
   // The per-rate tax breakup replaces the single GST line; the grand total
   // gets the boxed emphasis; anything else (paid, balance) follows it.
-  const taxable = totals.find(t => t.key === 'subtotal');
+  /* The FIRST summary row, printed with its own label.
+     ────────────────────────────────────────────────────────────────────────
+     This was hard-coded as "Taxable Amount" while reading the subtotal row's
+     value. That held while the row was "Subtotal (ex-GST)"; once it became
+     "Items (incl. GST) ₹9,750.00" this theme went on calling ₹9,750 the
+     taxable amount — the pre-discount figure INCLUDING tax, labelled as the
+     value tax is charged on. A label a theme owns and a value the adapter owns
+     will eventually describe different things. */
+  const summaryTop  = totals.find(t => t.key === 'subtotal');
+  // The row the per-rate tax lines print under — the real taxable value.
+  const taxAnchor   = totals.find(t => t.taxAfter);
   const grand   = totals.find(t => t.key === 'grand');
   /* round_off is pulled out of `rest` deliberately. `rest` renders BELOW the
      grand total, which is right for what it holds — discount, advance, paid,
@@ -87,7 +98,13 @@ function render({ doc, cfg, pageSize }) {
      the opposite: it is one of the figures the grand total is made OF, so it
      has to appear above it or the column does not add up. */
   const roundOff = totals.find(t => t.key === 'round_off');
-  const rest    = totals.filter(t => !['subtotal', 'gst', 'grand', 'round_off'].includes(t.key));
+  /* Excludes the rows rendered ABOVE the grand total. The tax-anchor row is
+     matched by its flag rather than by a key name — see docShared.buildTotals
+     for why a hard-coded 'gst' would have silently dropped the tax lines. */
+  const discountRow = totals.find(t => t.key === 'discount');
+  /* Everything rendered BELOW the grand total — paid, balance. The rows above
+     it are pulled out by name, so they are excluded here. */
+  const rest    = totals.filter(t => !t.taxAfter && !['subtotal', 'discount', 'grand', 'round_off'].includes(t.key));
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -226,6 +243,7 @@ function render({ doc, cfg, pageSize }) {
 
       ${blocks.terms ? `<div class="blk"><div class="h">Terms and Conditions</div><div class="body">${blocks.terms}</div></div>` : ''}
 
+      ${payBlockHtml(blocks)}
       ${blocks.bankRows.length ? `
       <div class="blk">
         <div class="h">Bank Details</div>
@@ -247,7 +265,9 @@ function render({ doc, cfg, pageSize }) {
     </div>
 
     <div class="foot-right">
-      ${taxable ? `<div class="tot-row"><span class="k">Taxable Amount</span><span>₹ ${taxable.value}</span></div>` : ''}
+      ${summaryTop ? `<div class="tot-row"><span class="k">${summaryTop.label}</span><span>₹ ${summaryTop.value}</span></div>` : ''}
+      ${discountRow ? `<div class="tot-row"><span class="k">${discountRow.label}</span><span>₹ ${discountRow.value}</span></div>` : ''}
+      ${taxAnchor ? `<div class="tot-row"><span class="k">${taxAnchor.label}</span><span>₹ ${taxAnchor.value}</span></div>` : ''}
       ${gstLines.map(g => `<div class="tot-row"><span class="k">${g.label}</span><span>₹ ${g.value}</span></div>`).join('')}
       ${roundOff ? `<div class="tot-row"><span class="k">${roundOff.label}</span><span>₹ ${roundOff.value}</span></div>` : ''}
       ${grand ? `<div class="tot-grand"><span>Total Amount</span><span>₹ ${grand.value}</span></div>` : ''}

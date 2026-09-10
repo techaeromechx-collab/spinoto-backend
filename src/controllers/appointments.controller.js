@@ -18,6 +18,7 @@ const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
 const { upsertCustomerVehicle } = require('../utils/customerVehicle');
 const { hubScopeSql, assertHubOwns } = require('../utils/hubScope');
+const { notifyHubAppointment } = require('../utils/hubNotify');
 
 // ─── Hub schedule validator ───────────────────────────────────────────────────
 // Returns { status, code, error } if the scheduled slot violates hub hours/days,
@@ -664,6 +665,23 @@ function createAppointment(req, res, next) {
       appt.services = await _getServices(apptId);
 
       logActivity({ userId: req.user?.id, userName: req.user?.name, action: 'CREATE', entity: 'appointment', entityId: apptId, description: `Created appointment for ${data.customer_name || data.mobile} on ${data.scheduled_date}` });
+
+      /* Tell the hub a job just landed on its bench.
+         AFTER the commit and deliberately NOT awaited: the appointment is
+         saved, and a push provider having a bad day must not turn a successful
+         booking into a 500. notifyHubAppointment swallows its own errors too —
+         belt and braces, because this is the last thing between here and the
+         response. */
+      notifyHubAppointment(pool, {
+        hubId:         appt.hub_id,
+        actorHubId:    req.user?.hub_id,   // the hub booking its own work says nothing
+        kind:          'created',
+        appointmentId: apptId,
+        customer:      appt.customer_name,
+        vehicle:       appt.vehicle_number,
+        when:          [appt.scheduled_date, appt.scheduled_time].filter(Boolean).join(' '),
+      });
+
       return res.status(201).json({ item: appt });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -1031,6 +1049,7 @@ function getAppointment(req, res, next) {
     // then delegates here.
     assertHubOwns(req, appt, 'hub_id', 'Appointment');
     appt.services = await _getServices(id);
+    appt.reschedules = await _getReschedules(id);
     return res.json({ item: appt });
   });
 }
@@ -1059,6 +1078,18 @@ async function _assertApptHub(req, id) {
   if (!req.user?.hub_id) return;
   const r = await pool.query(`SELECT hub_id FROM appointments WHERE id = $1`, [id]);
   assertHubOwns(req, r.rows[0], 'hub_id', 'Appointment');
+}
+
+/**
+ * 'HH:MM' out of either 'HH:MM' or Postgres's 'HH:MM:SS'. Null-safe.
+ *
+ * scheduled_time is a TIME column, so node-pg hands it back as '13:00:00'. The
+ * API's zod schema accepts only 'HH:MM' and the modal sends exactly that. The
+ * two sides are therefore never string-equal even when the appointment has not
+ * moved, which is why every comparison of them has to normalise first.
+ */
+function hhmm(v) {
+  return v === null || v === undefined || v === '' ? '' : String(v).slice(0, 5);
 }
 
 async function checkIsTerminal(id) {
@@ -1093,11 +1124,50 @@ function updateAppointment(req, res, next) {
     //
     // Only when a status change was actually requested — an ordinary edit that
     // never mentions status_id must not pay for a query it will not use.
+    /* Widened from `SELECT status_id` and no longer gated on a status change.
+       The hub notification below has to answer "was this MOVED" as well as
+       "was it cancelled", and a date cannot be compared to a value nobody
+       read. One row by primary key; the edit itself is far more expensive. */
     let prevStatusId = null;
-    if (data.status_id !== undefined) {
-      const prev = await pool.query('SELECT status_id FROM appointments WHERE id = $1', [id]);
-      prevStatusId = prev.rows[0]?.status_id ?? null;
+    let prevRow = null;
+    {
+      const prev = await pool.query(
+        `SELECT status_id, hub_id, scheduled_date::text AS scheduled_date, scheduled_time,
+                customer_name, vehicle_number
+           FROM appointments WHERE id = $1`,
+        [id]
+      );
+      prevRow = prev.rows[0] || null;
+      prevStatusId = prevRow?.status_id ?? null;
     }
+
+    /* ── Did the slot actually MOVE? ──────────────────────────────────────
+       Asked once, here, because four separate things downstream need the
+       answer: the original-slot snapshot, the new history row, the hub's
+       "moved" notification and the customer's reschedule message. Each used to
+       decide for itself, and they did not agree with each other.
+
+       PRESENCE IS NOT MOVEMENT. scheduled_date arrives on every save from the
+       edit form, unchanged, so a test of "was the field sent" calls an edit
+       that only touched the notes a reschedule.
+
+       And the two sides are not written the same way: Postgres returns TIME as
+       '13:00:00' while the API accepts, and the modal sends, '13:00'. Compared
+       raw those never match, so the old test treated every save carrying a time
+       as a move — which is how the hub came to be told a job had been
+       rescheduled when nothing had. hhmm() puts both sides in one shape first.
+       The date needs no such help: prevRow selects scheduled_date::text, so
+       both sides are already 'YYYY-MM-DD'. */
+    const nextDate = data.scheduled_date !== undefined ? data.scheduled_date : prevRow?.scheduled_date;
+    const nextTime = data.scheduled_time !== undefined ? data.scheduled_time : prevRow?.scheduled_time;
+    const slotMoved = !!prevRow && (
+      String(nextDate ?? '') !== String(prevRow.scheduled_date ?? '') ||
+      hhmm(nextTime) !== hhmm(prevRow.scheduled_time)
+    );
+
+    // Set by the auto-flip below when the server, not the caller, chooses the
+    // status. Read after the commit so the notification knows what was written.
+    let autoStatusId = null;
 
     if (data.status_id !== undefined) {
       const targetStatusRow = await pool.query(
@@ -1180,22 +1250,27 @@ function updateAppointment(req, res, next) {
     if (data.cc_category_id !== undefined) { params.push(data.cc_category_id); fields.push(`cc_category_id  = $${params.length}`); }
     if (data.segment_ids !== undefined) { params.push(data.segment_ids); fields.push(`segment_ids     = $${params.length}`); }
 
-    // When date/time is changing, capture the original values + who rescheduled + when
-    const isRescheduling = data.scheduled_date !== undefined || data.scheduled_time !== undefined;
-    if (isRescheduling && data.reschedule_reason !== undefined) {
-      const orig = await pool.query(
-        `SELECT scheduled_date, scheduled_time FROM appointments WHERE id = $1`, [id]
-      );
-      if (orig.rows[0]) {
-        const origDate = orig.rows[0].scheduled_date
-          ? new Date(orig.rows[0].scheduled_date).toISOString().slice(0, 10)
-          : null;
-        const origTime = orig.rows[0].scheduled_time || null;
-        params.push(origDate); fields.push(`original_scheduled_date = $${params.length}`);
-        params.push(origTime); fields.push(`original_scheduled_time = $${params.length}`);
-        params.push(req.user.id); fields.push(`rescheduled_by          = $${params.length}`);
-        params.push(new Date()); fields.push(`rescheduled_at          = $${params.length}`);
-      }
+    /* ── The previous slot, kept on the appointment itself ────────────────
+       Now keyed on the slot having MOVED rather than on a reason having been
+       typed. The old condition was `isRescheduling && reschedule_reason !==
+       undefined`: the modal makes the reason required so it held in practice,
+       but any other path that moves a date — an API client, a bulk edit, a drag
+       on a calendar — sends no reason and silently lost the audit trail. What
+       is being recorded is that the date changed. The reason is a note about
+       the move, not the thing that makes it one.
+
+       These four columns are deliberately kept: they hold the LATEST move, the
+       card already reads them, and nothing that depends on them has to change.
+       The full history goes to appointment_reschedules inside the transaction.
+
+       prevRow already holds both old values, so the extra SELECT this block
+       used to run is gone. */
+    const isRescheduling = slotMoved;
+    if (slotMoved) {
+      params.push(prevRow.scheduled_date);  fields.push(`original_scheduled_date = $${params.length}`);
+      params.push(prevRow.scheduled_time);  fields.push(`original_scheduled_time = $${params.length}`);
+      params.push(req.user.id);             fields.push(`rescheduled_by          = $${params.length}`);
+      params.push(new Date());              fields.push(`rescheduled_at          = $${params.length}`);
     }
 
     // Auto-set status to "rescheduled" when date or time is changed (and caller didn't explicitly set a status)
@@ -1211,7 +1286,8 @@ function updateAppointment(req, res, next) {
           `SELECT id FROM appointment_statuses WHERE slug = 'rescheduled' LIMIT 1`
         );
         if (rescRow.rows[0]) {
-          params.push(rescRow.rows[0].id);
+          autoStatusId = rescRow.rows[0].id;
+          params.push(autoStatusId);
           fields.push(`status_id = $${params.length}`);
         }
       }
@@ -1261,6 +1337,33 @@ function updateAppointment(req, res, next) {
         // has a shareable-URL identity too, so customer_token stays populated.
         if (data.mobile !== undefined) {
           await ensureCustomerIdentity(client, data.mobile);
+        }
+
+        /* ── One row per move, kept for ever ──────────────────────────────
+           original_scheduled_date is overwritten on every reschedule, so it
+           answers "where did this come from last time" and nothing else. Move
+           an appointment 10 Sep → 12 Sep → 15 Sep and the 10th is gone: the
+           card reads 12 → 15 with no trace that the customer was moved twice.
+
+           Written inside the same transaction as the UPDATE, so the history and
+           the appointment can never disagree — either both land or neither
+           does. A messaging or notification failure downstream cannot leave a
+           move recorded in one place and not the other. */
+        if (slotMoved) {
+          await client.query(
+            `INSERT INTO appointment_reschedules
+               (appointment_id, from_date, from_time, to_date, to_time,
+                reason, notes, rescheduled_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              id,
+              prevRow.scheduled_date, prevRow.scheduled_time,
+              nextDate, nextTime,
+              data.reschedule_reason ?? null,
+              data.reschedule_notes ?? null,
+              req.user.id,
+            ]
+          );
         }
       } else {
         // Confirm appointment exists even if only services are changing
@@ -1336,10 +1439,17 @@ function updateAppointment(req, res, next) {
     //
     // AFTER the commit, and never thrown. The status change is saved either
     // way, and a WhatsApp outage must not turn a successful edit into an error.
-    if (data.status_id !== undefined && data.status_id !== prevStatusId) {
+    /* The status that was actually WRITTEN, which is not always the one the
+       request carried. A reschedule sends no status_id and lets the auto-flip
+       above choose 'rescheduled' — and gating on data.status_id meant that path
+       reached the row but never the notification. Picking Rescheduled from the
+       dropdown messaged the customer; moving the date did not. Same status,
+       same customer, two outcomes, for no reason anybody chose. */
+    const writtenStatusId = data.status_id !== undefined ? data.status_id : autoStatusId;
+    if (writtenStatusId != null && writtenStatusId !== prevStatusId) {
       pool.query(
         'SELECT slug FROM appointment_statuses WHERE id = $1 AND is_system = TRUE',
-        [data.status_id]
+        [writtenStatusId]
       )
         // Only system statuses carry a slug. A custom status added in Master
         // Data has none, cannot be a trigger, and is not an error — there is
@@ -1349,9 +1459,62 @@ function updateAppointment(req, res, next) {
           console.error(`[whatsapp] status message for appt #${id} failed:`, err.message));
     }
 
+    /* ── The hub's copy: moved, or called off ──────────────────────────────
+       Two separate questions, both asked against prevRow, and a single edit can
+       answer yes to both — somebody who cancels and clears the date should get
+       one notification about each fact rather than a guess about which mattered.
+
+       Reschedule is compared on the DATE STRING. prevRow selects
+       scheduled_date::text so both sides are 'YYYY-MM-DD'; a timestamptz Date
+       object compared to the submitted string is never equal, which would
+       announce a reschedule on every save that touched anything at all.
+
+       Cancellation is read from the SLUG, not the name. A workshop that renames
+       "Cancelled" to "Called off" must not silently stop telling its hubs, and
+       slug is the column that does not move — the same reason the WhatsApp
+       trigger above reads it. */
+    if (prevRow) {
+      /* nextDate, nextTime and slotMoved are computed once at the top of this
+         handler — see the note there. This block used to derive them again and
+         compared a '13:00' from the request against a '13:00:00' from Postgres,
+         so it announced a reschedule to the hub on every save that carried a
+         time at all, whether or not anything had moved. */
+      const common = {
+        hubId:         prevRow.hub_id,
+        actorHubId:    req.user?.hub_id,
+        appointmentId: id,
+        customer:      prevRow.customer_name,
+        vehicle:       prevRow.vehicle_number,
+      };
+
+      if (slotMoved) {
+        notifyHubAppointment(pool, {
+          ...common,
+          kind: 'rescheduled',
+          when: [nextDate, nextTime].filter(Boolean).join(' '),
+        });
+      }
+
+      if (data.status_id !== undefined && data.status_id !== prevStatusId) {
+        pool.query('SELECT slug FROM appointment_statuses WHERE id = $1', [data.status_id])
+          .then(r => {
+            if (r.rows[0]?.slug === 'cancelled') {
+              notifyHubAppointment(pool, {
+                ...common,
+                kind: 'cancelled',
+                when: [prevRow.scheduled_date, prevRow.scheduled_time].filter(Boolean).join(' '),
+              });
+            }
+          })
+          .catch(err =>
+            console.error(`[hubNotify] cancel check for appt #${id} failed:`, err.message));
+      }
+    }
+
     const row = await pool.query(`${APPT_SELECT} WHERE a.id = $1`, [id]);
     const appt = row.rows[0];
     appt.services = await _getServices(id);
+    appt.reschedules = await _getReschedules(id);
 
     // ── Tell the customer their appointment moved ──────────────────────────
     //
@@ -1388,6 +1551,32 @@ function updateAppointment(req, res, next) {
 
     return res.json({ item: appt });
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper — every time this appointment's slot moved, oldest first
+//
+// Attached to the single-appointment reads only. The LIST does not carry it:
+// a page of 50 appointments would fan out into 50 more queries to render
+// something no list row shows.
+//
+// Oldest first so the rows read as the story they are — booked here, moved
+// there, moved again — rather than needing to be read upwards.
+// ─────────────────────────────────────────────────────────────────────────────
+async function _getReschedules(apptId) {
+  const r = await pool.query(
+    `SELECT ar.id,
+            TO_CHAR(ar.from_date, 'YYYY-MM-DD') AS from_date, ar.from_time,
+            TO_CHAR(ar.to_date,   'YYYY-MM-DD') AS to_date,   ar.to_time,
+            ar.reason, ar.notes, ar.rescheduled_at,
+            u.name AS rescheduled_by_name
+       FROM appointment_reschedules ar
+       LEFT JOIN users u ON u.id = ar.rescheduled_by
+      WHERE ar.appointment_id = $1
+      ORDER BY ar.rescheduled_at, ar.id`,
+    [apptId]
+  );
+  return r.rows;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -210,11 +210,17 @@ function tabCounts(req, res, next) {
 
     /* The page's agent picker, applied HERE as well as on the client.
 
-       The list is narrowed in the browser (`lead_assigned_to_id === agent`), so
-       without this the badges would keep counting the whole team while the rows
-       under them showed one person's — the precise failure a badge is supposed
-       to prevent. `l.assigned_to` is the column that alias comes from, so the
-       two tests are the same test.
+       assigned_to OR created_by — the SAME pair the visibility rule above uses,
+       and that matters. This page shows a lead to whoever created it or is
+       assigned it, so an agent's own unassigned leads legitimately appear on
+       their list. Narrowing the picker on assigned_to ALONE made exactly those
+       rows disappear the moment anybody was selected: "show me Kisha's
+       follow-ups" quietly dropped every lead Kisha had created and not yet
+       assigned, which is the subset most likely to need chasing.
+
+       Applied on the server as well as in the browser so the badge and the rows
+       under it count the same thing — the precise failure a badge exists to
+       prevent.
 
        Digits ONLY, tested on the whole string rather than trusting parseInt.
        parseInt('1; DROP TABLE leads') is 1 — harmless here because the value is
@@ -225,7 +231,7 @@ function tabCounts(req, res, next) {
     let agentSql = '';
     if (/^[1-9][0-9]*$/.test(rawAgent)) {
       args.push(Number(rawAgent));
-      agentSql = `AND l.assigned_to = $${args.length}`;
+      agentSql = `AND (l.assigned_to = $${args.length} OR l.created_by = $${args.length})`;
     }
 
     const r = await pool.query(
@@ -317,6 +323,12 @@ function listEvents(req, res, next) {
       l.mobile       AS lead_mobile,
       l.status       AS lead_current_status,
       l.assigned_to  AS lead_assigned_to_id,
+      /* The LEAD's creator — note cu below is the EVENT's creator, a different
+         person and a different question. Needed because this page shows a lead
+         to whoever created it OR is assigned it, so the agent picker has to
+         narrow on the same pair. Filtering on assigned_to alone made every
+         unassigned lead vanish the moment anybody was picked. */
+      l.created_by   AS lead_created_by_id,
       l.public_token AS lead_token,
       au.name        AS assigned_to_name,
       cu.name        AS created_by_name

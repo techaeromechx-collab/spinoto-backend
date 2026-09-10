@@ -35,6 +35,7 @@ const { staticLogoDataUri, inlineUploadUrl } = require('../utils/inlineImage');
 // The same calculator the estimate and invoice controllers use, so a document
 // re-costed at render time can never disagree with the totals stored for it.
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
+const { getDiscountBasis } = require('../utils/discountBasis');
 // Rounding is keyed on the row's created_at — see utils/math.js for why it must
 // never be keyed on a backdatable date.
 const { getRoundingFunction } = require('../utils/math');
@@ -329,14 +330,93 @@ function coverageLabel(src, kind) {
  * (estimate, customer invoice). A purchase invoice's hub rate is genuinely
  * ex-GST and is passed through untouched — see fromPurchaseInvoice.
  */
-function customerIncRate(src) {
+/**
+ * The rate column: what this line cost BEFORE any discount, per unit,
+ * inclusive of GST.
+ *
+ * Pre-discount on purpose. The row reads
+ *     Rate − Disc. = Amount
+ * and a reader checks it left to right; printing the discounted figure under
+ * "Rate" makes Rate and Amount the same number with a discount sitting between
+ * them, which reads as a mistake even though the total is right.
+ *
+ * txnShare is added for the same reason discount_amount is: both have already
+ * been taken out of total_inc_gst, so both have to go back in to recover the
+ * original. Zero on legacy documents, which therefore print exactly as before.
+ */
+function customerIncRate(src, txnShare = 0) {
   const qty = num(src.quantity);
   if (qty <= 0) return num(src.customer_rate);      // guard: never divide by 0
-  return (num(src.total_inc_gst) + num(src.discount_amount)) / qty;
+  return (num(src.total_inc_gst) + num(src.discount_amount) + num(txnShare)) / qty;
 }
 
 /** Normalise one line item. `rate` is whichever rate is this document's money column. */
-function itemFrom(src, { rate, total }) {
+/**
+ * A line's share of a WHOLE-BILL discount, in inclusive rupees.
+ *
+ * The apportionment is computed when the invoice is generated but only its
+ * RESULT is stored (total_inc_gst goes down); the share itself is not kept.
+ * Rather than add a column and a backfill, it is recovered here from figures
+ * that are stored, which cannot drift from them because it IS them:
+ *
+ *     gross line (inc)  = customer_rate × qty × (1 + rate/100)
+ *     share            = gross − line-item discount − total_inc_gst
+ *
+ * ONLY for documents on the inclusive basis. On the legacy basis the share is
+ * an ex-GST figure and this arithmetic would return it grossed up by the tax —
+ * a number that never appeared on that invoice. An issued document must print
+ * exactly what it printed, so those keep showing nothing, as they always have.
+ */
+function txnShareOf(src, basis) {
+  if (basis !== 'inclusive') return 0;
+  const qty  = num(src.quantity);
+  const rate = num(src.gst_percent);
+  const gross = num(src.customer_rate) * qty * (1 + rate / 100);
+  const share = gross - num(src.discount_amount) - num(src.total_inc_gst);
+  // Rounding noise on an undiscounted line must not print as "− ₹0.00".
+  return share > 0.005 ? Math.round(share * 100) / 100 : 0;
+}
+
+/**
+ * The one-line disclosure that a discount is a GST-inclusive amount.
+ *
+ * Added as a META ROW rather than as markup in each theme. Every theme renders
+ * doc.meta generically through buildHeaderFields, so one entry here reaches all
+ * eight; a sentence hand-placed in eight stylesheets is eight places to forget,
+ * which is exactly what docShared's header warns about.
+ *
+ * Only on documents that actually carry a whole-bill discount under the
+ * inclusive rule. On an undiscounted invoice it would answer a question nobody
+ * asked, and on a legacy one it would be untrue.
+ */
+function inclusiveDiscountNote(basis, discount) {
+  return (basis === 'inclusive' && discount > 0)
+    ? [{ key: 'disc_basis', label: 'Note', value: 'Rates and discounts shown include GST' }]
+    : [];
+}
+
+/**
+ * "Discount (₹500)" / "Discount (10%)" — the label the SCREEN already uses.
+ *
+ * The bracketed figure is what somebody typed, not what came off: on a
+ * percentage bill those are different numbers, and stating the rule beside the
+ * amount is what lets a customer check one against the other. The print said
+ * only "Total Discount", so the two halves of the same product described the
+ * same row differently.
+ *
+ * Falls back to the plain wording for a line-item discount, where there is no
+ * single rule to name — each line carries its own.
+ */
+function discountLabel(row) {
+  if (row.discount_mode !== 'transaction') return 'Total Discount';
+  const type = row.transaction_discount_type;
+  const val  = num(row.transaction_discount_value);
+  if (!val) return 'Discount';
+  return type === 'percent' ? `Discount (${val}%)` : `Discount (₹${val})`;
+}
+
+function itemFrom(src, { rate, total, txnShare = 0 }) {
+  const lineDiscount = num(src.discount_amount);
   return {
     id: src.id,
     type: src.item_type,
@@ -345,7 +425,13 @@ function itemFrom(src, { rate, total }) {
     hsn: src.hsn_sac || '',
     qty: num(src.quantity),
     rate: num(rate),
-    discount: num(src.discount_amount),
+    /* Line-item discount PLUS this line's share of any whole-bill discount.
+       One number in the Disc. column, because that is what the column means to
+       a reader: what came off this line. Keeping them apart would need a ninth
+       column on an already-wide table to say something nobody asked. */
+    discount: lineDiscount + num(txnShare),
+    lineDiscount,
+    txnShare: num(txnShare),
     discountType: src.discount_type || null,
     discountValue: num(src.discount_value),
     gstPercent: num(src.gst_percent),
@@ -413,6 +499,7 @@ function fromEstimate(row, company, cfg) {
   const txType  = row.transaction_discount_type || null;
   const txValue = num(row.transaction_discount_value);
   const roundFn = getRoundingFunction(row.created_at);
+  const estBasis = getDiscountBasis(row.created_at);
 
   let items;
   if (row.discount_mode === 'transaction' && txValue > 0 && src.length) {
@@ -421,6 +508,10 @@ function fromEstimate(row, company, cfg) {
       discountType: txType,
       discountValue: txValue,
       roundFn,
+      /* row.created_at, exactly as roundFn above. This is a RENDER of a stored
+         document: reading today's rule here would make an old estimate print
+         a different total every time it was opened after the cutover. */
+      basis: estBasis,
     });
     items = src.map((i, idx) => {
       const line = spread.lines[idx];
@@ -428,10 +519,15 @@ function fromEstimate(row, company, cfg) {
       /* Rebuilt from the discounted taxable so the RATE column, the TAXABLE
          column and the tax all move together. Presented inc-GST, which is the
          column this document has always shown. */
-      const incRate = roundFn((line.taxable + line.gst) / qty);
+      /* Pre-discount, so the row reads Rate − Disc. = Amount. The share is
+         added back for the same reason it is on the customer invoice. */
+      const estShare = estBasis === 'inclusive' ? num(line.share) : 0;
+      const incRate = roundFn((line.taxable + line.gst + estShare) / qty);
       return itemFrom(
         { ...i, gst_amount: line.gst, total_inc_gst: roundFn(line.taxable + line.gst) },
-        { rate: incRate, total: roundFn(line.taxable + line.gst) },
+        { rate: incRate, total: roundFn(line.taxable + line.gst),
+          // Straight from the spread that just ran — no need to recover it.
+          txnShare: estShare },
       );
     });
   } else {
@@ -442,6 +538,7 @@ function fromEstimate(row, company, cfg) {
   const pos = resolvePlaceOfSupply(row, company);
   const interState = isInterState(company, pos.code);
 
+  const estDiscForNote = num(row.transaction_discount_amount);
   const meta = [
     { key: 'number', label: 'Est. No.', value: formatNumber(cfg, row.id) },
     // The estimate's own date (migration 101) — when the work happened,
@@ -453,6 +550,7 @@ function fromEstimate(row, company, cfg) {
     ...(cfg.header_fields.place_of_supply && pos.name
       ? [{ key: 'pos', label: 'Place of Supply', value: `${pos.code} — ${pos.name}` }] : []),
     ...customMeta(row, cfg),
+    ...inclusiveDiscountNote(estBasis, estDiscForNote),
   ];
 
   const hub = hubLabel(cfg, { legalName: row.hub_full_name, branchName: row.hub_name });
@@ -475,6 +573,14 @@ function fromEstimate(row, company, cfg) {
   const subtotal = discount
     ? Math.round((num(row.subtotal_ex_gst) + discount) * 100) / 100
     : num(row.subtotal_ex_gst);
+
+  /* What the customer was quoted before the discount. Derived from the grand
+     total rather than from subtotal_ex_gst + total_gst: those two are stored
+     to the paisa and re-adding them can land a hair off the figure printed as
+     the total, which is the one number on the page that must not be
+     approximate. An estimate carries no round-off. */
+  const inclusiveBasis = estBasis === 'inclusive';
+  const grossInc = Math.round((grand + discount) * 100) / 100;
 
   return {
     docType: 'estimate',
@@ -499,9 +605,30 @@ function fromEstimate(row, company, cfg) {
     meta,
     items,
     totals: totalsFrom([
-      { key: 'subtotal', label: 'Subtotal (ex-GST)', value: subtotal, kind: 'normal' },
-      discount ? { key: 'discount', label: 'Total Discount', value: -discount, kind: 'normal' } : null,
-      { key: 'gst',   label: 'Total GST',   value: totalGst, kind: 'normal' },
+      /* On the inclusive basis the top line is the price the customer was
+         quoted, GST and all — so `Items − Discount = Grand Total` is an
+         arithmetic anyone can do in their head, standing at the counter.
+
+         The ex-GST wording is kept for documents raised under the old rule,
+         where that subtraction does not hold and calling the figure
+         "inclusive" would be a lie about a number already issued. */
+      inclusiveBasis
+        ? { key: 'subtotal', label: 'Items (incl. GST)', value: grossInc, kind: 'normal' }
+        : { key: 'subtotal', label: 'Subtotal (ex-GST)', value: subtotal, kind: 'normal' },
+      discount ? { key: 'discount', label: discountLabel(row), value: -discount, kind: 'normal' } : null,
+      /* The taxable value, with the CGST/SGST lines printed under it.
+         ────────────────────────────────────────────────────────────────────
+         This row used to be "Total GST". It was replaced rather than added to
+         because the two say the same thing twice: the tax lines immediately
+         below already sum to the GST, and a reader adding the column now goes
+             taxable + CGST + SGST = grand total
+         which is the arithmetic on the face of a tax invoice. The taxable
+         value is also the figure that goes in the GST return, and it was
+         nowhere on the document before.
+
+         taxAfter, not a key named 'gst' — see docShared.buildTotals. */
+      { key: 'taxable', label: 'Taxable value', value: num(row.subtotal_ex_gst),
+        kind: 'normal', taxAfter: true },
       { key: 'grand', label: 'Grand Total', value: grand,    kind: 'grand'  },
     ]),
     gstBreakup: gstBreakupFrom(items, interState),
@@ -537,7 +664,13 @@ function advanceLabel(row) {
 
 function fromCustomerInvoice(row, company, cfg) {
   // Inc-GST list price, matching what the invoice screen shows.
-  const items = (row.items || []).map(i => itemFrom(i, { rate: customerIncRate(i), total: i.total_inc_gst }));
+  const ciBasis = getDiscountBasis(row.created_at);
+  const items = (row.items || []).map(i => {
+    const share = txnShareOf(i, ciBasis);
+    return itemFrom(i, {
+      rate: customerIncRate(i, share), total: i.total_inc_gst, txnShare: share,
+    });
+  });
 
   const pos = resolvePlaceOfSupply(row, company);
   const interState = isInterState(company, pos.code);
@@ -559,6 +692,7 @@ function fromCustomerInvoice(row, company, cfg) {
     ...(cfg.header_fields.place_of_supply && pos.name
       ? [{ key: 'pos', label: 'Place of Supply', value: `${pos.code} — ${pos.name}` }] : []),
     ...customMeta(row, cfg),
+    ...inclusiveDiscountNote(ciBasis, num(row.transaction_discount_amount)),
   ];
 
   const hub = hubLabel(cfg, { legalName: row.hub_full_name, branchName: row.hub_name });
@@ -588,6 +722,11 @@ function fromCustomerInvoice(row, company, cfg) {
   const subtotal = discount
     ? Math.round((num(row.subtotal_ex_gst) + discount) * 100) / 100
     : num(row.subtotal_ex_gst);
+
+  /* The pre-discount inclusive total. grand_total already has the whole-rupee
+     round-off inside it, so that is taken back out first — otherwise the
+     round-off would be counted twice: once here and again in its own row. */
+  const ciGrossInc = Math.round((grand - roundOff + discount) * 100) / 100;
 
   // ── The advance line, and the trap it exists to avoid ─────────────────────
   //
@@ -630,9 +769,22 @@ function fromCustomerInvoice(row, company, cfg) {
     viewerRole: cfg.viewerRole,
     accent: accentFrom(company),
     publicToken: row.public_token || null,
+    /* What is still owed, for the render pipeline alone — no theme reads it.
+       It is what decides whether this document prints a way to pay at all:
+       a Pay Now code on a settled invoice is an invitation to pay twice, and
+       the customer has no way to know it is stale. Already computed above for
+       the Balance Due row, so this costs nothing. */
+    payable: balance,
     // Filled in asynchronously by the render pipeline (utils/renderDocument)
     // because QR generation can't happen inside a synchronous template.
     qrDataUri: null,
+    // Same story, same reason. Null here rather than absent so the shape of
+    // this object never depends on a setting being on.
+    payQrDataUri: null,
+    payUrl: null,
+    payButton: false,
+    upiQrDataUri: null,
+    upiVpa: null,
     title: cfg.title,
     number: formatNumber(cfg, row.id),
     date: row.created_at,
@@ -648,9 +800,17 @@ function fromCustomerInvoice(row, company, cfg) {
     meta,
     items,
     totals: totalsFrom([
-      { key: 'subtotal', label: 'Subtotal (ex-GST)', value: subtotal, kind: 'normal' },
-      discount ? { key: 'discount', label: 'Total Discount', value: -discount, kind: 'normal' } : null,
-      { key: 'gst',     label: 'Total GST',   value: totalGst, kind: 'normal' },
+      /* Inclusive basis: the top line is what the customer was quoted, so
+         Items − Discount reaches the Grand Total below (allowing for the
+         round-off row, which is disclosed separately). See the same note on
+         the estimate. */
+      ciBasis === 'inclusive'
+        ? { key: 'subtotal', label: 'Items (incl. GST)', value: ciGrossInc, kind: 'normal' }
+        : { key: 'subtotal', label: 'Subtotal (ex-GST)', value: subtotal, kind: 'normal' },
+      discount ? { key: 'discount', label: discountLabel(row), value: -discount, kind: 'normal' } : null,
+      // Replaces "Total GST" — see the note on the estimate above.
+      { key: 'taxable', label: 'Taxable value', value: num(row.subtotal_ex_gst),
+        kind: 'normal', taxAfter: true },
       /* The whole-rupee round-off, printed as its own row so the block still
          reconciles: subtotal + GST + round-off = grand total. Without it the
          three numbers above would not add up to the one below — the exact
@@ -840,7 +1000,11 @@ function fromPurchaseInvoice(row, company, cfg) {
       { key: 'subtotal', label: isHubView ? (isTaxInvoice ? 'Subtotal (ex-GST)' : 'Subtotal') : 'Subtotal (hub ex-GST)', value: subtotal, kind: 'normal' },
       // Dropped entirely, not zeroed: a Bill of Supply showing "Total GST ₹0.00"
       // still reads as a document that considered charging tax.
-      ...(isTaxInvoice ? [{ key: 'gst', label: 'Total GST', value: totalGst, kind: 'normal' }] : []),
+      /* The purchase invoice keeps "Total GST": its Subtotal row is ALREADY the
+         hub's taxable value, so a second row saying so would repeat it. The
+         anchor flag still marks it, so the CGST/SGST lines print under it
+         exactly as before. */
+      ...(isTaxInvoice ? [{ key: 'gst', label: 'Total GST', value: totalGst, kind: 'normal', taxAfter: true }] : []),
       /* The whole-rupee round-off, printed as its own row so the block still
          reconciles: subtotal + GST + round-off = grand total. Without it the
          three numbers above would not add up to the one below — the exact

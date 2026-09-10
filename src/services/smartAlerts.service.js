@@ -265,6 +265,12 @@ async function fireDailyTargetAlerts(cfg = DEFAULT_ALERT_CFG) {
         ON la.created_by = u.id
         AND la.created_at >= CURRENT_DATE
       WHERE u.is_active = TRUE
+        /* Staff only. A hub-portal user (users.hub_id) works a bench, not a
+           pipeline — they never create lead_activities, so any target they were
+           given is unreachable by definition and the alert would fire forever.
+           daily_target > 0 already hid most of them; this says why rather than
+           leaving it to a column nobody thought to set. */
+        AND u.hub_id IS NULL
         AND u.daily_target > 0
       GROUP BY u.id, u.name, u.daily_target
       HAVING COUNT(la.id) < u.daily_target
@@ -491,6 +497,14 @@ async function fireNoActivityAlerts(cfg = DEFAULT_ALERT_CFG) {
         ON la.created_by = u.id
         AND la.created_at >= CURRENT_DATE
       WHERE u.is_active = TRUE
+        /* Staff only — and here it is not a tidy-up, it is the bug.
+           A hub-portal user never creates a lead_activity, so the
+           MAX(la.created_at) IS NULL test below is true for them on EVERY run: the
+           workshop was told off, forever, for not doing lead work nobody asked
+           them to do. Harmless while the bell was silent; the appointment chime
+           is what made it matter, because the alert people must not learn to
+           ignore now shares a sound with one that was always wrong. */
+        AND u.hub_id IS NULL
       GROUP BY u.id, u.name
       HAVING
         MAX(la.created_at) < NOW() - ($1 || ' hours')::interval

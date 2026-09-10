@@ -6,13 +6,20 @@
  * Everything here is behind requireAuth AND a permission. Note what is NOT
  * used: requirePermissionOrHub. That helper waves through any hub login,
  * including one with no permission rows at all, and these endpoints open
- * charges against the company's gateway account. The handlers reject hub
- * sessions explicitly as well — see the header of payments.controller.js.
+ * charges against the company's gateway account. Plain requirePermission has no
+ * such fallback, so COLLECT_PAYMENT and CREATE_PAYMENT_LINK are real gates: a
+ * hub holds them only because migration 178 puts them in the Hub Partner role,
+ * and removing either from that role takes the ability away.
+ *
+ * Most handlers refuse hub sessions a second time, in the handler itself — see
+ * the header of payments.controller.js for which, and for the four that
+ * deliberately no longer do (order, QR, QR-cancel, payment link). Those four
+ * check invoice tenancy instead: may collect is not may collect against another
+ * hub's invoice.
  *
  * maskCustomerContact is mounted at the router, as on customer_invoices.routes,
- * so a hub login would see 98382xxxxx here too if hubs are ever given the
- * screen. Mounting it now rather than later means that decision is a nav change
- * and not a data-exposure review.
+ * so the hub portal sees +91 98*** **210 on these endpoints — which it now
+ * reaches for real, rather than hypothetically.
  *
  * The PUBLIC pay endpoints are deliberately NOT in this file — they live in
  * public.payments.routes.js, so a route can never be added here and quietly

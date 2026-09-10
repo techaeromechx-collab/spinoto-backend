@@ -17,14 +17,39 @@
  * handler where it cannot be lost by someone later swapping one middleware for
  * the other.
  *
- * Hub logins have no Payments screen today (the user's decision). The scoping
- * is written anyway — hubScopeSql on every list — so turning it on later is a
- * nav entry, not a security review.
+ * WHAT CHANGED, AND WHERE denyHub NO LONGER APPLIES
+ * ─────────────────────────────────────────────────
+ * Migrations 178/179 gave hub logins a real role (Hub Partner) with an explicit
+ * permission set, and hubs.controller.js now seeds it at login creation. The
+ * "a hub login has zero permission rows, so nothing is really gating it"
+ * premise above no longer holds for the routes in THIS file, which use
+ * requirePermission and not requirePermissionOrHub — COLLECT_PAYMENT is a real
+ * gate that a hub either has or does not.
+ *
+ * So four handlers no longer call denyHub, because a hub taking money from a
+ * customer standing at its own counter is the ordinary case, not the dangerous
+ * one:
+ *
+ *     createOrder        card / netbanking checkout
+ *     createQr           UPI QR at the counter
+ *     cancelQr           closing a QR it opened — without this the modal leaves
+ *                        a live code behind
+ *     createPaymentLink  the same collection, sent instead of scanned
+ *
+ * Money still lands in the company's gateway account, exactly as when an agent
+ * takes it; what changed is who may press the button. Tenancy is enforced
+ * separately by assertInvoiceInHubScope below — a permission to collect is not
+ * a permission to collect against SOMEBODY ELSE'S invoice.
+ *
+ * denyHub stays on everything that moves money the other way or exposes what
+ * the company earns: refunds, advances and money on account, credit,
+ * settlements and gateway configuration. cancelPaymentLink also keeps it — that
+ * control lives only on the admin Payment Links screen, which hubs do not have.
  */
 
 const { z } = require('zod');
 const { pool } = require('../config/db');
-const { isHubUser, hubScopeSql } = require('../utils/hubScope');
+const { isHubUser, hubScopeSql, assertHubOwns } = require('../utils/hubScope');
 const { buildSearchSql } = require('../utils/listSearch');
 const { gatewayStatus, getGateway: getGatewayAdapter } = require('../services/gateway');
 const {
@@ -352,19 +377,47 @@ function denyHub(req, what = 'This') {
   }
 }
 
+/**
+ * The tenancy half of letting hubs collect: this invoice must be theirs.
+ *
+ * The collect handlers take a customer_invoice_id straight from the body and
+ * hand it to the service, which reads the invoice by primary key with no scope
+ * of its own. While denyHub guarded them that was harmless — no hub reached the
+ * lookup at all. Now that a hub can, an unchecked id is an IDOR: hub A opens a
+ * QR against hub B's invoice, and the successful payment settles B's bill while
+ * telling A the customer's name and the amount owed.
+ *
+ * 404 rather than 403, via assertHubOwns — the reasoning is in hubScope.js, but
+ * in short a 403 confirms the row exists and turns id enumeration into a
+ * census of the workshop down the road.
+ *
+ * A no-op for staff, so callers can invoke it unconditionally. It reads hub_id
+ * only: the handler (or the service) still does its own load for balance and
+ * status, and duplicating those checks here would give them two places to
+ * disagree.
+ */
+async function assertInvoiceInHubScope(req, customerInvoiceId) {
+  if (!isHubUser(req)) return;
+  const r = await pool.query(
+    'SELECT hub_id FROM customer_invoices WHERE id = $1', [customerInvoiceId]);
+  assertHubOwns(req, r.rows[0], 'hub_id', 'Customer invoice');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payments/order
 // ─────────────────────────────────────────────────────────────────────────────
 function createOrder(req, res, next) {
   handle(req, res, next, async () => {
-    denyHub(req, 'Taking an online payment');
-
     const body = z.object({
       customer_invoice_id: idParam,
       // Optional part payment. The service clamps it to the real balance — this
       // schema only stops nonsense reaching it.
       amount: z.coerce.number().positive().optional().nullable(),
     }).parse(req.body || {});
+
+    // Hubs may collect (COLLECT_PAYMENT gates the route) but only against their
+    // own invoices. See assertInvoiceInHubScope; no-op for staff.
+    await assertInvoiceInHubScope(req, body.customer_invoice_id);
 
     const { order } = await createInvoiceOrder({
       customerInvoiceId: body.customer_invoice_id,
@@ -383,7 +436,7 @@ function createOrder(req, res, next) {
 // POST /api/payments/qr — a UPI QR the customer scans at the counter
 // ─────────────────────────────────────────────────────────────────────────────
 /**
- * Same permission as createOrder, same hub rejection, same amount rules. A QR
+ * Same permission as createOrder, same tenancy check, same amount rules. A QR
  * is a way of taking a payment, not a different kind of authority.
  *
  * The response carries an image URL and an expiry and nothing else about the
@@ -392,8 +445,6 @@ function createOrder(req, res, next) {
  */
 function createQr(req, res, next) {
   handle(req, res, next, async () => {
-    denyHub(req, 'Taking a QR payment');
-
     const body = z.object({
       customer_invoice_id: idParam,
       amount: z.coerce.number().positive().optional().nullable(),
@@ -401,6 +452,8 @@ function createQr(req, res, next) {
       // it; this schema stops a nonsense value reaching the gateway.
       expires_in_minutes: z.coerce.number().int().min(2).max(120).optional().nullable(),
     }).parse(req.body || {});
+
+    await assertInvoiceInHubScope(req, body.customer_invoice_id);
 
     const { qr } = await createInvoiceQr({
       customerInvoiceId: body.customer_invoice_id,
@@ -428,12 +481,13 @@ function createQr(req, res, next) {
  */
 function cancelQr(req, res, next) {
   handle(req, res, next, async () => {
-    denyHub(req, 'Cancelling a QR payment');
     const ref = z.string().trim().min(3).max(40).parse(req.params.ref);
 
-    // Hub scoping on the read, for the same reason every other handler carries
-    // it: the screen is admin-only today and that must not be the only thing
-    // standing between a hub login and another hub's payment.
+    // Hub scoping on the read is now the ONLY thing standing between a hub
+    // login and another hub's payment — this handler no longer refuses hubs
+    // outright, because a hub that opened a QR has to be able to close it.
+    // Scoping by txn_ref is enough: the ref identifies one transaction row and
+    // that row carries the hub the money is for.
     const params = [ref];
     const hubSql = hubScopeSql(req, params, 't.hub_id');
     const own = await pool.query(
@@ -1642,8 +1696,6 @@ function linkTtlDays() {
 
 function createPaymentLink(req, res, next) {
   handle(req, res, next, async () => {
-    denyHub(req, 'Creating a payment link');
-
     const body = z.object({
       customer_invoice_id: idParam,
       // Capped at 90 days. An immortal payment URL is a liability, and the cap
@@ -1656,6 +1708,10 @@ function createPaymentLink(req, res, next) {
     const { readInvoiceBalance } = require('../services/invoiceBalance.service');
     const inv = await readInvoiceBalance(pool, body.customer_invoice_id);
     if (!inv) return res.status(404).json({ error: 'Customer invoice not found' });
+    // Before the cancelled/balance checks, not after: those replies would
+    // otherwise tell a hub whether another hub's invoice exists and is paid.
+    // inv already carries hub_id, so this needs no second query.
+    assertHubOwns(req, inv, 'hub_id', 'Customer invoice');
     if (inv.status === 'cancelled') {
       return res.status(409).json({ error: 'This invoice has been cancelled.' });
     }
@@ -2252,6 +2308,9 @@ function testGatewayConnection(req, res, next) {
 }
 
 module.exports = {
+  // Exported for public.payments.controller's scan-to-pay endpoint, so the
+  // printed QR and a link made by hand expire on the same configured clock.
+  linkTtlDays,
   listRefunds,
   createOrder,
   createQr,

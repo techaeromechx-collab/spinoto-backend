@@ -926,12 +926,64 @@ function createHubLogin(req, res, next) {
 
     const hash = await bcrypt.hash(data.password, 10);
 
-    const ins = await pool.query(
-      `INSERT INTO users (name, email, password_hash, is_active, is_super_admin, hub_id)
-       VALUES ($1, $2, $3, TRUE, FALSE, $4)
-       RETURNING id, name, email, hub_id`,
-      [data.name, data.email.toLowerCase(), hash, hubId]
-    );
+    /* ── The login AND its permissions, in one transaction ──────────────────
+       This used to be the bare INSERT below and nothing else — no role_id, no
+       user_permissions — which is why every hub login in the system runs on an
+       empty permission set.
+
+       That is not "no access". requirePermissionOrHub reads an empty set as
+       OPEN access and waves the user through every route guarded that way,
+       while plain requirePermission has no such fallback and refuses them. So a
+       hub could do most things by accident and two things not at all:
+       recording an invoice payment (ADD_INVOICE_PAYMENT) and editing an
+       appointment (EDIT_APPOINTMENT) both 403'd behind buttons that rendered.
+
+       Seeded from the 'Hub Partner' role rather than a list written here, so
+       the role stays the single definition — change it in Settings -> Roles (or
+       re-run migration 178) and the next hub login follows, with nothing in
+       this file to update.
+
+       Migration 179 does the same for the logins that already exist. */
+    const client = await pool.connect();
+    let ins;
+    try {
+      await client.query('BEGIN');
+
+      ins = await client.query(
+        `INSERT INTO users (name, email, password_hash, is_active, is_super_admin, hub_id, role_id)
+         VALUES ($1, $2, $3, TRUE, FALSE, $4,
+                 (SELECT id FROM roles WHERE LOWER(name) = 'hub partner'))
+         RETURNING id, name, email, hub_id`,
+        [data.name, data.email.toLowerCase(), hash, hubId]
+      );
+
+      /* If the role is missing the sub-select above is NULL and this inserts
+         nothing — the login is still created, with the empty permission set
+         that was the old behaviour. Deliberately not an error: a hub that
+         cannot log in at all is worse than one on the old fallback, and the
+         warning says where to look. */
+      const perms = await client.query(
+        `INSERT INTO user_permissions (user_id, permission_code)
+         SELECT $1, p
+           FROM roles r
+           CROSS JOIN LATERAL unnest(r.permissions) AS p
+          WHERE LOWER(r.name) = 'hub partner'
+         ON CONFLICT DO NOTHING`,
+        [ins.rows[0].id]
+      );
+
+      if (perms.rowCount === 0) {
+        console.warn(`[hubs] hub login ${ins.rows[0].email} created with NO permissions — `
+          + `the "Hub Partner" role is missing. Run migration 178.`);
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     res.status(201).json({
       message: `Hub login created for ${hubCheck.rows[0].hub_name}`,

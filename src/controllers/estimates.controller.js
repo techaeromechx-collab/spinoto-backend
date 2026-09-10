@@ -17,12 +17,15 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+// Keeps the PI and CI in step after a decision or a work-status change.
+const { resyncInvoicesForEstimate, describeResync } = require('../services/invoiceResync.service');
 const { fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const { applyItemApprovals } = require('../services/estimateApproval.service');
 const { getRoundingFunction } = require('../utils/math');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
 const { hubScopeSql, assertHubOwns, isHubUser } = require('../utils/hubScope');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
+const { getDiscountBasis } = require('../utils/discountBasis');
 const { logActivity } = require('../services/activityLog.service');
 const { emitInvalidate } = require('../socket');
 
@@ -177,6 +180,12 @@ const updateSchema = z.object({
   b2b_gst_number:            z.string().trim().max(15).transform(v => v ? v.toUpperCase() : v).optional().nullable(),
   b2b_address:               z.string().trim().max(2000).optional().nullable(),
   save_b2b_to_profile:       z.boolean().optional().default(false),
+  /* The reading taken when the car actually arrived, which is rarely the one
+     guessed at booking. createSchema has always accepted this; the update path
+     did not, so a reading could be set once and never corrected — and a wrong
+     odometer is worse than none, because km-based warranty claims are validated
+     against it. Nullable so it can be cleared, not only changed. */
+  odometer_km:               z.coerce.number().int().nonnegative().optional().nullable(),
 }).superRefine((data, ctx) => {
   // Update payloads may omit is_b2b entirely (partial save). Only run the
   // B2B requiredness check when is_b2b is explicitly part of this request.
@@ -607,6 +616,8 @@ async function recalcTotals(client, estimateId) {
      sale that no longer carried it. */
   const isTx = discount_mode === 'transaction';
   const totals = applyTransactionDiscount({
+    // The ESTIMATE's own created_at (line above), not today's date.
+    basis: getDiscountBasis(created_at),
     items:         itemRes.rows,
     discountType:  isTx ? transaction_discount_type : null,
     discountValue: isTx ? parseFloat(transaction_discount_value) || 0 : 0,
@@ -1317,6 +1328,7 @@ function updateEstimate(req, res, next) {
       data.b2b_company_name === undefined &&
       data.b2b_gst_number === undefined &&
       data.b2b_address === undefined &&
+      data.odometer_km === undefined &&
       !hubChanged
     ) {
       return res.status(400).json({ error: 'Nothing to update' });
@@ -1403,6 +1415,14 @@ function updateEstimate(req, res, next) {
       }
       if (data.transaction_discount_value !== undefined) {
         setFields.push(`transaction_discount_value = $${n++}`); setVals.push(data.transaction_discount_value);
+      }
+      /* Written on the ESTIMATE, and the estimate wins: every read is
+         COALESCE(e.odometer_km, a.odometer_km), so a reading entered here
+         overrides the appointment's for this document, the purchase invoice and
+         the customer invoice alike. Clearing it (null) falls back to the
+         appointment rather than blanking the row. */
+      if (data.odometer_km !== undefined) {
+        setFields.push(`odometer_km = $${n++}`); setVals.push(data.odometer_km);
       }
 
       // B2B fields — resolved as a group against the current row so a
@@ -1560,17 +1580,19 @@ function updateEstimate(req, res, next) {
             );
             keptIds.add(Number(existingRow.id));
 
-            // An existing row already carries the right approval/work status —
-            // only the estimate-wide statuses below may override it. Deliberately
-            // NOT reapplying statusMap here: that map is keyed by service/part,
-            // so with the same service on two lines it could copy one line's
-            // status onto the other.
-            if (status === 'work_completed' || status === 'work_in_progress') {
-              await client.query(
-                `UPDATE estimate_items SET customer_approved = TRUE, work_status = $2 WHERE id = $1`,
-                [existingRow.id, status === 'work_completed' ? 'completed' : 'in_progress']
-              );
-            }
+            /* An existing row already carries the right approval and work
+               status, and nothing here may overwrite them.
+
+               This used to force `customer_approved = TRUE` on every line
+               whenever the estimate sat at work_completed or work_in_progress —
+               which meant a line the customer had REFUSED was silently
+               re-approved by the very next save of the estimate. The rejection
+               would survive until somebody edited a description, and then
+               quietly undo itself.
+
+               Deliberately NOT reapplying statusMap either: that map is keyed by
+               service/part, so with the same service on two lines it could copy
+               one line's status onto the other. */
             continue;
           }
 
@@ -1618,19 +1640,31 @@ function updateEstimate(req, res, next) {
             ]
           );
 
-          // Restore original approval + work status using the exact new item id.
-          // Priority:
-          //   1. If estimate is work_completed → all items must be completed & approved
-          //   2. Else use statusMap (per-item saved status)
-          //   3. Else leave as default (null / pending)
+          /* Restore the line's own previous approval and work status, using the
+             exact new item id. Every line is re-inserted on each save, so this
+             is what carries a decision across an edit.
+
+             ── A GENUINELY NEW LINE IS NOT APPROVED ──────────────────────────
+             There used to be a rule above this one: if the estimate was at
+             work_completed or work_in_progress, every inserted line was stamped
+             `customer_approved = true, work_status = completed`.
+
+             So a part added after the invoices already existed was marked
+             approved by a customer who had never seen it, counted as fitted,
+             and flowed straight onto both bills. That is the "it just does it
+             automatically" behaviour, and it is the whole reason a customer
+             could be billed for something nobody asked them about.
+
+             Now a line is only restored from statusMap — which holds what that
+             same service or part carried BEFORE this save. A line that was
+             there keeps its decision; a line that was not starts undecided and
+             work-pending, exactly where a line on a brand-new estimate starts,
+             and waits for the customer like any other. */
           const newItemId = insertedRow.rows[0].id;
           let restoredApproved = null;
           let restoredStatus   = null;
 
-          if (status === 'work_completed' || status === 'work_in_progress') {
-            restoredApproved = true;
-            restoredStatus   = status === 'work_completed' ? 'completed' : 'in_progress';
-          } else {
+          {
             const origKey = itemKey(svcId, partId, item.description);
             const orig    = statusMap[origKey];
             if (orig && orig.work_status) {
@@ -1680,6 +1714,33 @@ function updateEstimate(req, res, next) {
       ) {
         // Discount mode changed but items not resent — just recalc totals
         await recalcTotals(client, id);
+      }
+
+      /* ── Odometer → customer invoice ──────────────────────────────────────
+         The purchase invoice derives its reading live from the estimate and
+         the appointment, so it needs nothing here. The CUSTOMER invoice does
+         not: customer_invoices.odometer_km is a real column, stamped once at
+         sync time, because the printed tax invoice must keep the reading that
+         was true on the day it was issued.
+
+         That snapshot is what made a reading typed onto an existing estimate
+         look like it had been ignored — it reached the estimate and the PI,
+         but the already-issued CI kept its NULL forever, since a plain
+         estimate edit deliberately does not re-sync the invoice (see the
+         approval flow: edits must not silently re-price a live document).
+
+         Filling ONLY a null is the whole safety of this: an invoice that
+         already carries a reading is never overwritten, so nothing that was
+         printed or agreed can change under the customer. Amounts are not
+         touched. Clearing the estimate's reading (null) leaves the invoice
+         alone rather than blanking it. */
+      if (data.odometer_km !== undefined && data.odometer_km !== null) {
+        await client.query(
+          `UPDATE customer_invoices
+              SET odometer_km = $1, updated_at = NOW()
+            WHERE estimate_id = $2 AND odometer_km IS NULL`,
+          [data.odometer_km, id]
+        );
       }
 
       // ── Hub reassignment side effects (same transaction) ──────────────────
@@ -1974,11 +2035,45 @@ function customerApproval(req, res, next) {
     const cur = await pool.query(`SELECT id, status FROM estimates WHERE id = $1`, [id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
 
-    const allowedStatuses = ['sent_to_customer', 'partially_approved', 'fully_approved', 'work_in_progress'];
+    /* work_completed is in this list deliberately.
+       It was the omission that made rejecting a line impossible: 343 of the 355
+       estimates in this system sit at work_completed, so the screen refused to
+       open on almost every real job and deleting the line looked like the only
+       way to take it off a bill. A deletion leaves no trace that the customer
+       ever refused anything; a rejection is the record.
+       Safe only because applyItemApprovals no longer resets every fitted line
+       on the estimate — see the note there. Reverting that fix without
+       reverting this one empties invoices. */
+    const allowedStatuses = ['sent_to_customer', 'partially_approved', 'fully_approved',
+                             'work_in_progress', 'work_completed'];
     if (!allowedStatuses.includes(cur.rows[0].status)) {
       return res.status(409).json({
         error: `Customer approvals can only be recorded when status is one of: ${allowedStatuses.join(', ')}. Current status: '${cur.rows[0].status}'.`,
       });
+    }
+
+    /* ── A paid invoice cannot quietly get smaller ────────────────────────
+       Rejecting a line drops it from both invoices, because each picks its
+       rows with `customer_approved = true AND work_status = 'completed'`. Do
+       that after the customer has paid and the invoice ends up smaller than the
+       payment recorded against it — a settled document that no longer adds up,
+       and a payment matching nothing.
+       Only rejections are blocked. An approval can only make the bill larger,
+       which is an ordinary balance due, not a contradiction. */
+    if (data.approvals.some(a => a.approved === false)) {
+      const paid = await pool.query(
+        `SELECT ci.id FROM customer_invoices ci
+          WHERE ci.estimate_id = $1 AND ci.status = 'paid' LIMIT 1`,
+        [id]
+      );
+      if (paid.rows[0]) {
+        return res.status(409).json({
+          error: `Invoice CI-${String(paid.rows[0].id).padStart(6, '0')} is already paid. `
+               + 'Taking a line off a paid invoice needs a refund or a credit note, '
+               + 'not a rejection.',
+          code: 'INVOICE_ALREADY_PAID',
+        });
+      }
     }
 
     const client = await pool.connect();
@@ -2037,15 +2132,29 @@ function customerApproval(req, res, next) {
       client.release();
     }
 
+    /* ── Put the invoices back in step ───────────────────────────────────
+       A decision decides what gets billed, so an invoice that keeps the old
+       answer now contradicts the document it was derived from. Left to a
+       button, that is exactly what happened: a customer charged for the line
+       he had refused, and the hub paid for it.
+
+       AFTER the commit and never thrown — the decision is saved and correct
+       whether or not the invoices could follow. A paid invoice is skipped and
+       reported rather than quietly reduced; the remedy there is a refund or a
+       credit note, not a smaller total. */
+    const resync = await resyncInvoicesForEstimate(id, req.user);
+
     // The staff-side twin of the emit on the public decision route: this moves
     // the same rows, so a second person with the list open needs to hear about
-    // it for the same reason the customer's own approval does.
-    announceEstimateChange(req);
+    // it for the same reason the customer's own approval does. Emitted after
+    // the resync so a listener reloads the invoices as they now stand, not as
+    // they were a moment ago.
+    announceEstimateChange(req, true);
 
     const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [id]);
     const estimate = row.rows[0];
     estimate.items = await _getItems(id);
-    return res.json({ item: estimate });
+    return res.json({ item: estimate, resync, resync_message: describeResync(resync) });
   });
 }
 
@@ -2140,12 +2249,23 @@ function updateItemWorkStatus(req, res, next) {
       await advanceAppointmentStatus(apptId, 'work-completed');
     }
 
+    /* Work status is the OTHER half of what an invoice bills — a line counts
+       only when it is both approved and completed. So finishing a line that was
+       approved after the job closed, or reopening one, moves the bill exactly
+       as a decision does, and the invoices have to follow it for the same
+       reason. Never thrown; see the note in customerApproval. */
+    const wsResync = await resyncInvoicesForEstimate(estimateId, req.user);
+
     /* The one the hub uses most, and the one that was most obviously missing:
        a car marked finished on the ramp did not reach the CRM until somebody
        reloaded. `apptId` is only set when the estimate's own status moved, so
        it doubles as "did the appointment advance too". */
-    announceEstimateChange(req, Boolean(apptId));
-    return res.json({ item: { ...est.rows[0], items } });
+    announceEstimateChange(req, true);
+    return res.json({
+      item: { ...est.rows[0], items },
+      resync: wsResync,
+      resync_message: describeResync(wsResync),
+    });
   });
 }
 

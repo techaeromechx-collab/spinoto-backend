@@ -54,6 +54,7 @@ const {
   // would shadow this function and fail at runtime with "not a function".
   pageScale: pageScaleRatio,
   QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 const cls = (align) => (align === 'c' ? 'c' : align === 'r' ? 'r' : '');
@@ -166,23 +167,12 @@ function render({ doc, cfg, pageSize }) {
      Covers advanced_gst_a5, which renders from this same file. */
   const discount = totals.find(t => t.key === 'discount');
 
-  /* Hand-picked for the third time, and this one has a second problem the
-     others did not.
-
-     The TOTAL row above is a COLUMN total — it sums doc.items, so it prints
-     834.55, the figure the lines actually add to. grand_total in the database
-     is 835.00, because the round-off has been applied to it. Two different
-     numbers, both correct, and this theme prints the first as TOTAL while
-     amountInWords() reads the second — so an invoice would say 834.55 in
-     figures and "eight hundred thirty-five" in words.
-
-     So when a round-off exists, TOTAL stops being the last word: a ROUND OFF
-     strip and a GRAND TOTAL strip follow it, and the three reconcile on the
-     face of the document. Both are absent when round_off is 0, which is every
-     invoice raised before the cutoff — those print exactly as they always did.
-
-     Covers advanced_gst_a5, which renders from this same file. */
-  const roundOff = totals.find(t => t.key === 'round_off');
+  /* And the taxable value, hand-picked for the same reason — this theme's own
+     comment above predicts exactly this: a new totals row is invisible here
+     unless someone reaches for it. The HSN table below already carries a
+     Taxable Value column, but that is a rate-wise breakup, not the single
+     figure the money block is read for. */
+  const taxable = totals.find(t => t.taxAfter);
 
   // Built as inner fragments so the same content can be dropped into either a
   // half-width cell or a full-width one, depending on whether both exist.
@@ -393,9 +383,6 @@ function render({ doc, cfg, pageSize }) {
   /* Matches .recv-adv's weight so the two qualifying strips read as a pair,
      rather than one of them competing with the RECEIVED AMOUNT headline. */
   .recv-disc { font-weight: 600; text-transform: uppercase; letter-spacing: .2px; }
-  /* The restated grand total after a round-off. Heavier than the round-off
-     line above it, because it is the figure that is owed. */
-  .recv-grand { font-weight: 800; }
 
   table.hsn { width: 100%; border-collapse: collapse; }
   table.hsn th, table.hsn td { border-right: var(--rule) solid #000; border-bottom: var(--rule) solid #000; padding: 5px 6px; font-size: 8.5px; }
@@ -551,9 +538,8 @@ function render({ doc, cfg, pageSize }) {
           was CHARGED, not of what was paid. Quieter weight than RECEIVED
           AMOUNT for the same reason the advance is. buildTotals has already
           rendered the value with its minus sign. */''}
-    ${roundOff ? `<div class="recv recv-disc"><span>${roundOff.label}</span><span>₹ ${roundOff.value}</span></div>` : ''}
-    ${(roundOff && grand) ? `<div class="recv recv-grand"><span>${grand.label.toUpperCase()}</span><span>₹ ${grand.value}</span></div>` : ''}
     ${discount ? `<div class="recv recv-disc"><span>${discount.label}</span><span>₹ ${discount.value}</span></div>` : ''}
+    ${taxable ? `<div class="recv"><span>${taxable.label}</span><span>₹ ${taxable.value}</span></div>` : ''}
     ${advance ? `<div class="recv recv-adv"><span>${advance.label}</span><span>₹ ${advance.value}</span></div>` : ''}
     ${paid ? `<div class="recv"><span>${advance ? paid.label.toUpperCase() : 'RECEIVED AMOUNT'}</span><span>₹ ${paid.value}</span></div>` : ''}
 
@@ -608,6 +594,7 @@ function render({ doc, cfg, pageSize }) {
         ${coverage.map(c => `<div class="kv"><span class="k">${c.type}</span><span class="v">${c.item} — ${c.coverage}</span></div>`).join('')}
       </div>
     </div>` : ''}
+    ${payBlockHtml(blocks)}
     ${(blocks.terms || blocks.bankRows.length || blocks.signature) ? `
     <div class="band">
       <div class="halfL">

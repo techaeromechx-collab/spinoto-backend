@@ -476,4 +476,95 @@ const verifyPublicPayment = handler(async (req, res) => {
   });
 });
 
-module.exports = { getPayPage, createPublicOrder, verifyPublicPayment };
+/* ─────────────────────────────────────────────────────────────────────────────
+ * POST /api/public/pay/invoice/:token — scan-to-pay off the printed invoice.
+ *
+ * WHY THIS EXISTS AT ALL
+ * ──────────────────────
+ * Everything above is driven by a PAYMENT LINK token: a member of staff makes
+ * one, sends it, and it dies in a week. That is the right shape for a link you
+ * WhatsApp to somebody, and the wrong shape entirely for ink on paper. A QR
+ * printed on an invoice has to work when the customer finds the invoice in the
+ * glovebox two months later, and by then every link ever made for it is
+ * expired.
+ *
+ * So the printed code carries the INVOICE's own permanent public_token, and
+ * this endpoint turns it into a live payment link at the moment somebody
+ * actually scans. Nothing on the paper expires, because the paper carries no
+ * payment link — it carries a request for one.
+ *
+ * WHY THAT DOES NOT WEAKEN ANYTHING
+ * ─────────────────────────────────
+ * The invoice token is already public: it is what the printed "Track Your
+ * Order" QR resolves to, and it already serves the whole PDF to anyone holding
+ * it. This endpoint hands out strictly less than that — an opaque link token
+ * and nothing else. Every protection on the pay flow proper is untouched: the
+ * amount is still recomputed server-side, the link still expires, the created
+ * link can still be cancelled, and cancelling it still does not break the
+ * printed QR (a scan simply mints the next one).
+ *
+ * WHY IT REUSES AN ACTIVE LINK
+ * ────────────────────────────
+ * Without this, every scan would leave a row behind — a customer who opens the
+ * code three times while deciding creates three live links to the same invoice,
+ * all payable. Reusing the newest active one keeps that to one, and gives the
+ * staff-facing "outstanding requests" list a truthful count.
+ *
+ * WHAT IT REFUSES
+ * ───────────────
+ * A cancelled invoice and a settled one, both with the plain reason. This is
+ * the one place where saying "already paid" out loud is right rather than
+ * leaky: the person reading it is holding the invoice, and the alternative is
+ * letting them pay a second time.
+ * ─────────────────────────────────────────────────────────────────────────── */
+const startInvoicePayment = handler(async (req, res) => {
+  const token = tokenParam.parse(req.params.token);
+
+  const { resolveTokenToId, withTokenRetry } = require('../utils/publicToken');
+  const id = await resolveTokenToId(pool, 'customer_invoices', token);
+  // Same single message the link loader uses, for the same reason: a distinct
+  // "no such invoice" tells anyone probing tokens which guesses were real.
+  const dead = fail(404, 'This invoice could not be found. Please ask the workshop for a payment link.');
+  if (!id) throw dead;
+
+  const inv = await readInvoiceBalance(pool, id);
+  if (!inv) throw dead;
+  if (inv.status === 'cancelled') {
+    throw fail(409, 'This invoice has been cancelled. Please contact the workshop.');
+  }
+  if (inv.balance <= 0.01) {
+    throw fail(409, 'This invoice is already fully paid. Nothing is due.');
+  }
+
+  const existing = await pool.query(
+    `SELECT * FROM payment_links
+      WHERE entity_type = 'customer_invoice' AND entity_id = $1
+        AND status = 'active' AND expires_at > NOW()
+      ORDER BY id DESC LIMIT 1`,
+    [id]
+  );
+
+  let link = existing.rows[0] || null;
+  if (!link) {
+    const { linkTtlDays } = require('./payments.controller');
+    link = await withTokenRetry(t => pool.query(
+      `INSERT INTO payment_links
+         (token, entity_type, entity_id, hub_id, amount, status, expires_at, notes, created_by)
+       VALUES ($1,'customer_invoice',$2,$3,$4,'active', NOW() + ($5 || ' days')::interval, $6, NULL)
+       RETURNING *`,
+      // created_by NULL — nobody made this one; the customer's scan did. The
+      // note is what tells whoever reads the links list why a link exists that
+      // no member of staff remembers creating.
+      [t, inv.id, inv.hub_id, inv.balance, String(linkTtlDays()),
+       'Created by a scan of the printed invoice']
+    ).then(r => r.rows[0]));
+  }
+
+  // The relative path, not an absolute URL. The caller is the customer's own
+  // browser on the public site, and it knows its own origin — handing it one
+  // built from server configuration is how a link ends up pointing at the
+  // wrong host in a preview deployment.
+  return res.json({ token: link.token, path: `/pay/${link.token}` });
+});
+
+module.exports = { getPayPage, createPublicOrder, verifyPublicPayment, startInvoicePayment };

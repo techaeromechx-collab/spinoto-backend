@@ -115,6 +115,38 @@ const DEFAULT_GLOBAL = {
   // can be turned off for, say, purchase invoices alone. A document prints the
   // QR only when both are on — see qrEnabled().
   show_qr: true,
+
+  /* ── Paying from the printed invoice ──────────────────────────────────────
+     Both OFF by default. Every existing invoice must keep printing exactly
+     what it prints today until somebody deliberately turns one of these on,
+     and one of the two moves real money outside this system.
+
+     They are independent, not a mode switch: a workshop may want the online
+     button only, the UPI QR only, or both side by side for the customer to
+     pick. Neither has any effect on a document with nothing left to pay — see
+     renderDocument, which skips both once the balance reaches zero. */
+
+  // "Pay Now" link + a scannable code that opens the gateway checkout. The
+  // money arrives through Razorpay, the webhook captures it, and the invoice
+  // marks ITSELF paid. Nothing to reconcile by hand.
+  pay_online: false,
+
+  /* The same payment, as a tappable button rather than a code.
+     A SEPARATE switch, because the two are read in different places: the code
+     is for somebody holding paper, the button for somebody holding the PDF in
+     WhatsApp or email, where a QR they would have to scan with the same phone
+     that is already showing it is useless. A workshop that sends invoices
+     digitally may well want the button and not the code. */
+  pay_button: false,
+
+  // A plain UPI intent QR (upi://pay). Never expires, so unlike a gateway QR
+  // it can be printed — but the payment lands in the bank with no order and no
+  // webhook, so THE INVOICE STAYS UNPAID until a human records it. That trade
+  // is the whole reason this is a separate switch rather than part of the one
+  // above.
+  upi_qr: false,
+  upi_vpa: '',        // e.g. spinoto@okhdfcbank — without it the QR is skipped
+  upi_payee_name: '', // shown in the customer's UPI app; falls back to the VPA
 };
 
 // Per-document display settings. Anything absent here is inherited from
@@ -322,6 +354,16 @@ const documentConfigSchema = z.object({
     footer_contact:       z.boolean(),
     footer_contact_icons: z.boolean(),
     show_qr: z.boolean(),
+    pay_online: z.boolean(),
+    pay_button: z.boolean(),
+    upi_qr: z.boolean(),
+    // Trimmed and length-capped, but deliberately NOT pattern-matched. VPA
+    // handles vary by bank and by year (@okhdfcbank, @ybl, @ptaxis, numeric
+    // handles), and a regex here would reject a working address with no way
+    // for the operator to override it. A wrong VPA fails visibly at the first
+    // scan; a rejected valid one fails silently in the settings screen.
+    upi_vpa: z.string().trim().max(100),
+    upi_payee_name: z.string().trim().max(100),
   }).partial(),
   documents: z.object({
     estimate:         docSchema,

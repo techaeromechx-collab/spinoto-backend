@@ -52,6 +52,7 @@ const invoicesRoutes             = require('./routes/invoices.routes');
 // for one line to re-enable by accident.
 const partsRoutes                = require('./routes/parts.routes');
 const estimatesRoutes            = require('./routes/estimates.routes');
+const estimateChangeRequestsRoutes = require('./routes/estimate_change_requests.routes');
 const settingsRoutes             = require('./routes/settings.routes');
 const rolesRoutes                = require('./routes/roles.routes');
 const logsRoutes                 = require('./routes/logs.routes');
@@ -238,6 +239,9 @@ app.use('/api/invoices',                    invoicesRoutes);
 
 app.use('/api/parts',             partsRoutes);
 app.use('/api/estimates',         estimatesRoutes);
+// A hub's proposed edit to an estimate, held until Spinoto approves it —
+// see migration 180 for why an unreviewed hub edit could not stay a write.
+app.use('/api/estimate-change-requests', estimateChangeRequestsRoutes);
 app.use('/api/discount-master',   discountMasterRoutes);
 app.use('/api/warranty-master',   warrantyMasterRoutes);
 app.use('/api/warranty-claims',   warrantyClaimsRoutes);

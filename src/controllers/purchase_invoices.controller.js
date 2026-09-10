@@ -6,6 +6,7 @@ const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
 const { getRoundingFunction } = require('../utils/math');
 const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
+const { getDiscountBasis } = require('../utils/discountBasis');
 const { syncPayoutDueDate } = require('../utils/payoutSchedule');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
 const { loadCompany, resolveRender, sendPdf } = require('../utils/renderDocument');
@@ -88,6 +89,22 @@ const PI_SELECT = `
     pi.invoice_date::text AS invoice_date,
     pi.amount_paid,
     pi.payment_status,
+
+    /* ── Why the total on this document may be short ──────────────────────
+       Both invoices pick their lines with
+         customer_approved = true AND work_status = 'completed'
+       so a line still waiting on the customer, or approved but not yet fitted,
+       is silently absent from the total. Without a number to show, the figure
+       just looks wrong and nobody can tell why.
+       Counted here rather than fetched separately: these run beside the row, so
+       a list of fifty invoices costs no extra round trips. */
+    (SELECT COUNT(*)::int FROM estimate_items ei
+      WHERE ei.estimate_id = pi.estimate_id
+        AND ei.customer_approved IS NULL) AS items_awaiting_approval,
+    (SELECT COUNT(*)::int FROM estimate_items ei
+      WHERE ei.estimate_id = pi.estimate_id
+        AND ei.customer_approved = TRUE
+        AND ei.work_status <> 'completed') AS items_work_pending,
     h.hub_name, h.gst_number AS hub_gst,
     -- Supplier identity for the document. The snapshot columns (migration 120)
     -- are authoritative; the live hubs join stays only so invoices raised
@@ -103,8 +120,15 @@ const PI_SELECT = `
     COALESCE(a.mobile, est_ctx.mobile)                 AS mobile,
     (SELECT public_token FROM customer_identities WHERE mobile = COALESCE(a.mobile, est_ctx.mobile)) AS customer_token,
     COALESCE(a.vehicle_number, est_ctx.vehicle_number) AS vehicle_number,
-    /* The appointment's reading first, the estimate's as fallback — the same
-       precedence every other vehicle field on this row already uses.
+    /* The ESTIMATE's reading first, the appointment's as fallback. Note this
+       is deliberately the opposite order from the customer/mobile/vehicle
+       fields above: those identify the booking, so the appointment is the
+       authority, but the odometer is a measurement taken when the vehicle
+       actually arrives, and the estimate is where the mechanic types the real
+       number. Reading the appointment first meant a corrected reading on the
+       estimate showed on the estimate and the customer invoice but not here —
+       the same figure printed two different ways on two documents for one job.
+       It matches COALESCE(e.odometer_km, a.odometer_km) everywhere else.
 
        This column was missing entirely, which made the PDF quietly wrong
        rather than loudly broken: documentAdapter's vehicleMeta() reads
@@ -112,7 +136,7 @@ const PI_SELECT = `
        estimate and the customer invoice, found undefined, and printed no
        Odometer line at all. Nothing errored; the row was simply never asked
        for. */
-    COALESCE(a.odometer_km, est_ctx.odometer_km)       AS odometer_km,
+    COALESCE(est_ctx.odometer_km, a.odometer_km)       AS odometer_km,
     u.name  AS created_by_name,
     ab.name AS approved_by_name,
     (SELECT id FROM customer_invoices ci WHERE ci.purchase_invoice_id = pi.id OR ci.estimate_id = pi.estimate_id LIMIT 1) AS customer_invoice_id,
@@ -635,6 +659,14 @@ function generatePurchaseInvoice(req, res, next) {
       discountType:  txDiscountMode === 'transaction' ? txDiscountType : null,
       discountValue: txDiscountMode === 'transaction' ? txDiscountValue : 0,
       roundFn,
+      /* This PI does not exist yet, so it takes the rule current at the instant
+         it is being stamped — matching roundFn above.
+
+         WHAT THIS MEANS FOR THE HUB: the hub's share is derived from the
+         customer value, so a PI raised under the inclusive basis pays on a
+         taxable base that has had less taken off it. Slightly more, and only
+         on new payouts — an approved PI is never recomputed by this path. */
+      basis: getDiscountBasis(new Date()),
     });
 
     // Warranty redo: the claim's cost_bearer decides who pays for the redo.
@@ -1855,6 +1887,9 @@ function syncPurchaseInvoiceFromEstimate(req, res, next) {
       discountType:  txDiscountMode === 'transaction' ? txDiscountType : null,
       discountValue: txDiscountMode === 'transaction' ? txDiscountValue : 0,
       roundFn,
+      // pi.created_at — a re-sync must not move an existing invoice onto a
+      // rule it was not raised under, and must not silently change a payout.
+      basis: getDiscountBasis(pi.created_at),
     });
 
     let subtotalExGst = 0, totalGst = 0, grandTotal = 0;
@@ -2232,8 +2267,15 @@ function exportPayouts(req, res, next) {
     const csvEscape = v => {
       if (v === null || v === undefined) return '';
       const s = String(v);
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
-      return s;
+      /* A leading =, +, - or @ makes Excel evaluate the cell as a formula —
+         CSV injection, and the same guard payments.controller.js has always
+         had. It became load-bearing here when the hub mask changed shape:
+         a masked number is now '+91 98*** **345', so every hub export of this
+         file would have opened as #NAME? without it. A customer called
+         "=Sharma" was always a latent version of the same thing. */
+      const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+      if (safe.includes(',') || safe.includes('"') || safe.includes('\n')) return `"${safe.replace(/"/g, '""')}"`;
+      return safe;
     };
 
     if (type === 'outstanding') {

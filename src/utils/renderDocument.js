@@ -20,7 +20,7 @@ const advanceReceipt = require('../templates/invoiceThemes/advanceReceipt');
 const { buildDocument } = require('../templates/documentAdapter');
 const { resolveDocumentConfig, qrEnabled } = require('./documentConfig');
 const { renderHtmlToPdf } = require('./pdf');
-const { qrDataUri, publicDocumentUrl } = require('./qr');
+const { qrDataUri, publicDocumentUrl, publicPayUrl, upiPayUri } = require('./qr');
 const { inlineAsset } = require('./assetInline');
 
 /**
@@ -177,6 +177,56 @@ async function renderHtml(docType, row, company, cfg, theme, { baseUrl } = {}) {
     // Null when there's no public token or no base URL available; the themes
     // then simply omit the QR block.
     doc.qrDataUri = await qrDataUri(url);
+  }
+
+  /* ── Ways to pay, printed on the document ────────────────────────────────
+     Customer invoices only, and only while something is still owed.
+
+     The balance test is the important one and it is deliberately not a
+     setting. A paid invoice that still shows a Pay Now code is asking the
+     customer to pay twice, and they have no way to tell the code is stale —
+     the paper in their hand looks identical either way. `payable` is the same
+     figure printed as Balance Due, so the code on the page and the number
+     beside it can never disagree.
+
+     A cent of tolerance rather than `> 0`: grand_total and amount_paid are
+     both stored to the paisa and a fully-settled invoice can land a hair
+     above zero. */
+  const payable = Number(doc.payable);
+  if (docType === 'customer_invoice' && Number.isFinite(payable) && payable > 0.01) {
+    const g = cfg.global || {};
+
+    /* ONLINE — the code encodes this invoice's own permanent token, not a
+       payment link's. A link expires in days; this is going on paper. The page
+       it opens mints a fresh link when somebody actually scans it. */
+    if (g.pay_online || g.pay_button) {
+      // One URL, both ways in. Generating it once is what guarantees the code
+      // and the button on the same sheet cannot lead to different places.
+      doc.payUrl = publicPayUrl(doc.publicToken, baseUrl);
+      // The QR costs a render, so it is made only for the switch that shows it.
+      if (doc.payUrl && g.pay_online) doc.payQrDataUri = await qrDataUri(doc.payUrl);
+      doc.payButton = !!(doc.payUrl && g.pay_button);
+    }
+
+    /* UPI — a bare intent URI, which is why it can be printed at all (a
+       gateway QR is dead in two hours). Skipped silently with no VPA
+       configured: half a payment instruction is worse than none. */
+    if (g.upi_qr && String(g.upi_vpa || '').trim()) {
+      const uri = upiPayUri({
+        vpa: g.upi_vpa,
+        // The company's own name, not the hub's. The money goes to whoever
+        // owns the VPA, and that is the business the customer is billed by.
+        payeeName: g.upi_payee_name || company?.company_name || '',
+        amount: payable,
+        note: doc.number,
+      });
+      if (uri) {
+        doc.upiQrDataUri = await qrDataUri(uri);
+        // Printed under the code as text: a customer whose camera will not
+        // focus, or who is paying from a different phone, can still type it.
+        doc.upiVpa = String(g.upi_vpa).trim();
+      }
+    }
   }
 
   return { html: theme.render({ doc, cfg, pageSize: pageSizeFor(theme, cfg) }), doc };

@@ -97,4 +97,71 @@ async function qrDataUri(text, { size = 220 } = {}) {
   }
 }
 
-module.exports = { qrDataUri, publicDocumentUrl, publicBaseUrl };
+/**
+ * The customer-facing "pay this invoice" URL for a CUSTOMER INVOICE token.
+ *
+ * Deliberately built from the invoice's own permanent public token rather than
+ * from a payment link's. A payment link expires in days and can be cancelled;
+ * this URL is printed on paper and has to work in three months. The page it
+ * lands on is the one that mints a fresh link at the moment somebody scans —
+ * see controllers/public.payments.controller.js:startInvoicePayment.
+ *
+ * Same base resolution as publicDocumentUrl, for the same reason: the pay QR
+ * and the document QR on one sheet of paper must never point at two different
+ * hosts.
+ */
+function publicPayUrl(publicToken, fallbackBase) {
+  const base = publicBaseUrl() || String(fallbackBase || '').replace(/\/+$/, '');
+  if (!base || !publicToken) return null;
+  return `${base}/invoice/${encodeURIComponent(publicToken)}/pay`;
+}
+
+/**
+ * A UPI intent URI — what a printed "scan to pay" QR actually contains.
+ *
+ * WHY THIS EXISTS ALONGSIDE THE GATEWAY
+ * ─────────────────────────────────────
+ * A Razorpay QR cannot be printed. Their close_by caps at 2 HOURS from
+ * creation (see migration 129), so a QR generated at render time is dead
+ * before the customer reaches the counter. A plain UPI intent has no server
+ * behind it and therefore no expiry at all — it is just an address, an amount
+ * and a note, encoded.
+ *
+ * WHAT YOU GIVE UP BY USING IT
+ * ────────────────────────────
+ * Everything the gateway does. There is no order, no webhook and no
+ * payment_transactions row: the money lands in the bank account behind the VPA
+ * and NOTHING in this system knows. The invoice stays unpaid until a human
+ * records the payment. That is not a bug to be fixed later — it is inherent to
+ * a bank-to-bank UPI transfer, and it is why this is off by default and why
+ * the settings screen says so in as many words.
+ *
+ * FIELDS
+ *   pa  payee address (the VPA)          — required
+ *   pn  payee name, shown in the UPI app — required in practice; apps show
+ *                                          "Unknown" without it, which stops
+ *                                          people mid-payment
+ *   am  amount, 2dp                      — omitted when not positive, which
+ *                                          leaves the customer to type it
+ *   tn  transaction note                 — the invoice number, so the payment
+ *                                          can be reconciled by hand later.
+ *                                          UPI silently truncates this, so it
+ *                                          carries the number and nothing else.
+ *   cu  currency                         — INR is the only value UPI accepts
+ */
+function upiPayUri({ vpa, payeeName, amount = null, note = null }) {
+  const pa = String(vpa || '').trim();
+  if (!pa) return null;
+  const p = new URLSearchParams();
+  p.set('pa', pa);
+  p.set('pn', String(payeeName || '').trim() || pa);
+  const amt = Number(amount);
+  if (Number.isFinite(amt) && amt > 0) p.set('am', amt.toFixed(2));
+  p.set('cu', 'INR');
+  if (note) p.set('tn', String(note).trim().slice(0, 50));
+  // URLSearchParams encodes a space as '+', which some UPI apps show
+  // literally in the note. %20 is understood everywhere.
+  return `upi://pay?${p.toString().replace(/\+/g, '%20')}`;
+}
+
+module.exports = { qrDataUri, publicDocumentUrl, publicBaseUrl, publicPayUrl, upiPayUri };

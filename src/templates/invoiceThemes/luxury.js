@@ -22,6 +22,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 // Maps docShared's semantic alignment onto this theme's CSS classes.
@@ -68,7 +69,7 @@ function render({ doc, cfg, pageSize }) {
 
   // GST breakup sits immediately under the Total GST row — either one IGST
   // line or a CGST/SGST pair, decided by place of supply in the adapter.
-  const gstUnder = (t) => (t.key === 'gst' && gstLines.length
+  const gstUnder = (t) => (t.taxAfter && gstLines.length
     ? gstLines.map(g => `<div class="line gst-line"><span>${g.label}</span><span>&#8377; ${g.value}</span></div>`).join('')
     : '');
 
@@ -315,6 +316,7 @@ function render({ doc, cfg, pageSize }) {
     </table>
   </div>` : ''}
 
+  ${payBlockHtml(blocks)}
   ${blocks.bankDetails ? `<div class="block"><div class="label">Bank Details</div><div class="body">${blocks.bankDetails}</div></div>` : ''}
 
   ${blocks.signature ? `

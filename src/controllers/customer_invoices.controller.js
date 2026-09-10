@@ -6,6 +6,7 @@ const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/wh
 const { getRoundingFunction } = require('../utils/math');
 const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
+const { getDiscountBasis } = require('../utils/discountBasis');
 // syncPayoutDueDate is no longer required here: it moved inside
 // recalcInvoiceState along with the status recalculation it belongs to, so
 // every path that changes what an invoice has been paid re-anchors the hub
@@ -153,7 +154,21 @@ const CI_SELECT = `
     -- Signed, and ALREADY INCLUDED in grand_total — it is printed as its own
     -- row so the summary block reconciles, never added to anything.
     ci.round_off,
-    ci.notes, ci.odometer_km, ci.created_at, ci.updated_at,
+    ci.notes, ci.created_at, ci.updated_at,
+    /* ── Odometer: the stamp first, then live ────────────────────────────────
+       ci.odometer_km is a real column, stamped at sync time, because a printed
+       tax invoice must keep the reading that was true on the day it was
+       issued. But an invoice generated before anybody typed a reading has that
+       column NULL for good, and nothing ever went back to fill it — the
+       estimate showed the odometer, the purchase invoice showed it, and the
+       customer invoice showed nothing, on the same job.
+
+       So: use the stamped reading when there is one, otherwise fall back live
+       to the estimate's and then the appointment's, exactly the precedence
+       every other read of this field uses. An invoice that already carries a
+       reading is unaffected — it can still only ever be set by a sync, never
+       changed by a later edit. */
+    COALESCE(ci.odometer_km, est_ctx.odometer_km, a.odometer_km) AS odometer_km,
     -- invoice_date is the LEGAL date of the document (migration 099); it is
     -- what the customer, the reports and the printed invoice see. created_at
     -- stays alongside it as the system record of when the row was made, and
@@ -181,6 +196,22 @@ const CI_SELECT = `
     (SELECT COUNT(*)::int FROM invoice_payment_lines cip WHERE cip.customer_invoice_id = ci.id) AS payment_count,
     (SELECT pi.id FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_id,
     (SELECT pi.public_token FROM purchase_invoices pi WHERE pi.estimate_id = ci.estimate_id LIMIT 1) AS linked_purchase_invoice_token,
+
+    /* ── Why the total on this document may be short ──────────────────────
+       Both invoices pick their lines with
+         customer_approved = true AND work_status = 'completed'
+       so a line still waiting on the customer, or approved but not yet fitted,
+       is silently absent from the total. Without a number to show, the figure
+       just looks wrong and nobody can tell why.
+       Counted here rather than fetched separately: these run beside the row, so
+       a list of fifty invoices costs no extra round trips. */
+    (SELECT COUNT(*)::int FROM estimate_items ei
+      WHERE ei.estimate_id = ci.estimate_id
+        AND ei.customer_approved IS NULL) AS items_awaiting_approval,
+    (SELECT COUNT(*)::int FROM estimate_items ei
+      WHERE ei.estimate_id = ci.estimate_id
+        AND ei.customer_approved = TRUE
+        AND ei.work_status <> 'completed') AS items_work_pending,
     -- Must ask the SAME question as _hubPaidFor(), which is what actually
     -- refuses the delete. The UI reads this to decide whether to warn before
     -- deleting a payment; when it matched on estimate_id alone and the guard
@@ -1769,6 +1800,11 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       discountType:  isTx ? txDiscountType : null,
       discountValue: isTx ? txDiscountValue : 0,
       roundFn,
+      /* new Date(), matching roundFn above and for the same reason: this row
+         does not exist yet, so the instant it is about to be stamped with is
+         what decides its rule. An invoice raised now uses the current basis
+         even when its estimate is older — the estimate keeps its own. */
+      basis: getDiscountBasis(new Date()),
     });
 
     const subtotalExGst    = totals.subtotalExGst;
@@ -2289,8 +2325,15 @@ function exportCustomerInvoices(req, res, next) {
     const csvEscape = v => {
       if (v === null || v === undefined) return '';
       const s = String(v);
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
-      return s;
+      /* A leading =, +, - or @ makes Excel evaluate the cell as a formula —
+         CSV injection, and the same guard payments.controller.js has always
+         had. It became load-bearing here when the hub mask changed shape:
+         a masked number is now '+91 98*** **345', so every hub export of this
+         file would have opened as #NAME? without it. A customer called
+         "=Sharma" was always a latent version of the same thing. */
+      const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+      if (safe.includes(',') || safe.includes('"') || safe.includes('\n')) return `"${safe.replace(/"/g, '""')}"`;
+      return safe;
     };
 
     /* The GST block sits between Discount and Grand Total, and `GST` comes
@@ -2461,9 +2504,16 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
     }
 
     // Re-fetch estimate discount fields
+    //
+    // odometer_km rides along, resolved the same way every other read of it is
+    // — the estimate's own figure, else the appointment's. Used below only to
+    // fill a blank; see the note there.
     const estRow = await pool.query(
-      `SELECT e.discount_mode, e.transaction_discount_type, e.transaction_discount_value
-       FROM estimates e WHERE e.id = $1`,
+      `SELECT e.discount_mode, e.transaction_discount_type, e.transaction_discount_value,
+              COALESCE(e.odometer_km, a.odometer_km) AS odometer_km
+         FROM estimates e
+         LEFT JOIN appointments a ON a.id = e.appointment_id
+        WHERE e.id = $1`,
       [ci.estimate_id]
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Linked estimate not found' });
@@ -2502,6 +2552,9 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
       discountType:  isTx ? txDiscountType : null,
       discountValue: isTx ? txDiscountValue : 0,
       roundFn,
+      /* ci.created_at, never new Date(): re-syncing an invoice must not move it
+         onto a rule it was not raised under. Same reasoning as roundFn above. */
+      basis: getDiscountBasis(ci.created_at),
     });
 
     const subtotalExGst   = totals.subtotalExGst;
@@ -2670,6 +2723,32 @@ function syncCustomerInvoiceFromEstimate(req, res, next) {
           id,
         ]
       );
+
+      /* ── The odometer, and ONLY when this invoice has none ────────────
+         A customer invoice is a tax document: what was on it when it was handed
+         over should stay on it. So a reading already recorded here is never
+         touched, however the estimate later changes — the same reasoning that
+         freezes hub_gstin and supplier_state_code on the purchase invoice.
+
+         But a blank is not a snapshot of anything. There is a difference
+         between "the reading was 42,500 when we issued this" and "we never
+         recorded one", and freezing the second preserves nothing — it locks in
+         the gap, and the km-based warranty check
+         (current_km − service_odometer_km <= warranty_km) stays uncomputable
+         for that job for ever. Every one of the 344 customer invoices in this
+         system is currently in exactly that state.
+
+         So: NULL gets filled from the estimate, once. Anything already there is
+         left alone. The WHERE clause does the deciding, not an `if` above it,
+         so two concurrent syncs cannot both decide it was empty. */
+      if (est.odometer_km != null) {
+        await client.query(
+          `UPDATE customer_invoices
+              SET odometer_km = $1, updated_at = NOW()
+            WHERE id = $2 AND odometer_km IS NULL`,
+          [est.odometer_km, id]
+        );
+      }
 
       // Recompute paid status in case grand_total changed
       await _recalcStatus(client, id);

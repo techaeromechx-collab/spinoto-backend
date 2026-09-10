@@ -24,6 +24,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 // Maps docShared's semantic alignment onto this theme's CSS classes.
@@ -312,6 +313,7 @@ function render({ doc, cfg, pageSize }) {
   <div class="footer-row">
     <div class="terms-col">
       ${blocks.terms ? `<div class="block-box"><div class="hd">Terms &amp; Conditions</div>${blocks.terms}</div>` : ''}
+      ${payBlockHtml(blocks)}
       ${blocks.bankDetails ? `<div class="block-box"><div class="hd">Bank Details</div>${blocks.bankDetails}</div>` : ''}
     </div>
     ${blocks.signature ? `<div class="sign-box">

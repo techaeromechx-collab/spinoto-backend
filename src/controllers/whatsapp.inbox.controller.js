@@ -75,10 +75,27 @@ const OWNER_SQL = `COALESCE(c.assigned_user_id, l.assigned_to)`;
  * means one thing on the Leads page and another in the topbar is a CRM where
  * nobody can answer why a customer is missing from a screen.
  *
- * An advisor gets their own work plus the unassigned queue. The queue is in on
- * purpose: those are the leads routing could not place, they are visibly
- * nobody's, and a badge filtered to "mine" would leave them exactly as
- * invisible as they were before any of the routing work.
+ * An advisor gets THEIR OWN WORK AND NOTHING ELSE. The unassigned queue used to
+ * be in this scope too — `OR OWNER IS NULL` — so every conversation routing
+ * could not place sat in every advisor's badge at once. That is now a
+ * supervisor's queue: super admins and VIEW_LEAD holders see it, advisors do
+ * not.
+ *
+ * ⚠️ THE THING TO KNOW BEFORE WIDENING OR NARROWING THIS AGAIN
+ *
+ * announceInbound (whatsapp.webhook.controller.js) sends NO push for an
+ * unassigned conversation — `if (!userId) return`, because a push goes to one
+ * person and picking one at random would be handing out an assignment through a
+ * notification. So for an unassigned message this badge is the ONLY signal the
+ * system produces.
+ *
+ * That is survivable precisely because VIEW_LEAD still sees everything: the
+ * queue has a watcher. Take VIEW_LEAD out of seesEverything as well and an
+ * unassigned customer reaches nobody at all until somebody opens the Leads page
+ * — which is the state this feature was built to end.
+ *
+ * The real fix for a full queue is upstream, not here: set the fallback owner
+ * (rule 3 in waRouting.service.js) so conversations stop arriving ownerless.
  */
 function seesEverything(user) {
   return !!user.is_super_admin || !!user.permissions?.has?.('VIEW_LEAD');
@@ -86,9 +103,7 @@ function seesEverything(user) {
 
 /** $1 is always the user id — the unread cursor needs it whatever the scope. */
 function scopeSql(user) {
-  return seesEverything(user)
-    ? 'TRUE'
-    : `(${OWNER_SQL} = $1 OR ${OWNER_SQL} IS NULL)`;
+  return seesEverything(user) ? 'TRUE' : `${OWNER_SQL} = $1`;
 }
 
 /**

@@ -132,4 +132,67 @@ async function notifyHubsReferenceDataChange(db, { title, body }) {
   }
 }
 
-module.exports = { notifyHubsPricingChange, notifyHubsReferenceDataChange };
+/** Active hub-portal user ids for ONE hub. */
+async function hubUserIdsForHub(db, hubId) {
+  const r = await db.query(
+    `SELECT id FROM users WHERE hub_id = $1 AND is_active = TRUE`,
+    [hubId]
+  );
+  return r.rows.map((row) => row.id);
+}
+
+/**
+ * Tell a hub that an appointment on its bench was booked, moved or cancelled.
+ *
+ * ── Why the actor check is the first thing here ────────────────────────────
+ *
+ * `actorHubId === hubId` means the hub did this itself, and a portal that
+ * chimes at you for the thing you just clicked teaches people to ignore the
+ * chime. The rule the workshop actually asked for is "tell me when SPINOTO
+ * schedules something", and that is exactly this comparison — not a permission
+ * check, because a Spinoto admin who happens to have no hub_id and a hub user
+ * are distinguished by which hub they belong to, not by what they may do.
+ *
+ * ── And why the socket nudge carries no content ────────────────────────────
+ *
+ * getIO().emit reaches EVERY connected browser. The customer's name and
+ * registration go into the notifications row — which is per-user and read back
+ * through the user's own scoped endpoint — while the wire carries only "your
+ * notifications changed". A payload here would put one hub's customer in every
+ * other hub's socket frame.
+ *
+ * Never throws: a booking that saved must not fail because a chime did not.
+ */
+async function notifyHubAppointment(db, { hubId, actorHubId, kind, appointmentId, customer, vehicle, when }) {
+  try {
+    if (!hubId) return;
+    if (actorHubId && Number(actorHubId) === Number(hubId)) return;
+
+    const userIds = await hubUserIdsForHub(db, hubId);
+    if (!userIds.length) return;
+
+    const who = [customer, vehicle].filter(Boolean).join(' · ') || `Appointment #${appointmentId}`;
+    const copy = {
+      created:     { type: 'appointment_scheduled', title: 'New appointment scheduled' },
+      rescheduled: { type: 'appointment_rescheduled', title: 'Appointment rescheduled' },
+      cancelled:   { type: 'appointment_cancelled', title: 'Appointment cancelled' },
+    }[kind];
+    if (!copy) return;
+
+    const body = when ? `${who} — ${when}` : who;
+    await notifyUsers(db, userIds, copy.type, copy.title, body, '/hub/appointments');
+
+    // After the rows exist, so a client that reacts instantly finds them.
+    try {
+      require('../socket').getIO().emit('invalidate', { topic: 'notifications' });
+    } catch { /* no socket server in this process — the 120s poll still catches it */ }
+  } catch (err) {
+    console.error('[hubNotify] appointment notify error:', err.message);
+  }
+}
+
+module.exports = {
+  notifyHubsPricingChange,
+  notifyHubsReferenceDataChange,
+  notifyHubAppointment,
+};

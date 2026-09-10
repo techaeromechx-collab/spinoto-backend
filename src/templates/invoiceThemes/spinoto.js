@@ -29,6 +29,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 // The original Spinoto brand teal, used when the company hasn't chosen an
@@ -241,6 +242,7 @@ function render({ doc, cfg, pageSize }) {
 
       ${blocks.terms ? `<div class="blk"><div class="h">Terms &amp; Conditions</div><div class="body">${blocks.terms}</div></div>` : ''}
 
+      ${payBlockHtml(blocks)}
       ${blocks.bankRows.length ? `
       <div class="blk">
         <div class="h">Bank Details</div>
@@ -255,9 +257,12 @@ function render({ doc, cfg, pageSize }) {
         ${totals.map(t => {
           if (t.key === 'grand')  return `<div class="grand"><span>${t.label}</span><span>₹ ${t.value}</span></div>`;
           if (t.kind === 'strong') return `<div class="strong"><span>${t.label}</span><span>₹ ${t.value}</span></div>`;
-          const tax = t.key === 'gst' && gstLines.length
-            ? `<div class="tax-h">Tax Breakdown</div>` +
-              gstLines.map(g => `<div class="tax"><span>${g.label}</span><span>₹ ${g.value}</span></div>`).join('')
+          const tax = t.taxAfter && gstLines.length
+            /* No caption. The rows now read
+                   Taxable value / CGST 9% / SGST 9% / Grand Total
+               in one continuous column, and a heading in the middle of it
+               breaks the run of figures the reader is adding up. */
+            ?               gstLines.map(g => `<div class="tax"><span>${g.label}</span><span>₹ ${g.value}</span></div>`).join('')
             : '';
           return `<div class="row"><span class="k">${t.label}</span><span>₹ ${t.value}</span></div>${tax}`;
         }).join('')}

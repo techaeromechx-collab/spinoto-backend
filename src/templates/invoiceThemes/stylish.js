@@ -41,6 +41,7 @@ const {
   buildColumns, buildHeaderFields, buildTotals, buildGstLines, buildBlocks,
   buildCoverageRows, buildFooterContact, sellerAddressHtml, buildBuyerRows,
   amountInWords, grandTotalOf, pageScaleCss, pageMarginCss, PRINT_BREAK_CSS, QR_CAPTION,
+  payBlockHtml,
 } = require('./docShared');
 
 const cls = (align) => (align === 'c' ? 'c' : align === 'r' ? 'r' : '');
@@ -108,10 +109,15 @@ function render({ doc, cfg, pageSize }) {
   // of a single lumped "GST" row, so the generic row is swapped out whenever a
   // breakup is available.
   const totalsHtml = totals.map(t => {
-    if (t.key === 'gst' && gstLines.length) {
-      return gstLines.map(g =>
-        `<div class="trow"><span>${g.label}</span><span>₹ ${g.value}</span></div>`
-      ).join('');
+    if (t.taxAfter && gstLines.length) {
+      /* The row AND the lines. This used to return only the lines, which was
+         right while the row said "Total GST" — the per-rate breakup replaced
+         it. The row now carries the taxable value, which the breakup does not
+         restate, so dropping it would take the figure off the invoice. */
+      return `<div class="trow"><span>${t.label}</span><span>₹ ${t.value}</span></div>` +
+        gstLines.map(g =>
+          `<div class="trow"><span>${g.label}</span><span>₹ ${g.value}</span></div>`
+        ).join('');
     }
     if (t.kind === 'grand') {
       return `<div class="trow trow--grand"><span>${t.label}</span><span>₹ ${t.value}</span></div>`;
@@ -307,6 +313,7 @@ function render({ doc, cfg, pageSize }) {
 
   <div class="lower">
     <div class="lo-left">
+      ${payBlockHtml(blocks)}
       ${blocks.bankRows.length ? `
       <div class="blk">
         <div class="h">Bank Details</div>

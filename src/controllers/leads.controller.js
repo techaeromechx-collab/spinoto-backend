@@ -1540,8 +1540,15 @@ function exportLeads(req, res, next) {
     const csvEscape = v => {
       if (v === null || v === undefined) return '';
       const s = String(v);
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
-      return s;
+      /* A leading =, +, - or @ makes Excel evaluate the cell as a formula —
+         CSV injection, and the same guard payments.controller.js has always
+         had. It became load-bearing here when the hub mask changed shape:
+         a masked number is now '+91 98*** **345', so every hub export of this
+         file would have opened as #NAME? without it. A customer called
+         "=Sharma" was always a latent version of the same thing. */
+      const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+      if (safe.includes(',') || safe.includes('"') || safe.includes('\n')) return `"${safe.replace(/"/g, '""')}"`;
+      return safe;
     };
 
     const headers = [

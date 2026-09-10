@@ -40,6 +40,14 @@ const orderLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
 // retry, and every attempt still has to carry a valid HMAC to do anything.
 const verifyLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
 
+/* Before the bare '/:token' route for readability only — Express cannot
+   confuse them, since '/invoice/x' is two path segments and ':token' matches
+   one. Rate-limited like an order rather than like a read: each call can
+   CREATE a payment_links row, so it is a write wearing a read's clothes.
+   Slightly more generous than /order because a customer scanning a paper
+   invoice may well tap twice before the page loads. */
+router.post('/invoice/:token', orderLimit,  c.startInvoicePayment);
+
 router.get('/:token',         readLimit,   c.getPayPage);
 router.post('/:token/order',  orderLimit,  c.createPublicOrder);
 router.post('/:token/verify', verifyLimit, c.verifyPublicPayment);
