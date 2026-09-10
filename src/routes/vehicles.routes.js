@@ -35,7 +35,12 @@ router.delete(
 );
 
 // ── Reference list reads — VIEW_REFERENCE_DATA or any managing permission ─────
-const canViewRef = [requireAuth, requirePermission(
+/* requirePermissionOrHub for the same reason as cc_categories: these three are
+   reference lists a hub must read to describe the vehicle on an estimate, and
+   plain requirePermission denies a zero-permission hub — the open-access case —
+   because .has() on an empty set is always false. The codes are unchanged; only
+   who else passes. */
+const canViewRef = [requireAuth, requirePermissionOrHub(
   'VIEW_REFERENCE_DATA', 'MANAGE_VEHICLE_TYPES', 'MANAGE_BODY_TYPES', 'MANAGE_SEGMENTS',
   'VIEW_CC_CATEGORY', 'CREATE_CC_CATEGORY', 'EDIT_CC_CATEGORY', 'DELETE_CC_CATEGORY', 'MANAGE_CC_CATEGORY',
   'MANAGE_MASTER_DATA', 'CREATE_VEHICLE', 'UPDATE_VEHICLE', 'DELETE_VEHICLE',

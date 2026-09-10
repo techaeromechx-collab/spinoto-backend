@@ -2434,15 +2434,133 @@ function exportCustomerInvoices(req, res, next) {
 // GET /api/customer-invoices/vehicle-history/:vnum
 // Returns all customer invoices for a given vehicle number (case/space insensitive)
 // ─────────────────────────────────────────────────────────────────────────────
+/* ─────────────────────────────────────────────────────────────────────────────
+ * GET /api/customer-invoices/vehicle-history/:vnum
+ *
+ * ── Why this matches PART of a number ────────────────────────────────────────
+ * It used to demand the whole registration. That is the one thing the person
+ * asking never has: a customer says "the 5656 car", an advisor has the last
+ * four digits on a job card, a plate is half legible in a photo. An exact-match
+ * box answers "no invoices found" to a question that had a perfectly good
+ * answer, and the advisor has no way to tell that from "this car has never been
+ * here" — which is the wrong lesson to teach about your own data.
+ *
+ * ── Why the answer is vehicles first, invoices second ────────────────────────
+ * A fragment can belong to more than one car. GJ01AB5656 and GJ27XY5656 are
+ * two vehicles, two owners, two histories — and merged into one list, the
+ * running total at the bottom is a number that describes nobody. So the search
+ * resolves to VEHICLES; the invoices come after, once it is known which car is
+ * meant:
+ *
+ *   one vehicle matched   → its invoices ride along, nothing more to click
+ *   several matched       → the vehicles, for the caller to choose between
+ *   ?all=1                → every matched vehicle's invoices in one list,
+ *                           deliberately, with the registration on every row
+ *
+ * ── Why there is a floor and a ceiling ───────────────────────────────────────
+ * A one-character search matches most of the yard. MIN_PARTIAL keeps that from
+ * being asked at all; VEHICLE_CAP keeps the reply a page rather than a database
+ * dump, and `truncated` is what lets the screen say so instead of quietly
+ * showing the first 25 as if they were all of them.
+ *
+ * A COMPLETE registration still behaves exactly as before — it matches itself
+ * and nothing else, so every existing caller is unaffected.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+// Two characters can still be most of a workshop; three is where a fragment
+// starts to mean something. A full number is never subject to this.
+const MIN_PARTIAL = 3;
+const VEHICLE_CAP = 25;
+
+/* Registration numbers are written every way a human can write them —
+   "GJ 09 EW 6762", "gj-09-ew-6762", "GJ09EW6762". Comparing them means
+   stripping everything that is not a letter or a digit, on BOTH sides, every
+   time. Written once here so the vehicle search, the invoice fetch and the
+   count can never disagree about what "the same number" means. */
+const NORM_V = `regexp_replace(UPPER(COALESCE(ci.vehicle_number, a.vehicle_number, '')), '[^A-Z0-9]', '', 'g')`;
+
 function getVehicleHistory(req, res, next) {
   handle(req, res, next, async () => {
-    const vnum = (req.params.vnum || '').trim().toUpperCase();
-    if (!vnum) return res.json({ items: [], vehicle_number: vnum });
+    const raw  = String(req.params.vnum || '').trim();
+    const norm = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const wantAll = req.query.all === '1' || req.query.all === 'true';
 
-    // A registration number is a trivially guessable key, and the unfiltered
-    // history spans every hub that has ever touched the vehicle. A hub sees
-    // only the visits it performed.
-    const params = [vnum];
+    if (!norm) return res.json({ query: raw, mode: 'none', vehicles: [], items: [], vehicle_number: raw });
+    if (norm.length < MIN_PARTIAL) {
+      return res.json({
+        query: raw, mode: 'too_short', min: MIN_PARTIAL,
+        vehicles: [], items: [], vehicle_number: raw,
+      });
+    }
+
+    /* ── Which vehicles does this fragment name? ───────────────────────────
+       Hub-scoped like everything else here: a registration is a guessable key
+       and the unfiltered history spans every hub that ever touched the car, so
+       a hub sees only the visits it performed — and therefore only the
+       vehicles it has seen.
+
+       COUNT(*) OVER () rather than a second query: the cap means the rows
+       returned cannot tell you how many there were, and asking twice invites
+       the two answers to disagree under a concurrent insert. */
+    const vParams = [norm];
+    const vHubScope = hubScopeSql(req, vParams, 'ci.hub_id');
+    const vehRes = await pool.query(`
+      SELECT ${NORM_V} AS vehicle_key,
+             MAX(COALESCE(ci.vehicle_number, a.vehicle_number)) AS vehicle_number,
+             -- The name on the MOST RECENT invoice, not just any of them. A car
+             -- changes hands; the picker should say who owns it now.
+             (ARRAY_AGG(COALESCE(ci.customer_name, a.customer_name)
+                        ORDER BY ci.invoice_date DESC NULLS LAST, ci.id DESC))[1] AS customer_name,
+             (ARRAY_AGG(COALESCE(ci.mobile, a.mobile)
+                        ORDER BY ci.invoice_date DESC NULLS LAST, ci.id DESC))[1] AS mobile,
+             COUNT(*)::int              AS visits,
+             MAX(ci.invoice_date)::text AS last_visit,
+             SUM(ci.grand_total)        AS total_spent,
+             COUNT(*) OVER ()           AS match_count
+        FROM customer_invoices ci
+        LEFT JOIN appointments a ON a.id = ci.appointment_id
+       WHERE ${NORM_V} LIKE '%' || $1 || '%'
+         AND ${NORM_V} <> ''
+         ${vHubScope ? `AND ${vHubScope}` : ''}
+       GROUP BY ${NORM_V}
+       ORDER BY MAX(ci.invoice_date) DESC NULLS LAST
+       LIMIT ${VEHICLE_CAP + 1}
+    `, vParams);
+
+    // The cap is asked for as CAP+1 and trimmed here, so "there are more" is
+    // known without a COUNT over the whole table.
+    const truncated = vehRes.rows.length > VEHICLE_CAP;
+    const vehicles = vehRes.rows.slice(0, VEHICLE_CAP).map(v => ({
+      vehicle_number: v.vehicle_number,
+      vehicle_key:    v.vehicle_key,
+      customer_name:  v.customer_name,
+      mobile:         v.mobile,
+      visits:         v.visits,
+      last_visit:     v.last_visit,
+      total_spent:    v.total_spent,
+    }));
+
+    if (!vehicles.length) {
+      return res.json({ query: raw, mode: 'none', vehicles: [], items: [], vehicle_number: raw });
+    }
+
+    // Several cars and no instruction to merge them — hand back the choice.
+    // No invoices are fetched at all in this branch; picking one is a second
+    // call, and a list nobody looked at is a query nobody should have paid for.
+    if (vehicles.length > 1 && !wantAll) {
+      return res.json({
+        query: raw, mode: 'multi', vehicles, truncated, vehicle_count: vehicles.length,
+        items: [], vehicle_number: raw,
+      });
+    }
+
+    /* ── The invoices ──────────────────────────────────────────────────────
+       ANY(keys) rather than the fragment again: once the vehicles are known,
+       matching on the fragment a second time would silently re-include a car
+       the caller was never shown (one that arrived between the two queries),
+       and on the ?all=1 path it would ignore the cap the first query applied. */
+    const keys = vehicles.map(v => v.vehicle_key);
+    const params = [keys];
     const hubScope = hubScopeSql(req, params, 'ci.hub_id');
 
     const r = await pool.query(`
@@ -2470,8 +2588,7 @@ function getVehicleHistory(req, res, next) {
       LEFT JOIN hubs h ON h.id = ci.hub_id
       LEFT JOIN areas ar ON ar.id = h.area_id
       LEFT JOIN customer_invoice_items cii ON cii.customer_invoice_id = ci.id
-      WHERE UPPER(REPLACE(COALESCE(ci.vehicle_number, a.vehicle_number, ''), ' ', ''))
-            = UPPER(REPLACE($1, ' ', ''))${hubScope ? ` AND ${hubScope}` : ''}
+      WHERE ${NORM_V} = ANY($1::text[])${hubScope ? ` AND ${hubScope}` : ''}
       GROUP BY ci.id, a.customer_name, a.mobile, a.vehicle_number, ar.name, h.hub_name
       -- Service history is a customer-facing chronology, so it follows the
       -- invoice date rather than when the row was keyed in.
@@ -2479,7 +2596,18 @@ function getVehicleHistory(req, res, next) {
       LIMIT 50
     `, params);
 
-    res.json({ items: r.rows, vehicle_number: vnum });
+    res.json({
+      query: raw,
+      mode: vehicles.length === 1 ? 'single' : 'all',
+      vehicles,
+      truncated,
+      vehicle_count: vehicles.length,
+      items: r.rows,
+      // The resolved registration when exactly one car matched, so the screen
+      // can name it rather than echoing what was typed. On the merged path
+      // there is no single answer, and the number on each row is the truth.
+      vehicle_number: vehicles.length === 1 ? vehicles[0].vehicle_number : raw,
+    });
   });
 }
 
