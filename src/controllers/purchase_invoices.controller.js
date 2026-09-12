@@ -2161,13 +2161,18 @@ function getTechRateSummary(req, res, next) {
     const params = [];
     const hubScope = hubScopeSql(req, params, 'pi.hub_id');
     const r = await pool.query(
+      /* No rate_mode filter — see the same note in reports.controller.js.
+         customer_rate − hub_rate IS the take in commission mode too; the two
+         modes differ only in which field on the hub set the percentage. This
+         summary previously omitted every commission hub from the company's
+         own total take, which is the one number on that screen nobody would
+         think to check. */
       `SELECT
          SUM((pii.customer_rate - pii.hub_rate) * pii.quantity)                              AS total_ex_gst,
          SUM((pii.customer_rate - pii.hub_rate) * pii.quantity * (1 + pii.gst_percent/100)) AS total_inc_gst
        FROM purchase_invoice_items pii
        JOIN purchase_invoices pi ON pi.id = pii.purchase_invoice_id
-       WHERE pi.status = 'approved'
-         AND pi.rate_mode = 'tech_rate'${hubScope ? ` AND ${hubScope}` : ''}`,
+       WHERE pi.status = 'approved'${hubScope ? ` AND ${hubScope}` : ''}`,
       params
     );
     const row = r.rows[0];

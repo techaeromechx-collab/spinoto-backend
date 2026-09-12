@@ -1047,7 +1047,22 @@ async function getHubRevenue(req, res, next) {
     // report's date range/hub filter — Payouts itself has no date filter, but
     // this report does.
     const paramsB = [];
-    const whereB = [`pi.status = 'approved'`, `pi.rate_mode = 'tech_rate'`];
+    /* BOTH rate modes, deliberately — this used to say rate_mode = 'tech_rate'.
+       (customer_rate − hub_rate) is the take in either mode, because both
+       compute the hub's rate the same way:
+
+         commission  hub_rate = customer_rate × (1 − commission%)
+         tech_rate   hub_rate = customer_rate − (customer_rate × tech%)
+
+       Same arithmetic, different label on the hub record. Filtering by the
+       label therefore threw away real margin: a hub billed on commission
+       reported Our Take ₹0 while its Outstanding column — which never had this
+       filter — showed the true figure beside it. The row contradicted itself
+       and the zero looked like a hub we earn nothing from.
+
+       Status still matters and stays: a PI that is not approved is not yet an
+       agreed payout, so its margin is not yet earned. */
+    const whereB = [`pi.status = 'approved'`];
     const dateWhereB = dateParams(from, to, paramsB, 'pi.invoice_date');
     if (dateWhereB) whereB.push(dateWhereB);
     if (hubId) { paramsB.push(hubId); whereB.push(`pi.hub_id = $${paramsB.length}`); }

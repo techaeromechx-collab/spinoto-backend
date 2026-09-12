@@ -405,6 +405,42 @@ function getHub(req, res, next) {
 /**
  * POST /api/hubs
  */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The two rate blocks on a hub are ONE CHOICE.
+ *
+ * purchase_invoices.controller reads them like this, and has always done:
+ *
+ *     commission_percent > 0  →  rate_mode 'commission'; the whole invoice
+ *                                bills at that one percentage and BOTH tech
+ *                                rates are ignored
+ *     otherwise               →  rate_mode 'tech_rate'; the service rate on
+ *                                services, the parts rate on parts
+ *
+ * Nothing refused the third state — all three filled — so a hub was saved with
+ * 15 / 15 / 15 and every invoice quietly billed on commission while the hub
+ * record displayed two more rates that had no effect. It only surfaced because
+ * a report happened to filter on rate_mode and showed that hub's margin as ₹0.
+ *
+ * Refused here as well as in the form because the form is not the only way in:
+ * this same rule has to hold for the API and for anything scripted against it.
+ *
+ * > 0, not "not null": zero IS the way to say "commission does not apply here",
+ * and clearing the field by typing 0 must keep working.
+ * ─────────────────────────────────────────────────────────────────────────── */
+function rateModeConflict({ commission_percent, tech_rate_service, tech_rate_parts }) {
+  const n = (v) => (v === null || v === undefined ? 0 : Number(v));
+  const com = n(commission_percent);
+  if (!(com > 0)) return null;
+  const svc = n(tech_rate_service);
+  const pts = n(tech_rate_parts);
+  if (!(svc > 0) && !(pts > 0)) return null;
+  const which = [svc > 0 ? `Service ${svc}%` : null, pts > 0 ? `Parts ${pts}%` : null]
+    .filter(Boolean).join(' and ');
+  return `This hub cannot have both. A Spinoto Commission of ${com}% bills the whole invoice at that rate, `
+       + `so ${which} would never be used. Set the commission to 0 to bill by the Service and Parts rates, `
+       + `or clear those rates to bill on commission.`;
+}
+
 function createHub(req, res, next) {
   handle(req, res, next, async () => {
     const data      = createSchema.parse(req.body);
@@ -421,6 +457,9 @@ function createHub(req, res, next) {
     // If has_gst is false, always clear gst_number
     const hasGst    = data.has_gst ?? false;
     const gstNumber = hasGst ? (data.gst_number || null) : null;
+
+    const rateClash = rateModeConflict(data);
+    if (rateClash) return res.status(400).json({ error: rateClash });
 
     // Human-readable hub code — generated once, frozen forever. See
     // utils/hubCode.js for the initials/padding/collision-resolution rule.
@@ -485,9 +524,35 @@ function updateHub(req, res, next) {
     const data = updateSchema.parse(req.body);
 
     const exists = await pool.query(
-      'SELECT id, verification_status FROM hubs WHERE id = $1 AND deleted_at IS NULL', [id]
+      `SELECT id, verification_status, commission_percent, tech_rate_service, tech_rate_parts
+         FROM hubs WHERE id = $1 AND deleted_at IS NULL`, [id]
     );
     if (exists.rowCount === 0) return res.status(404).json({ error: 'HUB not found' });
+
+    /* Checked against the ROW THAT WILL EXIST, not against the payload.
+       Every rate column below is written with COALESCE($n, column), so a PATCH
+       carrying only commission_percent leaves the tech rates untouched — and
+       the conflict is created by a request that never mentions them. Merging
+       first is the only way to catch that.
+
+       ONLY when the request actually touches a rate, though. A hub saved in
+       the conflicting state before this rule existed must stay editable:
+       refusing to let anyone correct its phone number until its rates are
+       sorted out turns one bad field into a locked record, and the person
+       fixing the phone number is rarely the person who can decide the
+       commercial terms. Touch a rate and you own the whole choice; leave them
+       alone and the legacy row passes through untouched. */
+    const touchesRates = data.commission_percent !== undefined
+      || data.tech_rate_service !== undefined
+      || data.tech_rate_parts   !== undefined;
+    if (touchesRates) {
+      const rateClash = rateModeConflict({
+        commission_percent: data.commission_percent ?? exists.rows[0].commission_percent,
+        tech_rate_service:  data.tech_rate_service  ?? exists.rows[0].tech_rate_service,
+        tech_rate_parts:    data.tech_rate_parts    ?? exists.rows[0].tech_rate_parts,
+      });
+      if (rateClash) return res.status(400).json({ error: rateClash });
+    }
 
     // If the hub was rejected, editing it resets it to pending for re-review
     const wasRejected = exists.rows[0].verification_status === 'rejected';
