@@ -41,7 +41,12 @@ const pool = new Pool({
   ssl: sslConfig,
   options: '-c timezone=Asia/Kolkata',
   max: 10,
-  idleTimeoutMillis: 30_000,
+  // Longer than the slowest background poller (whatsappOutbox and
+  // integrationSettings both tick every 60s). At 30s every one of those ticks
+  // found the pool empty and paid for a fresh TCP + TLS + Neon-pooler
+  // handshake; at 120s they reuse one warm connection. Fewer cold connects
+  // also means fewer slow ones for anything else to land on.
+  idleTimeoutMillis: 120_000,
 });
 
 pool.on('error', (err) => {

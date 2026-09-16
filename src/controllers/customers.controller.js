@@ -782,6 +782,22 @@ function getCustomer(req, res, next) {
         default_b2b_company_name:    profile?.default_b2b_company_name   || null,
         default_b2b_gst_number:      profile?.default_b2b_gst_number     || null,
         default_b2b_address:         profile?.default_b2b_address        || null,
+        /* Where the customer is. The profile query above has fetched these
+           since migration 063 and the response never carried them, so the
+           page had no way to print a location it already held for 216 of the
+           232 profiles — and the edit form, having never seen them, sent the
+           three ids back as undefined and nulled them on every save.
+
+           Ids AND names: the names are what the page prints, the ids are what
+           the three pickers bind to. Deriving one from the other in the
+           browser would mean shipping the whole states/cities/areas tables to
+           do it. */
+        state_id:   profile?.state_id   ?? null,
+        state_name: profile?.state_name || null,
+        city_id:    profile?.city_id    ?? null,
+        city_name:  profile?.city_name  || null,
+        area_id:    profile?.area_id    ?? null,
+        area_name:  profile?.area_name  || null,
         customer_name:       name,
         total_appointments:  appts.length,
         total_spend:         totalSpend,

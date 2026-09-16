@@ -146,22 +146,153 @@ async function getStatusDistribution(req, res, next) {
     const { userIds }          = await resolveScope(req.user);
     const params               = [];
 
+    /* Every column below is qualified with the leads alias, because the query
+       now joins lead_statuses and `status`, `created_by` and `created_at`
+       would otherwise be ambiguous — or worse, silently resolve to the wrong
+       table's column of the same name. */
     let scopeWhere = '';
-    if (userIds) { params.push(userIds); scopeWhere = `created_by = ANY($${params.length})`; }
+    if (userIds) { params.push(userIds); scopeWhere = `l.created_by = ANY($${params.length})`; }
 
-    const dw      = dateParams(from, to, params, 'created_at');
-    const hub     = hubClause(hub_id, params);
+    const dw      = dateParams(from, to, params, 'l.created_at');
+    const hub     = hubClause(hub_id, params, 'l.created_by', 'l.assigned_to');
     const clauses = [scopeWhere, dw, hub].filter(Boolean);
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
+    /* The two flags come along so the SCREEN can group these without keeping
+       its own list of which status means what. lead_statuses already answers
+       it — converts_to_appointment is a win, is_closed is finished — and a
+       second copy of that judgement in the frontend would be one more place
+       to update when a status is added, and the place nobody would think of.
+
+       LEFT JOIN, not JOIN: leads carry the status NAME as text, so a status
+       that was renamed or deleted leaves rows pointing at nothing. Those must
+       still be counted — they are leads — so they arrive with both flags null
+       and the screen files them under "working", which is the honest answer
+       for a status nobody can describe any more.
+
+       COALESCE on the name for the same reason: a lead with no status at all
+       is a real lead and a real gap, and dropping it would make the total
+       disagree with the lead count on the same page. */
     const r = await pool.query(`
-      SELECT status AS name, COUNT(*)::int AS value
-      FROM leads ${where}
-      GROUP BY status
+      SELECT COALESCE(l.status, '(No status)') AS name,
+             COUNT(*)::int                     AS value,
+             BOOL_OR(COALESCE(ls.converts_to_appointment, FALSE)) AS is_won,
+             BOOL_OR(COALESCE(ls.is_closed, FALSE))               AS is_closed
+      FROM leads l
+      LEFT JOIN lead_statuses ls ON ls.name = l.status
+      ${where}
+      GROUP BY COALESCE(l.status, '(No status)')
       ORDER BY value DESC
     `, params);
 
     res.json({ items: r.rows });
+  } catch (err) { next(err); }
+}
+
+// =====================================================================
+// PIPELINE SUMMARY — the operations half of the Overview tab
+//
+// The page could already tell you everything about LEADS and nothing about
+// what happened afterwards: how many appointments, how many estimates, what
+// was quoted, what the hubs cost, what was billed and what actually arrived.
+// Those are five different tables and were five different screens.
+//
+// ── Each record is filtered on ITS OWN date ─────────────────────────────────
+// A lead created in January, invoiced in March, is a January lead and March
+// revenue. That is what the existing cards already do (leads on created_at,
+// invoices on invoice_date) and what anyone reading "this month" means. The
+// alternative — a cohort, tracing January's leads wherever they ended up — is
+// a truer measure of a month's CALLING, and a wrong answer to "what did we
+// bill this month". One page cannot mean both, so it keeps the one it had.
+//
+// ── The hub filter uses each record's own hub_id ────────────────────────────
+// Not the user-based hubClause the lead queries use. An appointment, estimate
+// and invoice each belong to a hub directly; asking instead whether the person
+// who created it is attached to that hub answers a different question and gets
+// it wrong for anything created by head office.
+//
+// Leads stay outside this: they have no hub until they become an appointment,
+// so the Total Leads card ignores the hub filter — as it always has.
+// =====================================================================
+async function getPipelineSummary(req, res, next) {
+  try {
+    const { from, to, hub_id } = req.query;
+    const { scope, userIds }   = await resolveScope(req.user);
+
+    // Built per query rather than shared: each table has its own date column
+    // and its own creator column, and a $1 that means different things in two
+    // queries is the bug this shape avoids.
+    const build = (dateCol, opts = {}) => {
+      const params = [];
+      const clauses = [];
+      if (userIds && opts.creatorCol) {
+        params.push(userIds);
+        clauses.push(`${opts.creatorCol} = ANY($${params.length})`);
+      }
+      const dw = dateParams(from, to, params, dateCol);
+      if (dw) clauses.push(dw);
+      if (hub_id && opts.hubCol) {
+        params.push(Number(hub_id));
+        clauses.push(`${opts.hubCol} = $${params.length}`);
+      }
+      if (opts.extra) clauses.push(opts.extra);
+      return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+    };
+
+    const ap = build('a.created_at',  { creatorCol: 'a.created_by', hubCol: 'a.hub_id' });
+    const es = build('e.created_at',  { creatorCol: 'e.created_by', hubCol: 'e.hub_id' });
+    const pi = build('pi.invoice_date', { creatorCol: 'pi.created_by', hubCol: 'pi.hub_id',
+                                          extra: `pi.status <> 'cancelled'` });
+    // customer_invoices has no created_by — it is generated from an estimate
+    // rather than typed by anyone — so it is scoped by hub and date only.
+    const ci = build('ci.invoice_date', { hubCol: 'ci.hub_id', extra: `ci.status <> 'cancelled'` });
+
+    const [apR, esR, piR, ciR] = await Promise.all([
+      pool.query(`
+        SELECT COUNT(*)::int AS appointments,
+               /* Cancelled and no-show excluded from the "did it produce work"
+                  half only — the raw count still includes them, because a
+                  cancelled booking is work the caller did. */
+               COUNT(*) FILTER (
+                 WHERE EXISTS (SELECT 1 FROM customer_invoices x
+                                WHERE x.appointment_id = a.id AND x.status <> 'cancelled')
+               )::int AS appointments_invoiced
+          FROM appointments a ${ap.where}`, ap.params),
+
+      pool.query(`
+        SELECT COUNT(*)::int AS estimates,
+               COALESCE(SUM(e.grand_total), 0)::numeric(14,2) AS estimates_value
+          FROM estimates e ${es.where}`, es.params),
+
+      pool.query(`
+        SELECT COUNT(*)::int AS purchase_invoices,
+               COALESCE(SUM(pi.grand_total), 0)::numeric(14,2) AS hub_cost
+          FROM purchase_invoices pi ${pi.where}`, pi.params),
+
+      pool.query(`
+        SELECT COUNT(*)::int AS customer_invoices,
+               COALESCE(SUM(ci.grand_total), 0)::numeric(14,2) AS billed,
+               COALESCE(SUM(ci.amount_paid), 0)::numeric(14,2) AS collected
+          FROM customer_invoices ci ${ci.where}`, ci.params),
+    ]);
+
+    const billed    = Number(ciR.rows[0].billed);
+    const collected = Number(ciR.rows[0].collected);
+    const hubCost   = Number(piR.rows[0].hub_cost);
+
+    res.json({
+      scope,
+      ...apR.rows[0],
+      ...esR.rows[0],
+      ...piR.rows[0],
+      ...ciR.rows[0],
+      /* Never below zero. Billed and hub cost are filtered independently — a
+         purchase invoice raised inside the range whose customer invoice falls
+         outside it can push the subtraction negative, and "margin −₹4,000"
+         on a dashboard reads as a loss rather than as an edge of the window. */
+      margin: Math.max(0, Number((billed - hubCost).toFixed(2))),
+      outstanding: Math.max(0, Number((billed - collected).toFixed(2))),
+    });
   } catch (err) { next(err); }
 }
 
@@ -241,6 +372,19 @@ async function getByUser(req, res, next) {
     const ciDw       = dateParams(from, to, params, 'ci2.invoice_date');
     const ciDateCond = ciDw ? `AND ${ciDw}` : '';
 
+    /* ── Money actually received, and how many invoices it came from ────────
+       A THIRD date filter, on the day the money arrived. Each of these three
+       columns answers a question about a different event — a lead was created,
+       an invoice was raised, a payment landed — and they happen weeks apart.
+       Filtering all three on the lead's date would have put a January lead's
+       March payment into January, which is not when the business got paid.
+
+       Credited to appointments.created_by: the person who booked the job, on
+       both routes into the system (converting a lead, and the Create
+       Appointment button). It is the only field filled on both. */
+    const payDw       = dateParams(from, to, params, 'pl.paid_at');
+    const payDateCond = payDw ? `AND ${payDw}` : '';
+
     const r = await pool.query(`
       SELECT
         u.id                                                                        AS user_id,
@@ -261,7 +405,43 @@ async function getByUser(req, res, next) {
           WHERE a2.created_by = u.id
             AND ci2.status != 'cancelled'
             ${ciDateCond}
-        )::numeric                                                                  AS ci_total
+        )::numeric                                                                  AS ci_total,
+
+        /* ── Collected ──────────────────────────────────────────────────────
+           Real payment rows, not invoice totals. An invoice raised is a hope;
+           a payment line is money in the account, and it is the only figure
+           safe to pay an incentive on.
+
+           SUM over payment LINES, so a part payment counts for exactly what
+           was received and an invoice settled in three instalments is counted
+           once per instalment rather than once at its full value. */
+        (
+          SELECT COALESCE(SUM(pl.amount), 0)
+          FROM appointments a3
+          JOIN customer_invoices ci3 ON ci3.appointment_id = a3.id AND ci3.status != 'cancelled'
+          JOIN invoice_payment_lines pl ON pl.customer_invoice_id = ci3.id
+          WHERE a3.created_by = u.id
+            ${payDateCond}
+        )::numeric                                                                  AS collected,
+
+        /* ── Paid invoices ──────────────────────────────────────────────────
+           DISTINCT the invoice, not the payment line: three instalments on one
+           job are one paid invoice, and counting the lines would flatter
+           whoever happens to serve customers who pay in pieces.
+
+           Deliberately NOT "appointments with status Closed". The two disagree
+           in production — jobs sit on Invoice Approved with the money already
+           received, and a few marked Closed have taken nothing. A status is a
+           label somebody has to remember to change; a payment row is an event
+           that happened. */
+        (
+          SELECT COUNT(DISTINCT ci4.id)
+          FROM appointments a4
+          JOIN customer_invoices ci4 ON ci4.appointment_id = a4.id AND ci4.status != 'cancelled'
+          JOIN invoice_payment_lines pl ON pl.customer_invoice_id = ci4.id
+          WHERE a4.created_by = u.id
+            ${payDateCond}
+        )::int                                                                      AS paid_invoices
       FROM users u
       LEFT JOIN leads l ON (l.created_by = u.id OR l.assigned_to = u.id) ${dateCond}
       LEFT JOIN appointments a ON a.lead_id = l.id
@@ -1194,7 +1374,7 @@ async function getHubRevenue(req, res, next) {
 }
 
 module.exports = {
-  getDashboardStats, getSummary, getStatusDistribution,
+  getDashboardStats, getSummary, getStatusDistribution, getPipelineSummary,
   getCategoryRevenue, getByUser, getUserDetail,
   getRevenueTrend, getConversionFunnel, getTopPerformers,
   getTeamPerformance, getLeadsOverTime, getLeadsBySource,

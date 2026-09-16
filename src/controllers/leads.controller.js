@@ -1,6 +1,7 @@
 const { z } = require('zod');
 const { fireWhatsAppEvent } = require('../services/whatsappAutomations.service');
 const { pool } = require('../config/db');
+const { resolveVehicleTypeId } = require('../utils/vehicleType');
 const {
   fireHighPriorityAlert,
   fireDuplicateLeadAlert,
@@ -1328,6 +1329,13 @@ function createLead(req, res, next) {
       // Only use data.status if explicitly passed
       const initialStatus = data.status || null;
 
+      /* The type, derived from the make when nobody picked one. This form is
+         where the blank starts: it offers a make and a model without requiring
+         a type, and everything downstream — the appointment, the invoice, the
+         Hub Revenue split — inherits the gap silently.
+         See utils/vehicleType.js; a chosen type is never overridden. */
+      const leadVehicleTypeId = await resolveVehicleTypeId(client, data);
+
       const leadRes = await client.query(
         `INSERT INTO leads (
           name, mobile, whatsapp, state_id, city_id, area_id,
@@ -1341,7 +1349,7 @@ function createLead(req, res, next) {
         [
           data.name, data.mobile, data.whatsapp || null,
           data.state_id || null, data.city_id || null, data.area_id || null,
-          data.vehicle_type_id || null, data.make_id || null, data.model_id || null,
+          leadVehicleTypeId, data.make_id || null, data.model_id || null,
           data.body_type_id || null, data.segment_ids,
           data.lead_source || null, initialStatus, totalPrice, data.notes || null,
           userId, data.assigned_to || null,

@@ -13,6 +13,7 @@
 
 const { z } = require('zod');
 const { pool } = require('../config/db');
+const { resolveVehicleTypeId } = require('../utils/vehicleType');
 const { logActivity } = require('../services/activityLog.service');
 const { generateAppointmentCode } = require('../utils/appointmentCode');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
@@ -455,6 +456,12 @@ function createAppointment(req, res, next) {
     try {
       await client.query('BEGIN');
 
+      /* Fill in a vehicle type nobody chose, from the make the vehicle already
+         names. A blank type is invisible here and then reappears three tables
+         later as an invoice the Hub Revenue report files under "Not set".
+         Never overrides a type that WAS chosen — see utils/vehicleType.js. */
+      const resolvedVehicleTypeId = await resolveVehicleTypeId(client, data);
+
       const ins = await client.query(
         `INSERT INTO appointments (
           lead_id, customer_name, mobile, whatsapp,
@@ -479,7 +486,7 @@ function createAppointment(req, res, next) {
           data.mobile,                           // $3
           data.whatsapp || null,           // $4
           data.vehicle_number || null,           // $5
-          data.vehicle_type_id || null,          // $6
+          resolvedVehicleTypeId,                 // $6
           data.make_id || null,          // $7
           data.model_id || null,          // $8
           data.body_type_id || null,          // $9

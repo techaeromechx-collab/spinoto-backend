@@ -22,6 +22,11 @@ router.get('/dashboard',           canViewAny,     c.getDashboardStats);
 router.get('/summary',             canViewAny,     c.getSummary);
 router.get('/status-distribution', canViewLeads,   c.getStatusDistribution);
 router.get('/category-revenue',    canViewRevenue, c.getCategoryRevenue);
+/* canViewRevenue, not canViewLeads: this returns what was quoted, what the
+   hubs cost and the margin between them. Counts of appointments would be
+   harmless; the money beside them is not, and the permission has to match the
+   most sensitive thing in the response rather than the least. */
+router.get('/pipeline-summary',    canViewRevenue, c.getPipelineSummary);
 router.get('/by-user',             canView,        c.getByUser);
 router.get('/user-detail/:userId', canView,        c.getUserDetail);
 

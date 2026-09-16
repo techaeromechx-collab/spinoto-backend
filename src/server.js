@@ -176,7 +176,21 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // ---- Health --------------------------------------------------------------
-app.get('/api/health', async (_req, res) => {
+// Render polls this on a 5-SECOND timeout and kills the instance when it
+// misses. It used to run `SELECT NOW()`, which made "is this process alive?"
+// depend on a round trip to a pooled, sometimes-cold managed Postgres. One
+// slow connect and a perfectly healthy instance was restarted -- which is
+// exactly the "HTTP health check failed (timed out after 5 seconds)" /
+// "Service recovered" pair in the Render log.
+//
+// So liveness now answers from memory. The database check is unchanged, it
+// just moved to /api/health/db: nothing polls that one, and it stays the
+// thing to curl when the question really is "can the app reach the database".
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, uptime: Math.round(process.uptime()) });
+});
+
+app.get('/api/health/db', async (_req, res) => {
   try {
     const r = await pool.query('SELECT NOW() AS now');
     res.json({ ok: true, db_time: r.rows[0].now });
