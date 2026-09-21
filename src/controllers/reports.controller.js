@@ -679,6 +679,19 @@ async function getDashboardStats(req, res, next) {
         `SELECT
            h.id AS hub_id,
            h.hub_name,
+           -- Spinoto's cut, not the hub's. 15% on most hubs, 33% on one, and
+           -- 100% on Tragad because that shop is ours — we keep the whole job.
+           -- Parts and service are separate rates and differ on one hub, so
+           -- both travel and the card decides how to show them.
+           h.tech_rate_parts,
+           h.tech_rate_service,
+           -- One row per hub PER VEHICLE TYPE. Splitting here rather than
+           -- adding 2W/4W variants of all ten status columns keeps the SQL
+           -- flat: 16 hubs produce at most 48 rows, and the card sums the
+           -- buckets it wants. 'other' is an invoice with no appointment
+           -- behind it (19 of 264 today — standalone invoices), which has no
+           -- vehicle type to read and so belongs in neither 2W nor 4W.
+           COALESCE(vt.name, 'other') AS vehicle,
            -- The "All" tab: no FILTER, so it picks up every status the join
            -- let through. Cancelled is excluded in the JOIN condition, which
            -- is what keeps this equal to the sum of the four status tabs —
@@ -701,10 +714,19 @@ async function getDashboardStats(req, res, next) {
          LEFT JOIN customer_invoices ci ON ci.hub_id = h.id
            AND ci.invoice_date >= $1::date
            AND ci.status <> 'cancelled'
+         -- Both LEFT: an invoice with no appointment must survive the join and
+         -- land in the 'other' bucket. An INNER join here would silently drop
+         -- those 19 invoices from the card's totals, which would then stop
+         -- matching the invoice list with nothing to show why.
+         LEFT JOIN appointments  a  ON a.id  = ci.appointment_id
+         LEFT JOIN vehicle_types vt ON vt.id = a.vehicle_type_id
          WHERE h.deleted_at IS NULL AND h.is_active = TRUE
-         GROUP BY h.id, h.hub_name
+         GROUP BY h.id, h.hub_name, h.tech_rate_parts, h.tech_rate_service,
+                  COALESCE(vt.name, 'other')
          ORDER BY all_value DESC, h.id
-         LIMIT 50`,
+         -- Raised from 50: rows are now per hub per vehicle type, so the same
+         -- 16 hubs can occupy up to 48 of them.
+         LIMIT 150`,
         [hubStart]
       ),
 
@@ -799,6 +821,10 @@ async function getDashboardStats(req, res, next) {
       outstanding_amount:  pendingInvoices.rows[0]?.outstanding_amount || 0,
       lead_conversion:     leadConversion.rows[0] || { total_leads: 0, converted_leads: 0, conversion_rate: 0 },
       hub_performance:     hubPerformance.rows,
+      // The card prints the window it is actually showing. Derived here, not
+      // in the browser, so "All Time" cannot drift from the date the query
+      // really used.
+      hub_range:           { from: hubStart, to: today, period },
       recent_invoices:     recentInvoices.rows,
       invoice_status_break: invoiceStatusBreak.rows,
       pipeline_value:      Number(pipelineValue.rows[0]?.pipeline_value || 0),
