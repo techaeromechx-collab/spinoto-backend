@@ -72,7 +72,21 @@ async function recalcInvoiceState(client, ciId) {
             (SELECT COALESCE(SUM(rf.amount), 0)
                FROM payment_refunds rf
               WHERE rf.customer_invoice_id = ci.id
-                AND rf.status = 'processed')       AS refunded
+                AND rf.status = 'processed')       AS refunded,
+            -- ── Credit notes (migration 185) ───────────────────────────
+            -- A credit note does NOT behave like a payment. A payment is money
+            -- arriving against the amount due; a credit note reduces the
+            -- amount due itself. Counting one as the other would settle the
+            -- invoice while leaving a tax liability the customer was never
+            -- charged.
+            --
+            -- 'issued' only. A cancelled note keeps its number and stops
+            -- counting, which is the whole reason cancelling exists rather
+            -- than deleting.
+            (SELECT COALESCE(SUM(cn.grand_total), 0)
+               FROM credit_notes cn
+              WHERE cn.customer_invoice_id = ci.id
+                AND cn.status = 'issued')          AS credited
        FROM customer_invoices ci
       WHERE ci.id = $1`,
     [ciId]
@@ -83,11 +97,19 @@ async function recalcInvoiceState(client, ciId) {
     throw err;
   }
 
-  const { grand_total, current_status, appointment_id, estimate_id, paid_gross, refunded } = r.rows[0];
+  const { grand_total, current_status, appointment_id, estimate_id, paid_gross, refunded, credited } = r.rows[0];
   const gross    = parseFloat(paid_gross);
   const refunds  = parseFloat(refunded);
   const amtPaid  = gross - refunds;
-  const total    = parseFloat(grand_total);
+
+  /* What the customer actually has to pay, after any credit note. Floored at
+     zero: a credit note larger than the invoice is a data error rather than a
+     negative liability, and letting the total go negative would flip every
+     comparison below. The controller refuses to issue one that large; this is
+     the second line of defence. */
+  const billed   = parseFloat(grand_total);
+  const credits  = parseFloat(credited);
+  const total    = Math.max(0, Number((billed - credits).toFixed(2)));
 
   // The 0.011 tolerance is carried over verbatim from the original. It exists
   // because grand_total is rounded to paise while payments are entered by
@@ -150,7 +172,12 @@ async function recalcInvoiceState(client, ciId) {
     appointment_id,
     estimate_id,
     amount_paid: amtPaid,
-    grand_total: total,
+    /* grand_total stays the INVOICE's figure, unchanged, because callers print
+       it. The net-of-credit figure every comparison above used is reported
+       separately rather than quietly redefining a field other code reads. */
+    grand_total: billed,
+    credited: credits,
+    payable: total,
     balance: Number((total - amtPaid).toFixed(2)),
   };
 }
@@ -194,7 +221,14 @@ async function readInvoiceBalance(db, ciId) {
             (SELECT COALESCE(SUM(rf.amount), 0)
                FROM payment_refunds rf
               WHERE rf.customer_invoice_id = ci.id
-                AND rf.status = 'processed')       AS refunded
+                AND rf.status = 'processed')       AS refunded,
+            -- Same credit-note subquery as recalc. This function exists
+            -- precisely so a gateway order is never raised against a stale
+            -- figure, so it must not be the one place that forgets them.
+            (SELECT COALESCE(SUM(cn.grand_total), 0)
+               FROM credit_notes cn
+              WHERE cn.customer_invoice_id = ci.id
+                AND cn.status = 'issued')          AS credited
        FROM customer_invoices ci
        LEFT JOIN appointments a ON a.id = ci.appointment_id
       WHERE ci.id = $1`,
@@ -203,13 +237,17 @@ async function readInvoiceBalance(db, ciId) {
   const row = r.rows[0];
   if (!row) return null;
 
-  const paid = parseFloat(row.paid_gross) - parseFloat(row.refunded);
-  const total = parseFloat(row.grand_total);
+  const paid    = parseFloat(row.paid_gross) - parseFloat(row.refunded);
+  const billed  = parseFloat(row.grand_total);
+  const credits = parseFloat(row.credited);
+  const payable = Math.max(0, Number((billed - credits).toFixed(2)));
   return {
     ...row,
     amount_paid: Number(paid.toFixed(2)),
-    grand_total: total,
-    balance: Number((total - paid).toFixed(2)),
+    grand_total: billed,
+    credited: credits,
+    payable,
+    balance: Number((payable - paid).toFixed(2)),
   };
 }
 

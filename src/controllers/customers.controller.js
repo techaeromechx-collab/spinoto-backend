@@ -896,6 +896,23 @@ function addCustomerVehicle(req, res, next) {
     const {
       vehicle_number, vehicle_type_id, make_id, model_id,
       color, year, notes, segment_id,
+      /* ── Promoting a plate that only exists on documents ────────────────
+         The Customer page shows vehicles that were never saved — plates read
+         off past appointments and invoices. "Save" on one of those lands
+         here, and the commonest reason anybody opens it is that the plate is
+         WRONG and they want it corrected.
+
+         Before this, a corrected plate simply created a second vehicle and
+         left the wrong one on the appointment, the estimate and the invoice.
+         The banner promised "save it to make it editable"; what it delivered
+         was an orphan. A real customer hit this on CI-000438.
+
+         So the promote path now carries the same two fields the edit path
+         has, and runs the same cascade. Sent only when the user ticks the
+         box, because promoting a plate under a DIFFERENT number is also a
+         legitimate way to add a second vehicle. */
+      original_vehicle_number,
+      propagate_vehicle_number,
     } = req.body;
 
     if (!vehicle_number?.trim()) {
@@ -917,24 +934,61 @@ function addCustomerVehicle(req, res, next) {
       });
     }
 
-    const r = await pool.query(`
-      INSERT INTO customer_vehicles
-        (mobile, vehicle_number, vehicle_type_id, make_id, model_id, color, year, notes, segment_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING
-        id, mobile, vehicle_number, vehicle_type_id, make_id, model_id,
-        color, year, notes, segment_id, created_at
-    `, [
-      mobile,
-      normalised,
-      vehicle_type_id || null,
-      make_id         || null,
-      model_id        || null,
-      color           || null,
-      year            || null,
-      notes           || null,
-      segment_id      || null,
-    ]);
+    const oldPlate = String(original_vehicle_number || '').trim().toUpperCase();
+    const plateChanged = !!oldPlate && oldPlate !== normalised;
+    const doCascade = plateChanged && !!propagate_vehicle_number;
+
+    /* One transaction. The row and the corrected documents are one decision —
+       a half-applied correction leaves the plate fixed on the invoice and
+       missing from the vehicle list, which is harder to diagnose than the
+       original bug. */
+    const client = await pool.connect();
+    let r;
+    try {
+      await client.query('BEGIN');
+
+      r = await client.query(`
+        INSERT INTO customer_vehicles
+          (mobile, vehicle_number, vehicle_type_id, make_id, model_id, color, year, notes, segment_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING
+          id, mobile, vehicle_number, vehicle_type_id, make_id, model_id,
+          color, year, notes, segment_id, created_at
+      `, [
+        mobile,
+        normalised,
+        vehicle_type_id || null,
+        make_id         || null,
+        model_id        || null,
+        color           || null,
+        year            || null,
+        notes           || null,
+        segment_id      || null,
+      ]);
+
+      if (doCascade) {
+        /* The SAME function the edit path uses. Only the plate is propagated
+           here: the details switches belong to editing a vehicle the customer
+           already has, and a promote has no previous details to compare
+           against. */
+        await cascadeVehicleEdit(client, {
+          mobile, oldPlate, newPlate: normalised, plateChanged: true,
+          vehicle_type_id: vehicle_type_id || null,
+          make_id: make_id || null,
+          model_id: model_id || null,
+          propagate_vehicle_number: true,
+          propagate_details: false,
+          propagate_details_all: false,
+        });
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* the original error is the one that matters */ }
+      throw err;
+    } finally {
+      client.release();
+    }
 
     // Fetch with joins for full response
     const full = await pool.query(`
@@ -954,7 +1008,7 @@ function addCustomerVehicle(req, res, next) {
        WHERE cv.id = $1
     `, [r.rows[0].id]);
 
-    res.status(201).json({ item: full.rows[0] });
+    res.status(201).json({ item: full.rows[0], propagated: doCascade });
   });
 }
 

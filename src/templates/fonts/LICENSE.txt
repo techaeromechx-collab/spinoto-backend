@@ -1,0 +1,31 @@
+Arimo, Tinos and Cousine
+Copyright 2010, 2012-2020 Google Inc. / 2015-2020 Google LLC.
+
+Licensed under the SIL Open Font License, Version 1.1.
+Full text: https://scripts.sil.org/OFL
+
+The .woff2 files in this folder are SUBSETS of the upstream TrueType fonts
+(Debian package `fonts-croscore`, version 20201225). They were reduced with
+fontTools' pyftsubset to the character ranges an Indian GST invoice actually
+prints — Basic Latin, Latin-1 Supplement, Latin Extended-A, common
+typographic punctuation, and the Indian Rupee sign U+20B9 — then re-flavoured
+to WOFF2. Subsetting and format conversion are expressly permitted by the
+OFL; the fonts have not been renamed, and no Reserved Font Name applies.
+
+Why these three specifically
+────────────────────────────
+They are metrically compatible, glyph for glyph, with the fonts the invoice
+templates ask for:
+
+    Arimo   ≡ Arial / Helvetica
+    Tinos   ≡ Times New Roman  (the fallback behind Georgia)
+    Cousine ≡ Courier New
+
+"Metrically compatible" means every character occupies exactly the same
+advance width as in the font it stands in for. Substituting them cannot
+change where a line wraps or where a page breaks — which is the whole point
+of shipping them rather than letting the host pick a substitute.
+
+Do not replace these with a visually similar font that is not metrically
+compatible (Liberation Sans is fine; Open Sans, Roboto and Noto Sans are
+not). Doing so will silently reflow every invoice ever generated.

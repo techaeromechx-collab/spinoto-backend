@@ -503,6 +503,32 @@ const PERMISSIONS = Object.freeze({
     group: 'Invoices',
   },
 
+  // ---- Ledger (credit notes, opening balances) ----
+  //
+  // Both of these change what a party appears to owe WITHOUT an invoice behind
+  // the change, which is why neither is bundled into EDIT_INVOICE and why they
+  // are two permissions rather than one: a business may well want one person
+  // issuing credit notes and a different person setting opening balances.
+  //
+  // Migrations 185 and 186 deliberately grant them to no role. They are listed
+  // here so the roles screen can offer them — without a catalog entry the
+  // roles screen never renders them, role validation rejects them, and user
+  // assignment silently drops them, which leaves the feature reachable by
+  // super admins only. Listing them is what makes them grantable; it does not
+  // give them to anybody.
+  MANAGE_CREDIT_NOTE: {
+    code: 'MANAGE_CREDIT_NOTE',
+    label: 'Manage Credit Notes',
+    description: 'Issue and cancel credit notes against customer invoices, and debit notes against hubs. A credit note reduces the invoice balance and the GST liability declared for that period (GSTR-1 Table 9B), so it lowers both what the customer owes and what the business has to pay. Intended for the accounts owner only.',
+    group: 'Invoices',
+  },
+  MANAGE_OPENING_BALANCE: {
+    code: 'MANAGE_OPENING_BALANCE',
+    label: 'Manage Opening Balances',
+    description: 'Set or clear the pre-Spinoto opening balance on a customer or hub ledger. This is the one figure in a statement with no document behind it, and it moves the closing balance one-for-one. Intended for the accounts owner only.',
+    group: 'Invoices',
+  },
+
   // ---- Payments (online / gateway) ----
   //
   // Separate from the ADD_INVOICE_PAYMENT family above, which is unchanged and

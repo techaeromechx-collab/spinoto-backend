@@ -29,7 +29,12 @@ const { isHubUser } = require('../utils/hubScope');
 /* The SAME three functions the PDF uses to decide CGST/SGST vs IGST and to
    halve a rate. The CSV must not re-implement any of it: an export that
    disagrees with the invoice it came from is worse than no export. */
-const { resolvePlaceOfSupply, isInterState, splitGst } = require('../utils/gstStates');
+/* stateName belongs in this list too. It was missing, while line ~2131 called
+   it when saving a place of supply — so every attempt to set that field threw
+   ReferenceError, rolled the transaction back, and left the column NULL on all
+   264 invoices. Migration 184 backfills them; this is what stops it happening
+   again. */
+const { resolvePlaceOfSupply, isInterState, splitGst, stateName } = require('../utils/gstStates');
 const maskFor = (req, v) => (isHubUser(req) ? maskMobile(v) : (v || ''));
 
 /* ── GST breakdown columns on the CSV export ────────────────────────────────
@@ -1857,6 +1862,21 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
         });
       }
 
+      /* ── Place of supply, decided once and written down ────────────────
+         resolvePlaceOfSupply is the SAME function the PDF and the GSTR-1
+         report call, so all three agree by construction. It is stored rather
+         than left to be re-derived because it is a legal field on the invoice:
+         a GSTIN corrected next year must not silently change what was filed
+         for a document issued today.
+
+         source === 'supplier_default' is the ordinary case here — an
+         unregistered walk-in at the workshop is an intra-state supply. */
+      const posCompany = await loadCompany();
+      const pos = resolvePlaceOfSupply(
+        { is_b2b: est.is_b2b, b2b_gst_number: est.is_b2b ? est.b2b_gst_number : null },
+        posCompany
+      );
+
       const ciRow = await client.query(
         `INSERT INTO customer_invoices
            (estimate_id, appointment_id, hub_id,
@@ -1867,9 +1887,9 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
             is_b2b, b2b_company_name, b2b_gst_number, b2b_address,
             notes, public_token, odometer_km,
             invoice_date, original_invoice_date, backdate_reason, backdated_by, backdated_at,
-            updated_by)
+            updated_by, place_of_supply_code, place_of_supply_name)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
-                 $22::date, $23::date, $24, $25, $26, $27) RETURNING id`,
+                 $22::date, $23::date, $24, $25, $26, $27, $28, $29) RETURNING id`,
         [
           estimate_id, est.appointment_id, est.hub_id,
           appt.customer_name || null, appt.mobile || null, appt.vehicle_number || null,
@@ -1897,6 +1917,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
           invoiceDate === today ? null : (req.user?.id || null),
           invoiceDate === today ? null : new Date(),
           req.user?.id || null,
+          pos.code || null,
+          pos.code ? pos.name : null,
         ]
       );
       const ciId = ciRow.rows[0].id;

@@ -15,15 +15,38 @@
  * instance and reuse it across requests rather than launching a fresh
  * browser per PDF (launching Chromium is the expensive part, ~0.5-1s).
  *
- * Deploy note: Puppeteer downloads a bundled Chromium on `npm install`. On
- * some minimal Linux hosts (slim Docker images, etc.) Chromium needs a
- * handful of system shared libraries that aren't installed by default —
- * see https://pptr.dev/troubleshooting for the exact package list if the
- * browser fails to launch in production. Not needed on a normal Ubuntu/
- * Debian VM/host.
+ * Deploy note — why this no longer uses the `puppeteer` package
+ * ─────────────────────────────────────────────────────────────
+ * `puppeteer` downloads a full Chromium during `npm install` and then expects
+ * a pile of system shared libraries (libnss3, libatk, libgbm, libasound2 …)
+ * to already exist on the host. Render's image happened to have them. The AWS
+ * task does not, which is what produced:
+ *
+ *     GET /api/customer-invoices/:id/pdf  →  500
+ *
+ * Installing those libraries means a Dockerfile, and a Dockerfile means the
+ * "just push code and it auto-deploys" workflow stops working.
+ *
+ * So instead: `puppeteer-core` (the driver, no download, no post-install) plus
+ * `@sparticuz/chromium` (a Chromium build that is statically linked against
+ * the libraries a stock host is missing). Both arrive through `npm install`
+ * like any other dependency — no Dockerfile, no host packages, no deploy
+ * pipeline change.
+ *
+ * Both are pinned EXACTLY, not with a caret. puppeteer-core speaks one
+ * specific DevTools protocol revision and @sparticuz/chromium ships one
+ * specific Chromium; a caret range lets either drift independently, and the
+ * failure mode is a launch error in production rather than anything npm
+ * would flag. Bump them together or not at all:
+ *
+ *     puppeteer-core 23.11.1   ⟷   @sparticuz/chromium 131.0.1
+ *
+ * Fonts are handled separately and deliberately — see templates/fonts/.
  */
 
-const puppeteer = require('puppeteer');
+const fs = require('fs');
+const puppeteer = require('puppeteer-core');
+const { withEmbeddedFonts } = require('../templates/fonts');
 
 let _browserPromise = null;
 
@@ -100,22 +123,117 @@ function rendererStats() {
   return { active, queued: waiting.length, maxConcurrent: MAX_CONCURRENT };
 }
 
+/** Args used when driving a Chromium we didn't get from @sparticuz/chromium. */
+const BASE_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage', // avoid /dev/shm size issues in constrained containers
+];
+
+/**
+ * Where to find a Chromium to drive.
+ *
+ * Three cases, in priority order:
+ *
+ *   1. PUPPETEER_EXECUTABLE_PATH — an explicit override. Always wins. This is
+ *      the escape hatch if the bundled build ever misbehaves on a new host:
+ *      install a system Chromium, point this at it, restart. No code change.
+ *
+ *   2. Linux (every deployed environment) — @sparticuz/chromium. It unpacks a
+ *      self-contained Chromium into /tmp on first launch (~1s, once per
+ *      process) and needs no system libraries.
+ *
+ *   3. macOS / Windows — local development. `@sparticuz/chromium` is a Linux
+ *      binary and cannot run here, and we deliberately do NOT depend on the
+ *      full `puppeteer` package just to make laptops work: it would reappear
+ *      in the AWS install and re-create the original problem. So we look for
+ *      a Chrome that is almost certainly already installed. If it isn't, the
+ *      error below says exactly what to do rather than failing obscurely
+ *      several frames deep inside the launcher.
+ */
+const LOCAL_CHROME_CANDIDATES = {
+  darwin: [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  ],
+  win32: [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ],
+};
+
+async function launchConfig() {
+  const override = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (override) {
+    return { executablePath: override, args: BASE_ARGS, headless: true };
+  }
+
+  if (process.platform === 'linux') {
+    // Required lazily: on a developer's Mac this module is a Linux binary
+    // wrapper that never needs to be touched, and requiring it at file scope
+    // would make a laptop pay for it on every boot.
+    const chromium = require('@sparticuz/chromium');
+
+    // @sparticuz/chromium is tuned for AWS Lambda, where the process handles
+    // one request and dies. This backend is the opposite — a single Node
+    // process that stays up for weeks (see src/server.js) — so two of its
+    // defaults are actively wrong here:
+    //
+    //   --single-process  puts the renderer in the browser process. One bad
+    //                     document then takes down the whole browser instead
+    //                     of one tab, and MAX_CONCURRENT renders serialise
+    //                     onto a single thread. Puppeteer documents this flag
+    //                     as unsupported.
+    //   --no-zygote       without the zygote, every tab re-does full process
+    //                     setup. Fine for one render; wasteful for thousands.
+    //
+    // Everything else it sets (swiftshader, no-sandbox, dev-shm, colour
+    // profile) is either required on a minimal host or harmless, so it stays.
+    const args = chromium.args.filter(
+      (a) => a !== '--single-process' && a !== '--no-zygote',
+    );
+
+    return {
+      args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    };
+  }
+
+  const candidates = LOCAL_CHROME_CANDIDATES[process.platform] || [];
+  const found = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+  if (found) return { executablePath: found, args: BASE_ARGS, headless: true };
+
+  throw new Error(
+    `No Chromium found for local PDF rendering on ${process.platform}. `
+    + 'Install Google Chrome, or set PUPPETEER_EXECUTABLE_PATH to a Chrome/Chromium binary. '
+    + '(Deployed Linux hosts use @sparticuz/chromium and need neither.)',
+  );
+}
+
 async function getBrowser() {
   if (_browserPromise) {
     // Guard against a previously-resolved browser having crashed/disconnected
     // since last use — relaunch if so.
-    const existing = await _browserPromise;
-    if (existing.isConnected()) return existing;
+    try {
+      const existing = await _browserPromise;
+      if (existing.isConnected()) return existing;
+    } catch {
+      // A launch that rejected must not be cached forever: without this, one
+      // failed start (a cold /tmp, a transient OOM) would make every
+      // subsequent PDF request replay the same rejected promise until the
+      // process restarted.
+    }
     _browserPromise = null;
   }
-  _browserPromise = puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', // avoid /dev/shm size issues in constrained containers
-    ],
-  });
+
+  _browserPromise = (async () => puppeteer.launch(await launchConfig()))();
+
+  // Same reason as above, one level up: drop the cached promise if this
+  // particular launch fails, so the next request gets a fresh attempt.
+  _browserPromise.catch(() => { _browserPromise = null; });
+
   return _browserPromise;
 }
 
@@ -148,7 +266,18 @@ async function renderOnce(html, pageSize) {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
-    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 15_000 });
+    // Every themed document passes through here, which makes this the one
+    // place the embedded fonts have to be added. Doing it per-template would
+    // mean eight files to keep in sync and a silent regression the first time
+    // someone adds a ninth. See templates/fonts/index.js for what and why.
+    await page.setContent(withEmbeddedFonts(html), { waitUntil: 'networkidle0', timeout: 15_000 });
+
+    // The fonts are data: URIs, so they resolve without network and
+    // networkidle0 does not wait for them. Without this, a render can start
+    // before the faces finish decoding and fall back to whatever the host
+    // has — the exact failure we are shipping fonts to avoid, except
+    // intermittent, which is worse.
+    await page.evaluate(() => document.fonts.ready);
     const bytes = await page.pdf({
       format: pageSize,
       printBackground: true, // themes rely on background colors/accent bars

@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
 const c = require('../controllers/reports.controller');
+const gstr1 = require('../controllers/gstr1.controller');
 
 const router = express.Router();
 
@@ -38,5 +39,12 @@ router.get('/analytics/top-performers',  canViewRevenue,  c.getTopPerformers);
 router.get('/analytics/leads-over-time', canViewLeads,    c.getLeadsOverTime);
 router.get('/analytics/leads-by-source', canViewLeads,    c.getLeadsBySource);
 router.get('/team-performance',          canViewTeamPerf, c.getTeamPerformance);
+
+/* GSTR-1. canViewInvoice, not canViewRevenue: the response is the invoice
+   ledger for a period — every customer name, every B2B GSTIN — so the
+   permission that matches it is the one that governs invoices. The controller
+   additionally refuses hub logins outright; a company GST return has no
+   correct hub-scoped version. */
+router.get('/gstr1',                     canViewInvoice,  gstr1.getGstr1);
 
 module.exports = router;
