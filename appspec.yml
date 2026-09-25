@@ -1,0 +1,13 @@
+version: 0.0
+
+os: linux
+
+files:
+  - source: .
+    destination: /tmp/spinoto-backend
+
+hooks:
+  AfterInstall:
+    - location: .script/after.sh
+      timeout: 900
+      runas: ubuntu
