@@ -113,8 +113,56 @@ function sourceFilterSql(raw) {
   return SOURCE_PREDICATES[key] || null;
 }
 
+/**
+ * Which lead_sources row this appointment came through.
+ *
+ * ══ COPIED FROM THE LEAD, NOT JOINED TO IT ═════════════════════════════════
+ *
+ * An explicit source_id always wins: somebody looking at the form and choosing
+ * a value knows something the lead does not, and this is how "the customer
+ * actually said they saw the Instagram ad" gets recorded.
+ *
+ * Otherwise, a conversion inherits the lead's. That is a COPY, deliberately —
+ * joining through lead_id instead would mean editing one lead's source silently
+ * moves last quarter's revenue between channels. Migration 204's header has the
+ * long version.
+ *
+ * A direct appointment with nothing chosen stays NULL. Guessing 'Walk-in'
+ * because nobody filled the box in would turn missing data into a number
+ * somebody later makes a decision on, which is worse than a gap that is visibly
+ * a gap.
+ *
+ * The id is VERIFIED to exist, and an inactive one is accepted: migration 204
+ * retires every unrecognised legacy spelling to is_active = false, and an edit
+ * that merely changes the date must not fail because the appointment's existing
+ * source is one of them.
+ */
+async function resolveSourceId(client, { source_id, lead_id }) {
+  if (source_id !== undefined && source_id !== null) {
+    const r = await client.query('SELECT id FROM lead_sources WHERE id = $1', [source_id]);
+    /* Not a silent null. A client sending an id that does not exist has a bug,
+       and swallowing it would file the job under "no source" for ever. */
+    if (!r.rowCount) {
+      const e = new Error(`Source #${source_id} does not exist.`);
+      e.status = 400;
+      throw e;
+    }
+    return source_id;
+  }
+  if (lead_id) {
+    const r = await client.query('SELECT source_id FROM leads WHERE id = $1', [lead_id]);
+    return r.rows[0]?.source_id ?? null;
+  }
+  return null;
+}
+
 const createSchema = z.object({
   lead_id: z.coerce.number().int().positive().optional().nullable(),
+  /* Where the customer came from. Optional, and left optional deliberately:
+     hundreds of existing rows have no source and a required field would only
+     make somebody pick one at random to get past the form. Omitted on a lead
+     conversion means "take the lead's" — see resolveSourceId. */
+  source_id: z.coerce.number().int().positive().optional().nullable(),
   assigned_to: z.coerce.number().int().positive().optional().nullable(),
   /* Book this in somebody else's name. Accepted from the body but NOT trusted —
      the handler decides whether this caller may set it, and ignores it if not.
@@ -169,6 +217,16 @@ const createSchema = z.object({
 
 const updateSchema = z.object({
   status_id: z.coerce.number().int().positive().optional().nullable(),
+  /* Editable, because the first answer is often wrong: an advisor books a
+     walk-in and the customer then says they saw the Instagram ad. Nullable so
+     the UI can clear a wrong one back to blank rather than being forced to leave
+     a value it knows is false. */
+  source_id: z.coerce.number().int().positive().optional().nullable(),
+  /* Reassignment. Nullable on purpose — sending null is how the UI says
+     "unassign", and it has to be distinguishable from not sending the field at
+     all, which is what every other edit on this form does. The handler checks
+     the target is a real, ACTIVE user before it writes; see updateAppointment. */
+  assigned_to: z.coerce.number().int().positive().optional().nullable(),
   scheduled_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   scheduled_time: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional().nullable(),
   notes: z.string().trim().max(3000).optional().nullable(),
@@ -325,11 +383,39 @@ const APPT_SELECT = `
       ELSE 'direct'
     END AS source_type,
 
+    /* ── AND THE REAL SOURCE, WHICH IS A DIFFERENT QUESTION ─────────────────
+       source_type above says HOW THE ROW GOT MADE. source_id says WHERE THE
+       CUSTOMER CAME FROM. They are not alternatives and neither derives from the
+       other: a Direct appointment can be a Walk-in or a Phone Call, and a Lead
+       appointment can have come through any channel at all.
+
+       STORED, unlike source_type, and stored on purpose. It could have been
+       joined through lead_id instead — and then editing one lead's source would
+       silently move last quarter's revenue between channels. The appointment
+       records what the source WAS when the job was booked. Migration 204.
+
+       source_is_active comes along so the UI can mark a value that was retired
+       from the master list — those exist by design: migration 204 gives every
+       unrecognised legacy spelling a switched-off row rather than throwing the
+       value away. */
+    a.source_id,
+    src.name      AS source_name,
+    src.is_active AS source_is_active,
+
     -- Linked estimate (used to lock fields in edit mode + status prerequisite checks)
-    (SELECT e.id     FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_id,
-    (SELECT e.public_token FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_token,
-    (SELECT e.status FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_status,
+    --
+    -- "parent_estimate_id IS NULL" pins these to the ORIGINAL estimate rather
+    -- than the newest one (migration 193). Today every estimate is an original
+    -- so the result is byte-identical; once a supplementary exists, "the
+    -- estimate for this appointment" on a list row must still mean the
+    -- document the customer first approved, not whatever was added last.
+    (SELECT e.id     FROM estimates e WHERE e.appointment_id = a.id AND e.parent_estimate_id IS NULL ORDER BY e.id DESC LIMIT 1) AS estimate_id,
+    (SELECT e.public_token FROM estimates e WHERE e.appointment_id = a.id AND e.parent_estimate_id IS NULL ORDER BY e.id DESC LIMIT 1) AS estimate_token,
+    (SELECT e.status FROM estimates e WHERE e.appointment_id = a.id AND e.parent_estimate_id IS NULL ORDER BY e.id DESC LIMIT 1) AS estimate_status,
     EXISTS (SELECT 1 FROM estimates e WHERE e.appointment_id = a.id)                            AS has_estimate,
+    -- How much extra work was found after the customer approved the first one.
+    (SELECT COUNT(*)::int FROM estimates e
+      WHERE e.appointment_id = a.id AND e.parent_estimate_id IS NOT NULL)                       AS supplementary_count,
 
     -- Linked customer invoice (for status prerequisite checks)
     (SELECT ci.id     FROM customer_invoices ci
@@ -343,7 +429,15 @@ const APPT_SELECT = `
        WHERE e.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_status,
 
     -- Financial totals
-    (SELECT e.grand_total FROM estimates e WHERE e.appointment_id = a.id ORDER BY e.id DESC LIMIT 1) AS estimate_total,
+    --
+    -- estimate_total is the ORIGINAL's, unchanged — the column every existing
+    -- screen reads, and it must keep meaning what it has always meant.
+    -- estimate_total_all is what the VISIT comes to once supplementaries are
+    -- counted. The two are equal for every appointment that has no
+    -- supplementary, which is all of them today.
+    (SELECT e.grand_total FROM estimates e WHERE e.appointment_id = a.id AND e.parent_estimate_id IS NULL ORDER BY e.id DESC LIMIT 1) AS estimate_total,
+    (SELECT COALESCE(SUM(e.grand_total), 0) FROM estimates e
+      WHERE e.appointment_id = a.id AND e.status <> 'cancelled')                                     AS estimate_total_all,
     (SELECT ci.grand_total FROM customer_invoices ci WHERE ci.appointment_id = a.id ORDER BY ci.id DESC LIMIT 1) AS invoice_total
 
   FROM appointments a
@@ -357,6 +451,9 @@ const APPT_SELECT = `
   LEFT JOIN users             u   ON u.id   = a.created_by
   LEFT JOIN users             au  ON au.id  = a.assigned_to
   LEFT JOIN users             ru  ON ru.id  = a.rescheduled_by
+  /* LEFT, not INNER: most existing rows have no source_id and must still appear.
+     An INNER join here would empty the appointments list on the day 204 ships. */
+  LEFT JOIN lead_sources      src ON src.id = a.source_id
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,13 +521,32 @@ function createAppointment(req, res, next) {
         return res.status(400).json({ error: 'That user does not exist or is inactive.' });
       }
       createdBy = data.created_by;
-      /* Option A: authorship and ownership move together. Leaving assigned_to
-         empty here would file the appointment under someone who is not on the
-         hook for it — and on a tier-3 login the two columns are read as one
-         question ("is this mine"), so splitting them serves nobody.
-         An explicit assigned_to in the request still wins. */
-      if (!assignedTo) assignedTo = createdBy;
     }
+
+    /* ── NOBODY IS NOT AN ANSWER ──────────────────────────────────────────
+       Whoever books the job owns it until somebody says otherwise.
+
+       This used to live inside the branch above, so it only fired on the one
+       path nobody uses — booking in a colleague's name. Every ordinary
+       booking fell through it. The result, measured on production: 378
+       appointments, 43 with an assignee, and all 43 of those inherited from
+       a lead. A lead nobody had been given, and every direct booking, landed
+       with assigned_to NULL and stayed that way, because the update path does
+       not accept the column either.
+
+       Precedence, unchanged and in this order:
+         1. an explicit assigned_to in the request
+         2. the lead's assignee, when converting
+         3. the person doing the booking          ← this line
+
+       Option A still holds where it applied: authorship and ownership move
+       together, so booking in a colleague's name still files the job under
+       them. That case is now just the general rule with createdBy already
+       reassigned above, rather than a special case that owned the fallback.
+
+       created_by is NOT NULL in practice on all 378 rows, so this cannot
+       leave a new appointment unassigned. */
+    if (!assignedTo) assignedTo = createdBy;
 
     // Fix #22: guard against duplicate lead conversion
     if (data.lead_id) {
@@ -452,6 +568,16 @@ function createAppointment(req, res, next) {
       if (hubErr) return res.status(hubErr.status).json({ error: hubErr.error, code: hubErr.code });
     }
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js). The read-back
+       and _getServices() below each need a connection of their own, so they run
+       after the release: ten bookings at once, each holding a client and asking
+       for a second, is a deadlock that no timeout ever breaks.
+
+       fireWhatsAppEvent stays INSIDE, because it is handed `client` and so
+       enrols in this transaction — a message must not be queued for an
+       appointment that can still roll back. */
+    let apptId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -461,6 +587,17 @@ function createAppointment(req, res, next) {
          later as an invoice the Hub Revenue report files under "Not set".
          Never overrides a type that WAS chosen — see utils/vehicleType.js. */
       const resolvedVehicleTypeId = await resolveVehicleTypeId(client, data);
+
+      /* Inside the transaction and on `client`, not the pool: the lead read it
+         does has to see the same snapshot as the insert, and the pool is 10 wide
+         with no acquire timeout — a second connection taken while this one is
+         held is the deadlock the comment above warns about.
+
+         It can throw a 400 for an id that does not exist. Throwing is correct
+         here and returning would not be: the catch below runs the ROLLBACK, and a
+         `return` inside an open transaction hands a poisoned connection back to
+         the pool. */
+      const resolvedSourceId = await resolveSourceId(client, data);
 
       const ins = await client.query(
         `INSERT INTO appointments (
@@ -472,13 +609,15 @@ function createAppointment(req, res, next) {
           pickup_required, pickup_address_line1, pickup_address_line2, pickup_city, pickup_pincode, pickup_maps_link,
           pickup_scheduled_date, pickup_scheduled_time,
           drop_required, drop_address_line1, drop_address_line2, drop_city, drop_pincode, drop_maps_link,
-          assigned_to, created_by, public_token, odometer_km
+          assigned_to, created_by, public_token, odometer_km,
+          source_id
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
           $18,$19,$20,$21,$22,$23,
           $24,$25,
           $26,$27,$28,$29,$30,$31,
-          $32,$33,$34,$35
+          $32,$33,$34,$35,
+          $36
         ) RETURNING id`,
         [
           data.lead_id || null,           // $1
@@ -516,10 +655,11 @@ function createAppointment(req, res, next) {
           createdBy,                             // $33
           generatePublicToken(),                 // $34
           data.odometer_km ?? null,              // $35
+          resolvedSourceId,                      // $36
         ]
       );
 
-      const apptId = ins.rows[0].id;
+      apptId = ins.rows[0].id;
 
       // Make sure this mobile number has a customer routing identity
       // (public_token) even if no customer_profiles row is ever created.
@@ -665,37 +805,37 @@ function createAppointment(req, res, next) {
       });
 
       await client.query('COMMIT');
-
-      // Return full record
-      const row = await pool.query(`${APPT_SELECT} WHERE a.id = $1`, [apptId]);
-      const appt = row.rows[0];
-      appt.services = await _getServices(apptId);
-
-      logActivity({ userId: req.user?.id, userName: req.user?.name, action: 'CREATE', entity: 'appointment', entityId: apptId, description: `Created appointment for ${data.customer_name || data.mobile} on ${data.scheduled_date}` });
-
-      /* Tell the hub a job just landed on its bench.
-         AFTER the commit and deliberately NOT awaited: the appointment is
-         saved, and a push provider having a bad day must not turn a successful
-         booking into a 500. notifyHubAppointment swallows its own errors too —
-         belt and braces, because this is the last thing between here and the
-         response. */
-      notifyHubAppointment(pool, {
-        hubId:         appt.hub_id,
-        actorHubId:    req.user?.hub_id,   // the hub booking its own work says nothing
-        kind:          'created',
-        appointmentId: apptId,
-        customer:      appt.customer_name,
-        vehicle:       appt.vehicle_number,
-        when:          [appt.scheduled_date, appt.scheduled_time].filter(Boolean).join(' '),
-      });
-
-      return res.status(201).json({ item: appt });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    // Return full record
+    const row = await pool.query(`${APPT_SELECT} WHERE a.id = $1`, [apptId]);
+    const appt = row.rows[0];
+    appt.services = await _getServices(apptId);
+
+    logActivity({ userId: req.user?.id, userName: req.user?.name, action: 'CREATE', entity: 'appointment', entityId: apptId, description: `Created appointment for ${data.customer_name || data.mobile} on ${data.scheduled_date}` });
+
+    /* Tell the hub a job just landed on its bench.
+       AFTER the commit and deliberately NOT awaited: the appointment is
+       saved, and a push provider having a bad day must not turn a successful
+       booking into a 500. notifyHubAppointment swallows its own errors too —
+       belt and braces, because this is the last thing between here and the
+       response. */
+    notifyHubAppointment(pool, {
+      hubId:         appt.hub_id,
+      actorHubId:    req.user?.hub_id,   // the hub booking its own work says nothing
+      kind:          'created',
+      appointmentId: apptId,
+      customer:      appt.customer_name,
+      vehicle:       appt.vehicle_number,
+      when:          [appt.scheduled_date, appt.scheduled_time].filter(Boolean).join(' '),
+    });
+
+    return res.status(201).json({ item: appt });
   });
 }
 
@@ -816,6 +956,15 @@ function listAppointmentsCalendar(req, res, next) {
     // what each source means, and one function is how that stays true.
     const sourceSqlCal = sourceFilterSql(req.query.source);
     if (sourceSqlCal) conditions.push(sourceSqlCal);
+    /* The real source too, for the same reason: a filter the list honours and
+       the calendar ignores is a filter that lies when somebody switches view. */
+    const srcIdCal = String(req.query.source_id ?? '').trim();
+    if (srcIdCal === 'none') {
+      conditions.push('a.source_id IS NULL');
+    } else if (srcIdCal && /^\d+$/.test(srcIdCal)) {
+      params.push(Number(srcIdCal));
+      conditions.push(`a.source_id = $${params.length}`);
+    }
 
     params.push(dateFrom);
     conditions.push(`a.scheduled_date >= $${params.length}`);
@@ -859,12 +1008,42 @@ function listAppointments(req, res, next) {
   handle(req, res, next, async () => {
     const search = (req.query.search || '').trim();
     const statusId = req.query.status_id || '';
+    /* Several statuses at once, comma-separated, exactly like hub_ids above.
+       status_id is KEPT and still honoured: the dashboard cards and a few
+       saved links arrive with ?status_id=, and quietly breaking a bookmark is
+       not an acceptable price for a new filter. status_ids wins when both are
+       sent, because it is the one the current UI writes. */
+    const statusIds = req.query.status_ids || '';
     const hubId = req.query.hub_id || '';
     const hubIds = req.query.hub_ids || '';
     const vehicleType = req.query.vehicle_type_id || '';
     const dateFrom = req.query.date_from || '';
     const dateTo = req.query.date_to || '';
     const createdById = req.query.created_by_id || '';
+
+    /* ── Sorting ──────────────────────────────────────────────────────────
+       A WHITELIST, never the raw value. ORDER BY cannot be parameterised, so
+       an interpolated query string here is SQL injection with extra steps.
+       Anything unrecognised falls back to the old default rather than erroring
+       — a bookmarked URL with a stale sort should still show the list.
+
+       Both options end in `a.id`, always. Without a unique final tiebreaker
+       Postgres is free to return rows in any order among equals, so the same
+       appointment can appear on two pages while another is never shown at all
+       — on a paginated list that is data loss, not an inconvenience.
+
+       Schedule also breaks on scheduled_time, NULLS LAST: ten jobs on one day
+       would otherwise come back in an arbitrary order that reshuffles on every
+       reload, and a job with no time set belongs after the ones that have one
+       rather than jumbled among them. */
+    const SORTS = {
+      created:  d => `a.created_at ${d}, a.id ${d}`,
+      schedule: d => `a.scheduled_date ${d}, a.scheduled_time ${d} NULLS LAST, a.id ${d}`,
+    };
+    const sortKey = SORTS[req.query.sort] ? req.query.sort : 'created';
+    const sortDir = String(req.query.dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+    const orderBy = SORTS[sortKey](sortDir);
+
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
     const offset = (page - 1) * limit;
@@ -945,6 +1124,22 @@ function listAppointments(req, res, next) {
     // whitelist, never interpolated user input.
     const sourceSql = sourceFilterSql(req.query.source);
     if (sourceSql) conditions.push(sourceSql);
+    /* ── The REAL source, a separate filter from the channel above ────────────
+       ?source=lead|direct|booking|warranty_redo   how the row was made
+       ?source_id=7                               where the customer came from
+       Both can be applied at once, and that combination is the useful one: "the
+       Walk-ins I booked directly" is a different list from "every Walk-in".
+
+       'none' is a value, not an absence. Without it there is no way to ask for
+       the rows that need a source filling in, which is the first thing anybody
+       will want after this ships. */
+    const srcIdRaw = String(req.query.source_id ?? '').trim();
+    if (srcIdRaw === 'none') {
+      conditions.push('a.source_id IS NULL');
+    } else if (srcIdRaw && /^\d+$/.test(srcIdRaw)) {
+      params.push(Number(srcIdRaw));
+      conditions.push(`a.source_id = $${params.length}`);
+    }
     if (dateFrom) {
       params.push(dateFrom);
       conditions.push(`a.scheduled_date >= $${params.length}`);
@@ -963,7 +1158,19 @@ function listAppointments(req, res, next) {
     const countConditions = [...conditions];
     const countParams = [...params];
 
-    if (statusId) {
+    /* Applied AFTER the count snapshot above, which is the whole point of the
+       snapshot: the per-status tab counts answer "how many are in each status
+       within everything else I have filtered", so they must not see the status
+       filter itself. Pick three statuses and the other tabs still show their
+       real numbers instead of collapsing to zero. */
+    const statusIdList = statusIds
+      .split(',')
+      .map(Number)
+      .filter(n => Number.isInteger(n) && n > 0);
+    if (statusIdList.length > 0) {
+      params.push(statusIdList);
+      conditions.push(`a.status_id = ANY($${params.length}::int[])`);
+    } else if (statusId) {
       params.push(Number(statusId));
       conditions.push(`a.status_id = $${params.length}`);
     }
@@ -971,9 +1178,11 @@ function listAppointments(req, res, next) {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const countWhere = countConditions.length ? `WHERE ${countConditions.join(' AND ')}` : '';
 
-    const [dataRes, countRes, statusCountsRes, sourceCountsRes] = await Promise.all([
+    const [dataRes, countRes, statusCountsRes, sourceCountsRes, realSourceCountsRes] = await Promise.all([
       pool.query(
-        `${APPT_SELECT} ${where} ORDER BY a.created_at DESC, a.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        /* orderBy is built from a whitelist above — never from the query
+           string directly. */
+        `${APPT_SELECT} ${where} ORDER BY ${orderBy} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
       pool.query(`SELECT COUNT(*) FROM appointments a ${where}`, params),
@@ -1002,13 +1211,33 @@ function listAppointments(req, res, next) {
          GROUP BY 1`,
         countParams
       ),
+      /* And the same for the real source, so its dropdown can show numbers too.
+         LEFT JOIN and a COALESCE'd label, because the rows with NO source are the
+         ones somebody needs to find and fix — leaving them out of the counts
+         would hide exactly the work this feature creates.
+         Ordered by count so the channels that matter are at the top of the list
+         rather than wherever the master list's sort_order happens to put them. */
+      pool.query(
+        `SELECT a.source_id,
+                COALESCE(s.name, '(no source)') AS source_name,
+                COUNT(*)::int                   AS count
+         FROM appointments a
+         LEFT JOIN lead_sources s ON s.id = a.source_id
+         ${countWhere}
+         GROUP BY a.source_id, s.name
+         ORDER BY count DESC, source_name`,
+        countParams
+      ),
     ]);
 
     return res.json({
       items: dataRes.rows,
       total: parseInt(countRes.rows[0].count, 10),
       status_counts: statusCountsRes.rows, // [{ status_id, count }]
-      source_counts: sourceCountsRes.rows, // [{ source_type, count }]
+      source_counts: sourceCountsRes.rows, // [{ source_type, count }] — the channel
+      // [{ source_id, source_name, count }] — the real source. source_id null is
+      // the "(no source)" row and is a real entry, not an error.
+      real_source_counts: realSourceCountsRes.rows,
       page,
       limit,
     });
@@ -1123,6 +1352,34 @@ function updateAppointment(req, res, next) {
       return res.status(400).json({ error: 'Cannot modify a closed, cancelled, or no-show appointment.' });
     }
 
+    /* ── REASSIGNMENT: the target has to be somebody who can actually work ──
+       Same check createAppointment runs on created_by, and for the same two
+       reasons. assigned_to is a foreign key, so a bad id fails at the UPDATE
+       with a constraint error no user can act on; and is_active is asked
+       separately because a disabled account is a perfectly valid foreign key
+       that quietly becomes the owner of live work.
+
+       Only when a number was sent. `assigned_to: null` is the unassign path
+       and needs no lookup — the column is nullable and ON DELETE SET NULL
+       already writes NULL there on its own.
+
+       Note what is deliberately NOT here: a self-lockout guard. On a login
+       without VIEW_APPOINTMENT, assigning a job away from yourself removes
+       your own claim on it and it leaves your list — the same trap documented
+       on created_by in createAppointment. It is not guarded because it cannot
+       currently fire: every active account holding EDIT_APPOINTMENT also holds
+       VIEW_APPOINTMENT or is a super admin. If a role is ever created that
+       splits those two, this is the place that needs the warning. */
+    if (data.assigned_to !== undefined && data.assigned_to !== null) {
+      const uRow = await pool.query(
+        `SELECT id FROM users WHERE id = $1 AND is_active = TRUE`,
+        [data.assigned_to]
+      );
+      if (!uRow.rows[0]) {
+        return res.status(400).json({ error: 'That user does not exist or is inactive.' });
+      }
+    }
+
     // ── What the status was, before we touch it ──────────────────────────
     //
     // Read here rather than inside the transaction because the messaging
@@ -1222,11 +1479,25 @@ function updateAppointment(req, res, next) {
     const params = [];
 
     if (data.status_id !== undefined) { params.push(data.status_id); fields.push(`status_id           = $${params.length}`); }
+    if (data.assigned_to !== undefined) { params.push(data.assigned_to); fields.push(`assigned_to         = $${params.length}`); }
     if (data.scheduled_date !== undefined) { params.push(data.scheduled_date); fields.push(`scheduled_date      = $${params.length}`); }
     if (data.scheduled_time !== undefined) { params.push(data.scheduled_time); fields.push(`scheduled_time      = $${params.length}`); }
     if (data.notes !== undefined) { params.push(data.notes); fields.push(`notes               = $${params.length}`); }
     if (data.odometer_km !== undefined) { params.push(data.odometer_km); fields.push(`odometer_km         = $${params.length}`); }
     if (data.hub_id !== undefined) { params.push(data.hub_id); fields.push(`hub_id              = $${params.length}`); }
+    /* Verified before it is written, and null is allowed through as a real value:
+       clearing a source somebody knows is wrong is a legitimate edit, and it must
+       be distinguishable from not sending the field at all — which is why this
+       tests `!== undefined` like every other line here rather than truthiness. */
+    if (data.source_id !== undefined) {
+      if (data.source_id !== null) {
+        const srcOk = await pool.query('SELECT id FROM lead_sources WHERE id = $1', [data.source_id]);
+        if (!srcOk.rowCount) {
+          return res.status(400).json({ error: `Source #${data.source_id} does not exist.` });
+        }
+      }
+      params.push(data.source_id); fields.push(`source_id           = $${params.length}`);
+    }
     if (data.vehicle_number !== undefined) { params.push(data.vehicle_number); fields.push(`vehicle_number      = $${params.length}`); }
     if (data.cancellation_reason !== undefined) { params.push(data.cancellation_reason); fields.push(`cancellation_reason = $${params.length}`); }
     if (data.pickup_required !== undefined) { params.push(data.pickup_required); fields.push(`pickup_required      = $${params.length}`); }
@@ -1666,8 +1937,28 @@ async function markAtWorkshop(req, res, next) {
 // Collects everything hanging off an appointment — used by both the preview
 // endpoint (the frontend warning popup) and the delete guards.
 async function _collectAppointmentChain(apptId) {
+  /* ── WHY THIS COUNTS AS WELL AS SELECTS ───────────────────────────────────
+     Everything below inspects ONE estimate and decides from it whether money
+     has moved. Once a visit can carry supplementary estimates (migration 193),
+     a paid invoice on a supplementary would be invisible to that check and the
+     appointment would look safe to delete — taking real financial history with
+     it.
+
+     Rewriting the money checks to walk every estimate is the thorough answer,
+     and the wrong one to reach for here: this endpoint exists to remove junk
+     ("Real jobs get CANCELLED; deletion is for junk/test/duplicate entries"),
+     and a visit somebody raised a supplementary on is by definition not junk.
+     So supplementaries BLOCK the delete outright, and the operator deals with
+     them deliberately. One count, no change to any existing check. */
+  const supplementaryCount = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM estimates
+      WHERE appointment_id = $1 AND parent_estimate_id IS NOT NULL`, [apptId]
+  )).rows[0].n;
+
   const est = (await pool.query(
-    `SELECT id, status, grand_total, warranty_claim_id FROM estimates WHERE appointment_id = $1 ORDER BY id DESC LIMIT 1`,
+    `SELECT id, status, grand_total, warranty_claim_id FROM estimates
+      WHERE appointment_id = $1 AND parent_estimate_id IS NULL
+      ORDER BY id DESC LIMIT 1`,
     [apptId]
   )).rows[0] || null;
 
@@ -1689,7 +1980,7 @@ async function _collectAppointmentChain(apptId) {
       )).rows;
     }
   }
-  return { est, pi, ci, claims };
+  return { est, pi, ci, claims, supplementaryCount };
 }
 
 // GET /api/appointments/:id/delete-preview — what would be deleted, and any
@@ -1705,9 +1996,13 @@ function deletePreview(req, res, next) {
     if (!appt) return res.status(404).json({ error: 'Appointment not found' });
     assertHubOwns(req, appt, 'hub_id', 'Appointment');
 
-    const { est, pi, ci, claims } = await _collectAppointmentChain(id);
+    const { est, pi, ci, claims, supplementaryCount } = await _collectAppointmentChain(id);
 
     const blockers = [];
+    /* First, because it is the one the money checks below cannot see past. */
+    if (supplementaryCount > 0) {
+      blockers.push(`This visit has ${supplementaryCount} supplementary estimate${supplementaryCount === 1 ? '' : 's'}. Delete ${supplementaryCount === 1 ? 'it' : 'them'} first, or cancel the appointment instead.`);
+    }
     if (ci && (parseFloat(ci.amount_paid) > 0 || ci.payment_count > 0)) {
       blockers.push(`Customer invoice CI-${String(ci.id).padStart(6, '0')} has ${ci.payment_count} payment(s) totalling ₹${parseFloat(ci.amount_paid).toFixed(2)}.`);
     }
@@ -1718,6 +2013,7 @@ function deletePreview(req, res, next) {
     res.json({
       appointment: { id: appt.id, code: appt.appointment_code, is_warranty_redo: appt.is_warranty_redo },
       estimate: est ? { id: est.id, status: est.status, grand_total: est.grand_total } : null,
+      supplementary_count: supplementaryCount,
       purchase_invoice: pi ? { id: pi.id, code: `PI-${String(pi.id).padStart(6, '0')}`, status: pi.status } : null,
       customer_invoice: ci ? { id: ci.id, code: `CI-${String(ci.id).padStart(6, '0')}`, status: ci.status } : null,
       claims: claims.map(c => ({ id: c.id, code: c.claim_code, status: c.status })),
@@ -1739,7 +2035,17 @@ function deleteAppointment(req, res, next) {
     if (!appt) return res.status(404).json({ error: 'Appointment not found' });
     assertHubOwns(req, appt, 'hub_id', 'Appointment');
 
-    const { est, pi, ci, claims } = await _collectAppointmentChain(id);
+    const { est, pi, ci, claims, supplementaryCount } = await _collectAppointmentChain(id);
+
+    /* ── Hard block: this visit has supplementary estimates ──
+       Before every money check, because those inspect ONE estimate and would
+       not see a payment sitting on a supplementary. See _collectAppointmentChain. */
+    if (supplementaryCount > 0) {
+      return res.status(409).json({
+        error: `This visit has ${supplementaryCount} supplementary estimate${supplementaryCount === 1 ? '' : 's'} — extra work found after the first estimate was approved. Delete ${supplementaryCount === 1 ? 'that estimate' : 'those estimates'} first, or cancel the appointment instead of deleting it.`,
+        code: 'HAS_SUPPLEMENTARY_ESTIMATES',
+      });
+    }
 
     // ── Hard blocks: money has moved ──
     if (ci && (parseFloat(ci.amount_paid) > 0 || ci.payment_count > 0)) {

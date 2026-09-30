@@ -47,6 +47,25 @@ const pool = new Pool({
   // handshake; at 120s they reuse one warm connection. Fewer cold connects
   // also means fewer slow ones for anything else to land on.
   idleTimeoutMillis: 120_000,
+
+  /* ── The seatbelt ────────────────────────────────────────────────────────
+     Without this, waiting for a connection has no end. That is not a
+     theoretical worry: twenty-one handlers used to check out a client and then
+     await something that needed a second one. Ten such requests at once took
+     all ten connections, and every one of them waited for an eleventh that
+     could never exist. Nothing timed out, nothing was logged, no query was
+     slow — the backend simply stopped answering until somebody restarted it.
+
+     All twenty-one are fixed, and a test re-reads every file on every run to
+     keep them that way. This is here for the twenty-second, written by someone
+     who has not read that test: with a ceiling on the wait, the same mistake
+     costs a few seconds of 500s that show up in the logs and then clears,
+     instead of a dead server and a phone call.
+
+     Ten seconds, not one: a Neon pooler cold start plus TLS can legitimately
+     take a couple of seconds, and a real burst at 3pm must not be mistaken for
+     a bug. A genuine starvation is over ten seconds long by a wide margin. */
+  connectionTimeoutMillis: 10_000,
 });
 
 pool.on('error', (err) => {

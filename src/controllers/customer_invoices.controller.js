@@ -2,6 +2,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { blockedFromInvoicing } = require('../helpers/jobCardInvoiceGuard');
 const { fireWhatsAppEvent, fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
 const { getRoundingFunction } = require('../utils/math');
 const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
@@ -145,6 +146,26 @@ const CI_SELECT = `
     ci.id, ci.public_token, ci.purchase_invoice_id, ci.estimate_id, est_ctx.public_token AS estimate_token, ci.appointment_id, ci.hub_id,
     est_ctx.warranty_claim_id,
     (SELECT wc.claim_code FROM warranty_claims wc WHERE wc.id = est_ctx.warranty_claim_id) AS warranty_claim_code,
+    /* The job card for this visit, so an invoice can point back at the work
+       rather than only at the quote.
+
+       No new column and no backfill: customer_invoices already carries
+       appointment_id — the one place invoices are created sets it from the
+       estimate — and job_cards is keyed on the same appointment. That makes
+       this one hop, and it cannot drift the way a copied job_card_id would.
+       COALESCE to the estimate's appointment so a row that predates the column
+       being populated still resolves. */
+    (SELECT jc.id FROM job_cards jc
+      WHERE jc.appointment_id = COALESCE(ci.appointment_id, est_ctx.appointment_id)) AS job_card_id,
+    (SELECT jc.job_card_no FROM job_cards jc
+      WHERE jc.appointment_id = COALESCE(ci.appointment_id, est_ctx.appointment_id)) AS job_card_no,
+    (SELECT jc.status FROM job_cards jc
+      WHERE jc.appointment_id = COALESCE(ci.appointment_id, est_ctx.appointment_id)) AS job_card_status,
+    /* The id the job card screen is actually addressed by. Its route is
+       /job-cards/:appointmentId, not /job-cards/:jobCardId — so handing the
+       frontend job_card_id alone would give it a number it cannot navigate to.
+       Same COALESCE as above, so the link and the number always agree. */
+    COALESCE(ci.appointment_id, est_ctx.appointment_id) AS visit_appointment_id,
     -- Fall back to appointment data if CI columns were stored as null
     COALESCE(ci.customer_name, a.customer_name) AS customer_name,
     COALESCE(ci.mobile,        a.mobile)        AS mobile,
@@ -695,6 +716,10 @@ function getCustomerInvoicePdf(req, res, next) {
     await sendPdf(res, {
       docType: 'customer_invoice', row: invoice, company, cfg, theme,
       baseUrl: req.get('origin') || req.get('referer'),
+      /* ?format=html returns the very same document as HTML, for the
+         browser's own print dialog. Same permission checks, same data, same
+         template — see sendPdf. */
+      format: req.query.format,
     });
   });
 }
@@ -1139,8 +1164,13 @@ function deletePayment(req, res, next) {
 
 // The company's books-lock date and backdating window. One row table; missing
 // row means nothing is locked and the default window applies.
-async function loadInvoiceDateSettings() {
-  const r = await pool.query(
+/* `db` so a caller inside a transaction can hand its own client over — see the
+   matching note on loadDateSettings in estimates.controller.js.
+   updateInvoiceDate called this while holding a client and an advisory lock,
+   which on a 10-wide pool with no acquire timeout (config/db.js) is a deadlock
+   at ten concurrent date changes rather than a slow one. */
+async function loadInvoiceDateSettings(db = pool) {
+  const r = await db.query(
     `SELECT books_locked_through::text AS books_locked_through,
             backdate_max_days
        FROM company_settings ORDER BY id LIMIT 1`
@@ -1470,7 +1500,7 @@ function updateInvoiceDate(req, res, next) {
         return res.status(400).json({ error: 'That is already the invoice date.', code: 'UNCHANGED' });
       }
 
-      const settings = await loadInvoiceDateSettings();
+      const settings = await loadInvoiceDateSettings(client);
       const warranty = await computeWarrantyImpact(client, id, ctx.invoice_date, body.invoice_date, today);
 
       // Decided BEFORE validation, because it changes what the floor is. This
@@ -1630,6 +1660,12 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       // means an override can never happen because someone simply had the
       // permission — they have to have seen the warning and chosen to proceed.
       override: z.coerce.boolean().optional().default(false),
+      // Separate from `override` above, deliberately. That one is about the
+      // invoice date; this one is about raising the bill before the job card
+      // has passed its quality check. Two different rules, two different
+      // decisions, and folding them into one flag would mean agreeing to a
+      // thing you were never shown.
+      override_reason: z.string().trim().max(500).optional(),
     }).parse(req.body);
     const { estimate_id } = body;
 
@@ -1654,6 +1690,15 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
         error: `Estimate must be work_completed to generate a customer invoice (current: ${est.status})`,
       });
     }
+
+    // ── Not before the quality check ────────────────────────────────────────
+    // Where a job card exists, the customer's bill cannot be raised until that
+    // card reaches Ready. An appointment with NO job card is unaffected, which
+    // is what makes this safe to deploy mid-week.
+    const jcBlock = await blockedFromInvoicing(est.appointment_id, {
+      user: req.user, overrideReason: body.override_reason, document: 'customer invoice',
+    });
+    if (jcBlock) return res.status(jcBlock.status).json(jcBlock.body);
 
     // Block CI unless an approved Purchase Invoice exists for this estimate
     const piRow = await pool.query(
@@ -1843,6 +1888,18 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
     // rather than leaving them to notice it in the totals.
     let appliedAdvances = [];
 
+    /* ── Released the moment the transaction ends ────────────────────────────
+       Everything after the COMMIT wants a connection of its own:
+       advanceAppointmentStatus runs two queries plus the WhatsApp automation
+       lookup, resolveClaimForEstimate runs more, and then there are three
+       read-backs. The pool is 10 wide with no acquire timeout (config/db.js),
+       so holding this client through all of that is a deadlock at ten
+       simultaneous invoices, not a slow response — and this one also holds an
+       advisory lock, which would freeze anybody else touching the same estimate.
+
+       Early release with a flag rather than a restructure: not one line of the
+       amounts, the GST or the advance application is moved by this change. */
+    let released = false;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -1871,7 +1928,7 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
 
          source === 'supplier_default' is the ordinary case here — an
          unregistered walk-in at the workshop is an intra-state supply. */
-      const posCompany = await loadCompany();
+      const posCompany = await loadCompany(client);
       const pos = resolvePlaceOfSupply(
         { is_b2b: est.is_b2b, b2b_gst_number: est.is_b2b ? est.b2b_gst_number : null },
         posCompany
@@ -1973,6 +2030,8 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
       }
 
       await client.query('COMMIT');
+      client.release();          // ← nothing below belongs to the transaction
+      released = true;
 
       // Advance appointment → Invoice Generated
       await advanceAppointmentStatus(est.appointment_id, 'invoice-generated');
@@ -1994,10 +2053,15 @@ function generateCustomerInvoiceFromEstimate(req, res, next) {
         applied_advances: appliedAdvances,
       });
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Only while we still hold it. Past the release the invoice is committed
+      // and there is nothing of ours left to roll back — a status advance or a
+      // read-back failing must not try to undo real money.
+      if (!released) await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
-      client.release();
+      // A second release() on the same pg client throws, so the flag is what
+      // keeps the early exit and this one apart.
+      if (!released) client.release();
     }
   });
 }

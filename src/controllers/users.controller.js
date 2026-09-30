@@ -195,6 +195,12 @@ function createUser(req, res, next) {
 
     const passwordHash = await bcrypt.hash(data.password, 10);
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js). loadUser()
+       runs its own query, so calling it while still holding this client means
+       ten simultaneous user creations take all ten connections and each then
+       waits for an eleventh that cannot exist. It happens after the release. */
+    let newId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -209,20 +215,21 @@ function createUser(req, res, next) {
           data.mobile ?? null, data.department ?? null, data.joining_date ?? null,
         ]
       );
-      const newId = r.rows[0].id;
+      newId = r.rows[0].id;
       if (data.permissions && data.permissions.length) {
         await replacePermissions(client, newId, data.permissions);
       }
       await client.query('COMMIT');
-      const user = await loadUser(newId);
-      getIO().emit('invalidate', { topic: 'users' });
-      res.status(201).json({ item: user });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before loadUser() asks for a client
     }
+
+    const user = await loadUser(newId);
+    getIO().emit('invalidate', { topic: 'users' });
+    res.status(201).json({ item: user });
   });
 }
 

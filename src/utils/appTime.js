@@ -88,4 +88,46 @@ function istEndOfDayISO(dateStr) {
   return new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999) - IST_OFFSET_MS).toISOString();
 }
 
-module.exports = { IST, applyProcessTimezone, istToday, istAddDays, istWeekday, istEndOfDayISO };
+/**
+ * A value from the database as the calendar date it actually is, 'YYYY-MM-DD'.
+ *
+ * ── WHY THIS EXISTS, AND WHY toISOString() IS NOT IT ───────────────────────
+ *
+ * `pg` turns a DATE column into a Date built at LOCAL midnight. With the
+ * process pinned to IST by applyProcessTimezone() above, 2026-07-09 arrives as
+ *
+ *     Thu Jul 09 2026 00:00:00 GMT+0530
+ *
+ * and `.toISOString()` on that is "2026-07-08T18:30:00.000Z". Slice ten
+ * characters off and the date is a DAY EARLY — on every row, silently, and
+ * only on a server east of Greenwich. Which is every server this runs on.
+ *
+ * Reading the calendar parts instead returns what was stored, because those
+ * are the same parts `pg` put in. Verified against four server timezones:
+ * local parts were right in all four, toISOString() wrong in two (IST among
+ * them), and forcing IST wrong in one.
+ *
+ * For a TIMESTAMPTZ the value is an instant rather than a calendar day, and
+ * the local parts give its IST date — which is the date a person in the office
+ * would call it. That depends on the process TZ, which applyProcessTimezone()
+ * sets as the first statement of server.js.
+ *
+ * A string is passed through after being checked, so a column already cast to
+ * text in SQL — the bulletproof version of this — costs nothing here.
+ */
+function calendarDate(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'string') {
+    const m = v.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : null;
+  }
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+module.exports = {
+  IST, applyProcessTimezone, istToday, istAddDays, istWeekday, istEndOfDayISO,
+  calendarDate,
+};

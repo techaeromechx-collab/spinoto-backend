@@ -294,6 +294,14 @@ async function cancelInvoiceQr({ txnRef, userId = null }) {
  * @returns { captured, duplicate, invoice_status, ledger_payment_id }
  */
 async function captureVerifiedPayment({ txnId, gatewayPaymentId, gatewayPayment = null, via = 'callback' }) {
+  /* The comment further down already says the side effects must not run inside
+     this transaction — and they did not. They ran after the COMMIT but before
+     the release, which on a 10-wide pool with no acquire timeout
+     (config/db.js) is the same hang by a different route:
+     advanceAppointmentStatus and resolveClaimForEstimate each open their own
+     connection, so ten payments landing together held all ten and every one of
+     them waited for an eleventh. The flag hands this one back first. */
+  let released = false;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -466,11 +474,14 @@ async function captureVerifiedPayment({ txnId, gatewayPaymentId, gatewayPayment 
     }
 
     await client.query('COMMIT');
+    client.release();          // ← before the side effects ask for a client
+    released = true;
 
-    // Side effects AFTER the commit. advanceAppointmentStatus and the warranty
-    // resolver run their own transactions; calling them inside this one risks a
-    // deadlock, and a failure in either must not roll back money we have
-    // already received. This mirrors what the manual payment path does.
+    // Side effects AFTER the commit AND after the release. advanceAppointmentStatus
+    // and the warranty resolver run their own transactions on their own
+    // connections; calling them inside this one, or while still holding its
+    // client, is a deadlock — and a failure in either must not roll back money
+    // we have already received. This mirrors what the manual payment path does.
     if (state.status === 'paid') {
       try {
         await advanceAppointmentStatus(state.appointment_id, 'closed');
@@ -496,10 +507,12 @@ async function captureVerifiedPayment({ txnId, gatewayPaymentId, gatewayPayment 
       txn,
     };
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    // Only while we still hold it. Past the release the payment is committed —
+    // the customer's money has arrived — and there is nothing left to undo.
+    if (!released) await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
-    client.release();
+    if (!released) client.release();
   }
 }
 

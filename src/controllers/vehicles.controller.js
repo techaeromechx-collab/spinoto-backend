@@ -499,6 +499,11 @@ function createVehicleRecord(req, res, next) {
   handle(req, res, next, async () => {
     const data = vehicleRecordSchema.parse(req.body);
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js), so the
+       read-back cannot run while this client is still held: ten at once would
+       take all ten connections and each then wait for an eleventh. */
+    let newId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -600,20 +605,20 @@ function createVehicleRecord(req, res, next) {
          RETURNING id`,
         [makeId, data.model, segmentId, bodyTypeId, data.engine_cc ?? null, ccCategoryId, data.is_active]
       );
-      const newId = r.rows[0].id;
+      newId = r.rows[0].id;
 
       await client.query('COMMIT');
-
-      // Return full record
-      const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [newId]);
-      getIO().emit('invalidate', { topic: 'vehicles' });
-      res.status(201).json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before the read-back asks for a client
     }
+
+    // Return full record
+    const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [newId]);
+    getIO().emit('invalidate', { topic: 'vehicles' });
+    res.status(201).json({ item: full.rows[0] });
   });
 }
 
@@ -749,16 +754,16 @@ function updateVehicleRecord(req, res, next) {
       );
 
       await client.query('COMMIT');
-
-      const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [id]);
-      getIO().emit('invalidate', { topic: 'vehicles' });
-      res.json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before the read-back asks for a client
     }
+
+    const full = await pool.query(`${VEHICLE_SELECT} WHERE vm.id = $1`, [id]);
+    getIO().emit('invalidate', { topic: 'vehicles' });
+    res.json({ item: full.rows[0] });
   });
 }
 

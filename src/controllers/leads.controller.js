@@ -11,6 +11,8 @@ const { logActivity }  = require('../services/activityLog.service');
 const { sendPush }     = require('../utils/sendPush');
 const { isNotificationEnabled } = require('../utils/notificationPrefs');
 const { generatePublicToken, resolveTokenToId } = require('../utils/publicToken');
+// The lead-visibility rule. See utils/leadScope.js for why it is not in here.
+const { ph, teamIdsFor, teamIdsIfNeeded, scopeConditions } = require('../utils/leadScope');
 
 // ---------- validators ----------
 const leadSchema = z.object({
@@ -254,50 +256,19 @@ ${ACTIVITY_JOIN}
  *             points.
  */
 
-/** Small helper: push a value, get its placeholder. Keeps $n numbering honest
- *  across four queries that share a params array. */
-function ph(params, value) {
-  params.push(value);
-  return `$${params.length}`;
-}
+/* ph / teamIdsFor / teamIdsIfNeeded / scopeConditions moved to
+   utils/leadScope.js — imported at the top of this file.
 
-/**
- * Who reports to this manager, plus themselves.
- *
- * Read ONCE per request and passed to scopeConditions, which is called four
- * times — once for the page and once per count base. Left inside
- * scopeConditions it was four identical round trips to build one answer that
- * cannot change between them.
- */
-async function teamIdsFor(user) {
-  const r = await pool.query(`SELECT id FROM users WHERE manager_id = $1`, [user.id]);
-  return [...r.rows.map(x => x.id), user.id];
-}
+   They moved because internal chat needs the same answer (may this lead be
+   NAMED to the person a message was shared with), and the two alternatives were
+   both worse: a fourth copy of the rule, which is the exact mistake
+   scopeConditions' own comment records having happened three times already; or
+   importing this 113KB controller into a chat service and dragging the whole
+   lead subsystem in with it.
 
-/**
- * teamIdsFor, but only when the answer will be used.
- *
- * A super admin and a VIEW_LEAD holder are not scoped at all, and an advisor
- * with VIEW_OWN_LEADS is scoped by their own id — neither needs the lookup, and
- * running it anyway is a query per request for a value that gets discarded.
- */
-async function teamIdsIfNeeded(user) {
-  if (user.is_super_admin || user.permissions.has('VIEW_LEAD')) return null;
-  if (!user.permissions.has('VIEW_TEAM_LEADS')) return null;
-  return teamIdsFor(user);
-}
+   Behaviour is unchanged — the functions were moved verbatim, and every call
+   site in this file still calls them by the same names. */
 
-/** Which leads this user may see at all. Pushes into `params`. */
-function scopeConditions(user, teamIds, params) {
-  if (user.is_super_admin || user.permissions.has('VIEW_LEAD')) return [];
-
-  if (teamIds) return [`(l.created_by = ANY(${ph(params, teamIds)}))`];
-
-  // VIEW_OWN_LEADS — created by them OR given to them. The second half is what
-  // makes handing somebody a lead work at all.
-  const me = ph(params, user.id);
-  return [`(l.created_by = ${me} OR l.assigned_to = ${me})`];
-}
 
 /* The source chips, as SQL.
    Grouped rather than matched exactly, because lead_source is free text
@@ -307,6 +278,37 @@ function scopeConditions(user, teamIds, params) {
 const META_SOURCES   = "'meta ads','meta','facebook','instagram','facebook ads','instagram ads','social media'";
 const MANUAL_SOURCES = "'manual','walk-in','walk in','phone call','referral'";
 const SRC = "LOWER(TRIM(COALESCE(l.lead_source,'')))";
+
+/**
+ * The lead_sources row a free-text source name means, or null.
+ *
+ * ══ WHY BOTH COLUMNS ARE WRITTEN ═══════════════════════════════════════════
+ *
+ * Migration 204 made leads.source_id the truth and kept leads.lead_source, and
+ * this is what keeps the two in step on every write. Three things still read the
+ * text — the source chips above, the exact-source dropdown at line 366, and
+ * reports' leads-by-source — so writing only source_id would leave every NEW
+ * lead missing from all three. Writing only the text would leave the new
+ * appointment-source reports blank. So: both, always, from one place.
+ *
+ * The CLIENT still sends a name, not an id, and that is on purpose for now: the
+ * dropdown is fed from /api/lead-sources, so what arrives is already a master
+ * name and the lookup matches. Changing the wire format would mean touching
+ * NewLeadModal and EditLeadModal for no behaviour anybody can see.
+ *
+ * No match leaves source_id NULL and stores the text unchanged. That happens when
+ * somebody bypasses the dropdown, and the honest record of it is a lead whose
+ * text is kept and whose link is empty — not a link invented to the nearest
+ * guess. Takes `client` because both callers are inside a transaction, and the
+ * pool is 10 wide with no acquire timeout.
+ */
+async function resolveLeadSourceId(client, name) {
+  const s = String(name ?? '').trim();
+  if (!s) return null;
+  const r = await client.query(
+    `SELECT id FROM lead_sources WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`, [s]);
+  return r.rows[0]?.id ?? null;
+}
 
 function sourceChipSql(key) {
   switch (key) {
@@ -929,6 +931,12 @@ function updateLead(req, res, next) {
     // cc_category_id is not a column on the leads table — exclude it
     const { services, cc_category_id: _cc, category_ids, ...coreData } = data;
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js). The assignment
+       notification, the conversion check and the read-back all want their own
+       connection, so they run after the release. Ten lead edits at once would
+       otherwise hold all ten connections while each waited for an eleventh. */
+    let prevLead;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -941,7 +949,7 @@ function updateLead(req, res, next) {
          LEFT JOIN users u ON u.id = l.assigned_to
          WHERE l.id = $1`, [id]
       );
-      const prevLead = prevLeadRow.rows[0];
+      prevLead = prevLeadRow.rows[0];
 
       // Block assigned_to changes once lead is converted to an appointment
       if ('assigned_to' in coreData) {
@@ -1022,6 +1030,17 @@ function updateLead(req, res, next) {
       for (const [key, val] of Object.entries(coreData)) {
         params.push(val);
         fields.push(`${key} = $${params.length}`);
+      }
+
+      /* The loop above writes whatever it is given, generically. source_id is not
+         one of those things — it is derived from lead_source — so it has to be
+         appended here, and only when the source is actually being changed.
+         Without this, editing a lead's source updates the text and leaves the
+         link pointing at the old channel, and the two reports disagree from that
+         moment on. */
+      if (coreData.lead_source !== undefined) {
+        params.push(await resolveLeadSourceId(client, coreData.lead_source));
+        fields.push(`source_id = $${params.length}`);
       }
 
       // Replace services if provided
@@ -1243,64 +1262,68 @@ function updateLead(req, res, next) {
       }
 
       await client.query('COMMIT');
-
-      // ── Notify assignee if assigned_to changed ──────────────────────────
-      if ('assigned_to' in coreData && coreData.assigned_to) {
-        // prevLead was captured before the update so this comparison is correct
-        const isNewAssignment = prevLead?.assigned_to !== coreData.assigned_to;
-        if (isNewAssignment) {
-          const assignerRow = await pool.query(
-            `SELECT name FROM users WHERE id = $1`, [req.user.id]
-          );
-          const assignerName = assignerRow.rows[0]?.name || 'Someone';
-          const parts = [prevLead?.name, prevLead?.mobile].filter(Boolean);
-          const leadLabel = parts.join(' • ') || `Lead #${id}`;
-          const notifTitle = 'Lead Assigned';
-          const notifBody  = `${leadLabel} assigned to you by ${assignerName}`;
-          if (await isNotificationEnabled(pool, coreData.assigned_to, 'lead_assigned')) {
-            await pool.query(
-              `INSERT INTO notifications (user_id, type, title, body, lead_id)
-               VALUES ($1, 'lead_assigned', $2, $3, $4)`,
-              [coreData.assigned_to, notifTitle, notifBody, id]
-            );
-          }
-          // Push immediately (single assignment — don't wait for summary)
-          sendPush(coreData.assigned_to, 'lead_assigned', notifTitle, notifBody, '/leads');
-        }
-      }
-
-      /* ── Alert #9 Lead Conversion ────────────────────────────────────────
-         Asked of the STATUS TABLE, not of a list of names in this file.
-
-         The list used to be ['won', 'converted', 'closed won'] and not one of
-         those has ever been a status in this system — the alert read as
-         working and had never once fired. A hardcoded name is wrong here twice
-         over: it is wrong on the day it is written if nobody checks, and it
-         goes wrong later the moment somebody renames a status.
-
-         converts_to_appointment is the flag that MEANS converted: it is the
-         one that turns a lead into an appointment. */
-      if (coreData.status) {
-        const conv = await client.query(
-          `SELECT 1 FROM lead_statuses
-            WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) AND converts_to_appointment`,
-          [coreData.status]);
-        if (conv.rowCount) fireLeadConversionAlert(id, req.user.id).catch(() => {});
-      }
-
-      // ── Alert #2 High Priority (on update) ───────────────────────────────
-      if (coreData.priority || coreData.tags || (coreData.services !== undefined)) {
-        fireHighPriorityAlert(id).catch(() => {});
-      }
-
-      const full = await pool.query(`${LEAD_SELECT} WHERE l.id = $1`, [id]);
-      res.json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    // ── Notify assignee if assigned_to changed ────────────────────────────
+    if ('assigned_to' in coreData && coreData.assigned_to) {
+      // prevLead was captured before the update so this comparison is correct
+      const isNewAssignment = prevLead?.assigned_to !== coreData.assigned_to;
+      if (isNewAssignment) {
+        const assignerRow = await pool.query(
+          `SELECT name FROM users WHERE id = $1`, [req.user.id]
+        );
+        const assignerName = assignerRow.rows[0]?.name || 'Someone';
+        const parts = [prevLead?.name, prevLead?.mobile].filter(Boolean);
+        const leadLabel = parts.join(' • ') || `Lead #${id}`;
+        const notifTitle = 'Lead Assigned';
+        const notifBody  = `${leadLabel} assigned to you by ${assignerName}`;
+        if (await isNotificationEnabled(pool, coreData.assigned_to, 'lead_assigned')) {
+          await pool.query(
+            `INSERT INTO notifications (user_id, type, title, body, lead_id)
+             VALUES ($1, 'lead_assigned', $2, $3, $4)`,
+            [coreData.assigned_to, notifTitle, notifBody, id]
+          );
+        }
+        // Push immediately (single assignment — don't wait for summary)
+        sendPush(coreData.assigned_to, 'lead_assigned', notifTitle, notifBody, '/leads');
+      }
+    }
+
+    /* ── Alert #9 Lead Conversion ──────────────────────────────────────────
+       Asked of the STATUS TABLE, not of a list of names in this file.
+
+       The list used to be ['won', 'converted', 'closed won'] and not one of
+       those has ever been a status in this system — the alert read as
+       working and had never once fired. A hardcoded name is wrong here twice
+       over: it is wrong on the day it is written if nobody checks, and it
+       goes wrong later the moment somebody renames a status.
+
+       converts_to_appointment is the flag that MEANS converted: it is the
+       one that turns a lead into an appointment.
+
+       On the pool now, not on `client` — the client went back to the pool at
+       the release above, and this read has nothing to do with the
+       transaction. */
+    if (coreData.status) {
+      const conv = await pool.query(
+        `SELECT 1 FROM lead_statuses
+          WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) AND converts_to_appointment`,
+        [coreData.status]);
+      if (conv.rowCount) fireLeadConversionAlert(id, req.user.id).catch(() => {});
+    }
+
+    // ── Alert #2 High Priority (on update) ─────────────────────────────────
+    if (coreData.priority || coreData.tags || (coreData.services !== undefined)) {
+      fireHighPriorityAlert(id).catch(() => {});
+    }
+
+    const full = await pool.query(`${LEAD_SELECT} WHERE l.id = $1`, [id]);
+    res.json({ item: full.rows[0] });
   });
 }
 
@@ -1341,10 +1364,10 @@ function createLead(req, res, next) {
           name, mobile, whatsapp, state_id, city_id, area_id,
           vehicle_type_id, make_id, model_id, body_type_id, segment_ids,
           lead_source, status, total_price, notes, created_by, assigned_to,
-          priority, tags, public_token
+          priority, tags, public_token, source_id
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-          $18, $19, $20
+          $18, $19, $20, $21
         ) RETURNING id`,
         [
           data.name, data.mobile, data.whatsapp || null,
@@ -1354,6 +1377,9 @@ function createLead(req, res, next) {
           data.lead_source || null, initialStatus, totalPrice, data.notes || null,
           userId, data.assigned_to || null,
           data.priority || 'normal', data.tags || [], generatePublicToken(),
+          /* Derived from the text in the same statement that stores the text, so
+             the two can never disagree for a new lead. See resolveLeadSourceId. */
+          await resolveLeadSourceId(client, data.lead_source),
         ]
       );
 
@@ -1861,6 +1887,17 @@ function bulkStatus(req, res, next) {
     // and the colour lookup on the list keeps working.
     const statusName = target.name;
 
+    /* ── Released the moment the transaction ends ────────────────────────────
+       Everything after the COMMIT — the notification summaries, the conversion
+       alerts — wants its own connection, and there is a LOOP of them. The pool
+       is 10 wide with no acquire timeout (config/db.js), so holding this client
+       through that is a deadlock, not a slow response.
+
+       Early release with a flag rather than a restructure, because this handler
+       computes a dozen values inside the transaction that the code below reads;
+       the flag is the same shape refundAdvance() in advances.service.js already
+       uses, for the same reason. */
+    let released = false;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -2039,6 +2076,8 @@ function bulkStatus(req, res, next) {
       }
 
       await client.query('COMMIT');
+      client.release();          // ← nothing below belongs to the transaction
+      released = true;
 
       logActivity({
         userId:      req.user?.id,
@@ -2126,10 +2165,14 @@ function bulkStatus(req, res, next) {
         ids,
       });
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Only while we still hold it. Past the release above the statuses are
+      // committed and there is nothing of ours left to roll back.
+      if (!released) await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
-      client.release();
+      // A second release() on the same pg client throws, so the flag is what
+      // keeps the early exit and this one apart.
+      if (!released) client.release();
     }
   });
 }

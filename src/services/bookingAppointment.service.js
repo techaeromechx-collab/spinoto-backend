@@ -241,19 +241,48 @@ async function createBookingAppointment(input) {
 
   const client = await pool.connect();
   let apptId, apptCode = null;
+  /* The idempotent-replay path in the catch below re-reads the existing booking
+     on the POOL, after this transaction has been rolled back but while its
+     client is still held. The pool is 10 wide with no acquire timeout
+     (config/db.js), so a burst of duplicate deliveries — exactly the case that
+     path exists for — could hold all ten connections while each waited for an
+     eleventh. The flag lets the catch hand the connection back first. */
+  let released = false;
   try {
     await client.query('BEGIN');
 
     const defStatus = await client.query(
       `SELECT id FROM appointment_statuses WHERE is_default = TRUE AND is_active = TRUE LIMIT 1`);
 
+    /* ── The booking site's own source string, mapped onto OUR master list ────
+       data.source keeps going into booking_source verbatim, untouched: that
+       column is the raw payload and the audit trail, and rewriting it would lose
+       what the far side actually sent.
+
+       source_id is the CRM's own answer, matched case-insensitively against
+       lead_sources so 'website' from the booking panel and 'Website' picked
+       inside the CRM count as ONE channel rather than two (migration 204).
+
+       No match is left NULL rather than forced to a default. The booking panel
+       can send whatever it likes, and inventing a channel for a string nobody
+       recognises would put made-up numbers in a revenue report. booking_source
+       still holds the original, so an unmatched value is findable — add it to the
+       master list once and every later booking matches it. */
+    const srcMatch = data.source
+      ? await client.query(
+          `SELECT id FROM lead_sources WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1`,
+          [String(data.source)])
+      : { rows: [] };
+    const bookingSourceId = srcMatch.rows[0]?.id ?? null;
+
     const ins = await client.query(
       `INSERT INTO appointments
          (customer_name, mobile, vehicle_number,
           vehicle_type_id, make_id, model_id, body_type_id, segment_ids,
           hub_id, scheduled_date, scheduled_time, status_id, total_price,
-          notes, external_ref, booking_source, public_token, pickup_maps_link)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          notes, external_ref, booking_source, public_token, pickup_maps_link,
+          source_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
        RETURNING id`,
       [
         data.customer.name || null, data.customer.mobile,
@@ -264,6 +293,7 @@ async function createBookingAppointment(input) {
         defStatus.rows[0]?.id || null, totalPrice,
         noteLines.join('\n'),
         externalRef, data.source, generatePublicToken(), mapsLink,
+        bookingSourceId,
       ]
     );
     apptId = ins.rows[0].id;
@@ -306,6 +336,10 @@ async function createBookingAppointment(input) {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
+    // Rolled back, so this connection has no more work to do — and the replay
+    // lookup below wants one of its own.
+    client.release();
+    released = true;
     // Unique-violation race (two deliveries at once) → idempotent replay.
     if (err.code === '23505') {
       const again = await findExisting(externalRef);
@@ -320,7 +354,9 @@ async function createBookingAppointment(input) {
     }
     throw err;
   } finally {
-    client.release();
+    // A second release() on the same pg client throws, so the flag keeps the
+    // catch's early release and this one apart.
+    if (!released) client.release();
   }
 
   logActivity({

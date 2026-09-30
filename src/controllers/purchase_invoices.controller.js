@@ -3,6 +3,7 @@ const crypto   = require('crypto');
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { blockedFromInvoicing } = require('../helpers/jobCardInvoiceGuard');
 const { getRoundingFunction } = require('../utils/math');
 const { applyGrandTotalRounding } = require('../utils/invoiceRounding');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
@@ -471,6 +472,10 @@ function getPurchaseInvoicePdf(req, res, next) {
     await sendPdf(res, {
       docType: 'purchase_invoice', row: invoice, company, cfg, theme,
       baseUrl: req.get('origin') || req.get('referer'),
+      /* ?format=html returns the very same document as HTML, for the
+         browser's own print dialog. Same permission checks, same data, same
+         template — see sendPdf. */
+      format: req.query.format,
     });
   });
 }
@@ -491,12 +496,15 @@ function getPurchaseInvoiceByToken(req, res, next) {
 
 function generatePurchaseInvoice(req, res, next) {
   handle(req, res, next, async () => {
-    const { estimate_id, invoice_date } = z.object({
+    const { estimate_id, invoice_date, override_reason } = z.object({
       estimate_id: z.coerce.number().int().positive(),
       // Optional, and absent by default. See the PI date block below for why
       // this exists rather than a cleverer default.
       invoice_date: z.string().trim()
         .regex(/^\d{4}-\d{2}-\d{2}$/, 'invoice_date must be YYYY-MM-DD').optional(),
+      // Super admin only, and only to raise this bill before the job card has
+      // reached Ready. See the guard below.
+      override_reason: z.string().trim().max(500).optional(),
     }).parse(req.body);
 
     // Validate estimate
@@ -515,6 +523,18 @@ function generatePurchaseInvoice(req, res, next) {
     );
     if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
     const est = estRow.rows[0];
+
+    // ── Not before the quality check ────────────────────────────────────────
+    // Where a job card exists, the hub's bill cannot be raised until that card
+    // reaches Ready. Until now this fired the moment the estimate read
+    // work_completed — before QC had even started.
+    //
+    // An appointment with NO job card is unaffected, which is what makes this
+    // safe to deploy mid-week: everything already in flight keeps working.
+    const jcBlock = await blockedFromInvoicing(est.appointment_id, {
+      user: req.user, overrideReason: override_reason, document: 'purchase invoice',
+    });
+    if (jcBlock) return res.status(jcBlock.status).json(jcBlock.body);
 
     // ── PI date ─────────────────────────────────────────────────────────────
     // Inherited from a deliberately-backdated estimate, else today. See the
@@ -749,6 +769,16 @@ function generatePurchaseInvoice(req, res, next) {
       grandTotal, createdAt: new Date(),
     });
 
+    /* ── Released the moment the transaction ends ────────────────────────────
+       The read-back below needs its own connection, and the pool is 10 wide
+       with no acquire timeout (config/db.js): holding this client while asking
+       for a second one is a deadlock at ten concurrent callers, not a slow
+       response.
+
+       Early release with a flag rather than moving code, deliberately — not one
+       line of the amounts, the rounding or the supplier snapshot is touched by
+       this change. Same shape as refundAdvance() in advances.service.js. */
+    let released = false;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -803,14 +833,18 @@ function generatePurchaseInvoice(req, res, next) {
         );
       }
       await client.query('COMMIT');
+      client.release();          // ← before the read-back asks for a client
+      released = true;
+
       const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [piId]);
       full.rows[0].items = await _getItems(piId);
       res.status(201).json({ item: full.rows[0] });
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Only while we still hold it — past the release the invoice is committed.
+      if (!released) await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
-      client.release();
+      if (!released) client.release();
     }
   });
 }
@@ -1310,8 +1344,18 @@ function deleteHubPayment(req, res, next) {
 
     await _assertPiHub(req, id);
 
+    /* The only change here is WHEN the connection goes back to the pool. The
+       DELETE, the guard on gateway-paid rows, the recalc and every message are
+       exactly as they were — this function decides real money against a hub and
+       is not the place for tidying.
+
+       Why it needed changing at all: on the zero-rows path below, the
+       explanatory SELECT runs on the POOL while this client is still held. The
+       pool is 10 wide with no acquire timeout (config/db.js), so ten of those at
+       once would hold all ten connections, each waiting for an eleventh. */
     const client = await pool.connect();
     let deleted = null;
+    let released = false;
     try {
       await client.query('BEGIN');
 
@@ -1343,6 +1387,10 @@ function deleteHubPayment(req, res, next) {
       );
       if (r.rowCount === 0) {
         await client.query('ROLLBACK');
+        /* Rolled back, so this connection has no more work to do — and the
+           SELECT that follows wants one of its own. Hand it back first. */
+        client.release();
+        released = true;
         // Two reasons for zero rows, and they need different sentences.
         const why = await pool.query(
           `SELECT hub_payout_id, (SELECT payout_ref FROM hub_payouts WHERE id = hp.hub_payout_id) AS payout_ref
@@ -1361,10 +1409,16 @@ function deleteHubPayment(req, res, next) {
       await _recalcHubPaymentStatus(client, id);
 
       await client.query('COMMIT');
+      client.release();          // ← before the read-back asks for a client
+      released = true;
     } catch (err) {
-      await client.query('ROLLBACK');
+      if (!released) await client.query('ROLLBACK').catch(() => {});
       throw err;
-    } finally { client.release(); }
+    } finally {
+      // A second release() on the same pg client throws, so the flag keeps the
+      // three exits — zero rows, committed, thrown — apart.
+      if (!released) client.release();
+    }
 
     const full = await pool.query(`${PI_SELECT} WHERE pi.id = $1`, [id]);
     full.rows[0].items        = await _getItems(id);

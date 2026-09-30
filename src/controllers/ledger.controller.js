@@ -39,6 +39,7 @@
 const { pool } = require('../config/db');
 const { isHubUser } = require('../utils/hubScope');
 const { loadCompany } = require('../utils/renderDocument');
+const { calendarDate } = require('../utils/appTime');
 const { renderHtmlToPdf } = require('../utils/pdf');
 const { statementHtml } = require('../templates/statementPdf');
 
@@ -46,17 +47,86 @@ const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const r2  = (v) => Math.round(num(v) * 100) / 100;
 const ciNo = (id) => `CI-${String(id).padStart(6, '0')}`;
 const piNo = (id) => `PI-${String(id).padStart(6, '0')}`;
-const isoDate = (d) => (d ? String(new Date(d).toISOString()).slice(0, 10) : null);
+/* Was `new Date(d).toISOString().slice(0, 10)`, which is the UTC date. The
+   process runs in IST (utils/appTime), so a DATE column arrives as local
+   midnight and its UTC form is the DAY BEFORE — every invoice date, every note
+   date and every opening date on every statement, one day early. Only visible
+   on a server east of Greenwich, which is the only kind this runs on. */
+const isoDate = calendarDate;
 
 /** The live opening balance for a party, or null. */
-async function openingFor(partyType, partyKey) {
+/**
+ * Everything that happened BEFORE `from`, as one debit-positive number.
+ *
+ * The filters here have to match the builders below exactly — same tables,
+ * same status conditions. If one of them counts a cancelled invoice and the
+ * other does not, a statement for August plus a statement for September stops
+ * adding up to a statement for August–September, and nobody can tell which of
+ * the two is lying.
+ */
+async function netBefore(partyType, partyKey, from) {
+  const d = String(from).slice(0, 10);
+  const q = partyType === 'customer'
+    ? { sql: `SELECT
+           (SELECT COALESCE(SUM(ci.grand_total), 0) FROM customer_invoices ci
+             WHERE ci.mobile = $1 AND ci.invoice_date < $2::date)
+         + (SELECT COALESCE(SUM(rf.amount), 0) FROM payment_refunds rf
+              JOIN customer_invoices ci2 ON ci2.id = rf.customer_invoice_id
+             WHERE ci2.mobile = $1 AND rf.status = 'processed' AND rf.created_at::date < $2::date)
+         - (SELECT COALESCE(SUM(p.amount), 0) FROM customer_invoice_payments p
+             WHERE p.mobile = $1 AND p.paid_at::date < $2::date)
+         - (SELECT COALESCE(SUM(cn.grand_total), 0) FROM credit_notes cn
+             WHERE cn.party_type = 'customer' AND cn.mobile = $1
+               AND cn.status = 'issued' AND cn.note_date < $2::date) AS net`,
+        params: [String(partyKey), d] }
+    : { sql: `SELECT
+           (SELECT COALESCE(SUM(hp.amount), 0) FROM hub_payments hp
+             WHERE hp.hub_id = $1 AND hp.paid_at::date < $2::date)
+         + (SELECT COALESCE(SUM(cn.grand_total), 0) FROM credit_notes cn
+             WHERE cn.party_type = 'hub' AND cn.hub_id = $1
+               AND cn.status = 'issued' AND cn.note_date < $2::date)
+         - (SELECT COALESCE(SUM(pi.grand_total), 0) FROM purchase_invoices pi
+             WHERE pi.hub_id = $1 AND pi.created_at::date < $2::date) AS net`,
+        params: [Number(partyKey), d] };
+  const r = await pool.query(q.sql, q.params);
+  return num(r.rows[0]?.net);
+}
+
+/**
+ * Where the statement starts.
+ *
+ * Unfiltered, that is the opening balance somebody typed in. Filtered to a
+ * date range, it has to be the opening balance PLUS everything that happened
+ * before the range — otherwise a statement for August silently drops January
+ * to July and every balance in the column is wrong while looking perfectly
+ * reasonable. That is the one failure mode a statement must not have.
+ */
+async function openingFor(partyType, partyKey, from) {
   const r = await pool.query(
     `SELECT amount, direction, as_of_date, note
        FROM party_opening_balances
       WHERE party_type = $1 AND party_key = $2 AND superseded_at IS NULL`,
     [partyType, String(partyKey)]
   );
-  return r.rows[0] || null;
+  const stored = r.rows[0] || null;
+  if (!from) return stored;
+
+  /* Debit-positive throughout, the same direction `runBalance` works in. */
+  const storedSigned = stored
+    ? (stored.direction === 'dr' ? num(stored.amount) : -num(stored.amount))
+    : 0;
+  const net = r2(storedSigned + await netBefore(partyType, partyKey, from));
+
+  /* A party that was square on the morning the range opens gets no row at all.
+     Printing "brought forward ₹0.00" is noise dressed as diligence. */
+  if (Math.abs(net) < 0.011) return null;
+  return {
+    amount: Math.abs(net),
+    direction: net >= 0 ? 'dr' : 'cr',
+    as_of_date: String(from).slice(0, 10),
+    note: 'Balance brought forward',
+    brought_forward: true,
+  };
 }
 
 /**
@@ -75,11 +145,34 @@ function runBalance(rows, opening, dirIsDebit) {
     return String(a.ref).localeCompare(String(b.ref));
   });
 
+  /* `bal` is debit-positive for BOTH parties, because the loop below does
+     `bal += debit - credit`. A credit opening is therefore negative here
+     whoever the party is, and only the LABEL flips with the convention.
+
+     This used to read `opening.direction === (dirIsDebit ? 'dr' : 'cr')`,
+     which stored a hub's credit opening as a POSITIVE — leaving every running
+     balance after it wrong by twice the opening, in the direction that says
+     the hub owes us. It never surfaced because party_opening_balances is
+     empty, so no statement had ever taken this branch. A date-filtered
+     statement brings a balance forward through this same path on every
+     request, so it would have surfaced on the first filtered hub. */
   let bal = 0;
   if (opening) {
-    const amt = num(opening.amount);
-    bal = opening.direction === (dirIsDebit ? 'dr' : 'cr') ? amt : -amt;
+    bal = opening.direction === 'dr' ? num(opening.amount) : -num(opening.amount);
   }
+
+  /* The single place that turns the internal figure into what is printed, so
+     the opening row and every row after it cannot describe the same number in
+     two different ways. */
+  const describe = (b) => {
+    const shown = dirIsDebit ? b : -b;
+    return {
+      balance: r2(Math.abs(shown)),
+      balance_direction: shown >= 0
+        ? (dirIsDebit ? 'dr' : 'cr')
+        : (dirIsDebit ? 'cr' : 'dr'),
+    };
+  };
 
   const out = [];
   if (opening) {
@@ -87,32 +180,24 @@ function runBalance(rows, opening, dirIsDebit) {
       date: isoDate(opening.as_of_date),
       type: 'opening',
       col: opening.direction === 'dr' ? 'debit' : 'credit',
-      ref: 'Opening balance',
+      ref: opening.brought_forward ? 'Brought forward' : 'Opening balance',
       particulars: opening.note || 'Carried in from before Spinoto',
       debit:  opening.direction === 'dr' ? r2(opening.amount) : 0,
       credit: opening.direction === 'cr' ? r2(opening.amount) : 0,
-      balance: r2(Math.abs(bal)),
-      balance_direction: bal >= 0 ? (dirIsDebit ? 'dr' : 'cr') : (dirIsDebit ? 'cr' : 'dr'),
+      ...describe(bal),
     });
   }
 
   for (const r of sorted) {
     bal += num(r.debit) - num(r.credit);
-    /* For a hub the sign convention is inverted, so the running figure is
-       negated before it is described — the arithmetic above stays in one
-       direction and only the label changes. */
-    const shown = dirIsDebit ? bal : -bal;
-    /* The LABEL has to follow the convention too, not just the sign. On the
-       hub side a positive running figure means we owe them, which is a CREDIT
-       balance — calling it 'dr' because the number came out positive is how a
-       payables statement ends up saying the hub owes us. */
+    /* The LABEL follows the convention, not just the sign. On the hub side a
+       positive running figure means we owe them, which is a CREDIT balance —
+       calling it 'dr' because the number came out positive is how a payables
+       statement ends up saying the hub owes us. describe() holds that rule. */
     out.push({
       ...r,
       debit: r2(r.debit), credit: r2(r.credit),
-      balance: r2(Math.abs(shown)),
-      balance_direction: shown >= 0
-        ? (dirIsDebit ? 'dr' : 'cr')
-        : (dirIsDebit ? 'cr' : 'dr'),
+      ...describe(bal),
     });
   }
   return out;
@@ -157,7 +242,7 @@ async function buildCustomerLedger(mobile, { from, to } = {}) {
            JOIN customer_invoices ci ON ci.id = rf.customer_invoice_id
           WHERE ci.mobile = $1 AND rf.status = 'processed'${dateWhere('rf.created_at::date')}
           ORDER BY rf.created_at, rf.id`, [mobile]),
-      openingFor('customer', mobile),
+      openingFor('customer', mobile, from),
     ]);
 
     const rows = [];
@@ -232,6 +317,9 @@ async function buildCustomerLedger(mobile, { from, to } = {}) {
         closing_direction: last ? last.balance_direction : 'dr',
         documents: rows.length,
       },
+      /* Echoed back so the screen and the PDF print the period they were
+         actually given rather than the period somebody meant to ask for. */
+      range: { from: from || null, to: to || null },
       ageing,
     };
 }
@@ -268,7 +356,7 @@ async function buildHubLedger(hubId, { from, to } = {}) {
           WHERE cn.party_type = 'hub' AND cn.hub_id = $1
             AND cn.status = 'issued'${dateWhere('cn.note_date')}
           ORDER BY cn.note_date, cn.id`, [hubId]),
-      openingFor('hub', String(hubId)),
+      openingFor('hub', String(hubId), from),
     ]);
 
     if (!hub.rows[0]) { const e = new Error('Hub not found.'); e.status = 404; throw e; }
@@ -317,6 +405,9 @@ async function buildHubLedger(hubId, { from, to } = {}) {
         closing_direction: last ? last.balance_direction : 'cr',
         documents: rows.length,
       },
+      /* Echoed back so the screen and the PDF print the period they were
+         actually given rather than the period somebody meant to ask for. */
+      range: { from: from || null, to: to || null },
     };
 }
 
@@ -383,7 +474,19 @@ async function payables(req, res, next) {
               COUNT(pi.id)::int AS open_invoices,
               ROUND(SUM(pi.grand_total), 2) AS outstanding,
               MIN(pi.created_at)::date AS oldest,
-              EXTRACT(DAY FROM NOW() - MIN(pi.created_at))::int AS oldest_days
+              EXTRACT(DAY FROM NOW() - MIN(pi.created_at))::int AS oldest_days,
+              /* The last time money actually left for this hub.
+                 hub_payments, NOT hub_payouts — the same table the Hub Payouts
+                 screen sums for "what we paid", so the two screens cannot
+                 disagree about when a hub was last paid. hub_payouts holds only
+                 the transfers a provider sent; a payment recorded by hand from
+                 a banking app never appears in it, and this column would then
+                 tell someone a hub had never been paid when it had.
+                 A payout covering three invoices writes three rows here, but
+                 MAX is unaffected by that — the date is the same either way. */
+              (SELECT MAX(hp.paid_at)::date
+                 FROM hub_payments hp
+                WHERE hp.hub_id = h.id) AS last_paid
          FROM purchase_invoices pi
          JOIN hubs h ON h.id = pi.hub_id
         WHERE pi.payment_status = 'pending' AND pi.grand_total > 0

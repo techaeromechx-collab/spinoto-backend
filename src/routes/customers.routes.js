@@ -46,6 +46,11 @@ router.get   ('/by-token/:token',      ...canView,        ctrl.getCustomerByToke
 // Vehicle sub-routes — must be before /:mobile to avoid param clash
 router.get   ('/:mobile/timeline',     ...canView,        ctrl.getCustomerTimeline);
 router.get   ('/:mobile/vehicle-usage', ...canView,       ctrl.getVehicleUsage);
+/* Both behind canView, the same gate the rest of the profile uses. They expose
+   spend and which hub did the work, so NOT the looser canPick the vehicle list
+   gets. */
+router.get   ('/:mobile/job-cards',      ...canView,      ctrl.listCustomerJobCards);
+router.get   ('/:mobile/vehicle-history', ...canView,     ctrl.getVehicleHistory);
 // Readable by a hub: it already had to know the complete mobile number to get
 // here, and this returns cars — not visits, spend, or which hub serviced them.
 router.get   ('/:mobile/vehicles',     ...canPick, pickLimit, ctrl.listCustomerVehicles);

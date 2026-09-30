@@ -62,6 +62,12 @@ const EARLIEST_HOUR = 8;
 async function runRetargetSweep(opts = {}) {
   if (!opts.force && new Date().getHours() < EARLIEST_HOUR) return { skipped: 'too early' };
 
+  /* notifyOwners runs on the pool — the comment further down says so — but it
+     was being called while this client was still held. On a 10-wide pool with
+     no acquire timeout (config/db.js) that is a connection spent doing nothing
+     while asking for more, and notifyOwners loops over every lead that moved.
+     The flag hands this one back at the COMMIT. */
+  let released = false;
   const client = await pool.connect();
   try {
     // ── Where do they go? ────────────────────────────────────────────────
@@ -173,6 +179,8 @@ async function runRetargetSweep(opts = {}) {
     }
 
     await client.query('COMMIT');
+    client.release();          // ← before notifyOwners asks for a client
+    released = true;
     console.log(`[retarget] moved ${moving.length} lead(s) to "${target}"`);
 
     // ── Telling somebody ─────────────────────────────────────────────────
@@ -184,11 +192,13 @@ async function runRetargetSweep(opts = {}) {
 
     return { moved: moving.length, skipped_returned: back.length, target };
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch { /* connection already gone */ }
+    // Only while we still hold it — past the release the moves are committed and
+    // it is only the notifying that can still fail.
+    if (!released) { try { await client.query('ROLLBACK'); } catch { /* connection already gone */ } }
     console.error('[retarget] sweep failed:', err.message);
     return { moved: 0, error: err.message };
   } finally {
-    client.release();
+    if (!released) client.release();
   }
 }
 

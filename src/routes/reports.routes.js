@@ -38,6 +38,23 @@ router.get('/analytics/funnel',          canViewLeads,    c.getConversionFunnel)
 router.get('/analytics/top-performers',  canViewRevenue,  c.getTopPerformers);
 router.get('/analytics/leads-over-time', canViewLeads,    c.getLeadsOverTime);
 router.get('/analytics/leads-by-source', canViewLeads,    c.getLeadsBySource);
+
+/* ── The source reports added with migration 204 ──────────────────────────────
+   Gated on what each one actually DISCLOSES rather than on one shared
+   permission:
+
+     appointments-by-source   job counts        → the appointments gate
+     revenue-by-source        money             → the revenue gate
+     source-funnel            counts AND money  → the revenue gate, the stricter
+                                                  of the two, because its last
+                                                  column is revenue and showing it
+                                                  to somebody who may not see
+                                                  revenue would be a hole opened
+                                                  by a chart. */
+router.get('/analytics/appointments-by-source', canViewAppts,    c.getAppointmentsBySource);
+router.get('/analytics/revenue-by-source',      canViewRevenue,  c.getRevenueBySource);
+router.get('/analytics/source-funnel',          canViewRevenue,  c.getSourceFunnel);
+
 router.get('/team-performance',          canViewTeamPerf, c.getTeamPerformance);
 
 /* GSTR-1. canViewInvoice, not canViewRevenue: the response is the invoice
@@ -46,5 +63,9 @@ router.get('/team-performance',          canViewTeamPerf, c.getTeamPerformance);
    additionally refuses hub logins outright; a company GST return has no
    correct hub-scoped version. */
 router.get('/gstr1',                     canViewInvoice,  gstr1.getGstr1);
+/* The same return as one workbook — every table on its own sheet, behind a
+   Dashboard. Same permission and the same builder as the JSON above, so the
+   file cannot disagree with the screen it was downloaded from. */
+router.get('/gstr1/xlsx',                canViewInvoice,  gstr1.getGstr1Xlsx);
 
 module.exports = router;

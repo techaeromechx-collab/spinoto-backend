@@ -1073,6 +1073,231 @@ async function getLeadsBySource(req, res, next) {
   } catch (err) { next(err); }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   SOURCE REPORTS — the three added with migration 204
+   ═══════════════════════════════════════════════════════════════════════════
+
+   getLeadsBySource above is older and reads leads.lead_source, the free TEXT
+   column. These three read source_id, the master-list link, and that difference
+   is the whole point: nine spellings of 'facebook' were nine rows in a chart and
+   are now one. The two reports WILL disagree on channel names for historic data,
+   and the new ones are the ones to trust.
+
+   ── WHICH DATE, AND WHY IT IS NOT THE SAME ONE ─────────────────────────────
+
+   Each stage is filtered on its OWN date column:
+
+     leads         l.created_at      when the enquiry arrived
+     appointments  a.scheduled_date  when the job was booked in for
+     revenue       ci.invoice_date   when it was billed
+
+   So "March" means enquiries that arrived in March, jobs booked for March, and
+   money billed in March — which are three different sets of records, because a
+   January enquiry can be a March job. That is deliberate: every number is then
+   true on its own ("we booked 18 Walk-in jobs in March"), and it is reported as
+   date_basis so nothing has to be inferred from a chart axis. It is NOT a cohort
+   analysis, and the funnel's percentages must not be read as "these exact leads
+   converted" — see the note getSourceFunnel returns.
+
+   ── WARRANTY REDOS ─────────────────────────────────────────────────────────
+
+   A redo inherits the original job's source (warranty_claims.controller.js), so
+   it would otherwise count as a second Walk-in. It is not new business, so it is
+   excluded from the job counts and reported separately as `redos`. Excluded and
+   COUNTED rather than silently dropped: a channel whose work keeps coming back
+   under warranty is exactly what somebody would want to see. */
+
+// ── Appointments By Source ────────────────────────────────────────────────────
+// GET /api/reports/analytics/appointments-by-source?from=&to=&hub_id=
+async function getAppointmentsBySource(req, res, next) {
+  try {
+    const { from, to, hub_id } = req.query;
+    const params = [];
+
+    const dw  = dateParams(from, to, params, 'a.scheduled_date');
+    /* On the appointment's own hub, not the creator's. hubClause() walks
+       users.hub_id from created_by/assigned_to, which is right for a LEAD (whose
+       hub is whoever owns it) and wrong for a job (whose hub is where the car
+       physically goes). */
+    let hub = '';
+    if (hub_id) { params.push(Number(hub_id)); hub = `a.hub_id = $${params.length}`; }
+
+    const where = [dw, hub].filter(Boolean);
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const r = await pool.query(`
+      SELECT
+        a.source_id,
+        COALESCE(s.name, '(no source)') AS source,
+        s.is_active                     AS source_is_active,
+        /* Real jobs. Redos are excluded here and counted beside it.
+           BY SLUG, not by a boolean flag. appointment_statuses has no
+           is_completed or is_cancelled column — the first version of this was
+           written against two I had assumed existed, and every other report in
+           this file uses slug IN ('no-show','cancelled'). Slugs are
+           is_system = TRUE and stable; the NAME is editable in master data and
+           would not be.
+
+           Every slug listed here is one migrations 036, 060 and 061 actually
+           seed. 'completed' means the car is done: work finished, ready, invoiced
+           or closed. It is NOT 'paid' only — a job the customer has not settled
+           yet is still a job this channel produced. */
+        COUNT(*) FILTER (WHERE NOT COALESCE(a.is_warranty_redo, FALSE))::int AS total,
+        COUNT(*) FILTER (WHERE COALESCE(a.is_warranty_redo, FALSE))::int     AS redos,
+        COUNT(*) FILTER (
+          WHERE NOT COALESCE(a.is_warranty_redo, FALSE)
+            AND ast.slug IN ('work-completed', 'ready-for-delivery', 'invoice-generated',
+                             'invoice-approved', 'invoice-paid', 'closed')
+        )::int AS completed,
+        COUNT(*) FILTER (
+          WHERE NOT COALESCE(a.is_warranty_redo, FALSE)
+            AND ast.slug IN ('cancelled', 'no-show')
+        )::int AS cancelled
+      FROM appointments a
+      LEFT JOIN lead_sources          s   ON s.id   = a.source_id
+      LEFT JOIN appointment_statuses  ast ON ast.id = a.status_id
+      ${whereSql}
+      GROUP BY a.source_id, s.name, s.is_active
+      ORDER BY total DESC, source
+    `, params);
+
+    res.json({ items: r.rows, date_basis: 'appointments.scheduled_date' });
+  } catch (err) { next(err); }
+}
+
+// ── Revenue By Source ─────────────────────────────────────────────────────────
+// GET /api/reports/analytics/revenue-by-source?from=&to=&hub_id=
+async function getRevenueBySource(req, res, next) {
+  try {
+    const { from, to, hub_id } = req.query;
+    const params = [];
+
+    /* Cancelled invoices excluded, exactly as getHubRevenue does. A cancelled
+       invoice is not revenue and counting it would make two reports on the same
+       money disagree. */
+    const where = [`ci.status != 'cancelled'`];
+    const dw = dateParams(from, to, params, 'ci.invoice_date');
+    if (dw) where.push(dw);
+    if (hub_id) { params.push(Number(hub_id)); where.push(`ci.hub_id = $${params.length}`); }
+
+    /* Through customer_invoices.appointment_id, which is a real column — not via
+       the estimate. A STANDALONE estimate has no appointment, so its invoice has
+       no source and lands in '(no source)'. That row is deliberately kept in the
+       result rather than filtered out: hiding it would make the channel revenue
+       look like the whole of revenue, and the gap is the thing worth seeing. */
+    const r = await pool.query(`
+      SELECT
+        a.source_id,
+        COALESCE(s.name, '(no source)') AS source,
+        s.is_active                     AS source_is_active,
+        COUNT(*)::int                                     AS invoices,
+        COUNT(DISTINCT ci.appointment_id)::int            AS jobs,
+        COALESCE(SUM(ci.grand_total), 0)::numeric(14,2)   AS revenue,
+        COALESCE(SUM(ci.amount_paid),  0)::numeric(14,2)  AS collected,
+        -- What is still owed on this channel's work, floored so an overpaid
+        -- invoice never reads as negative outstanding.
+        COALESCE(SUM(GREATEST(ci.grand_total - COALESCE(ci.amount_paid, 0), 0)), 0)::numeric(14,2)
+          AS outstanding
+      FROM customer_invoices ci
+      LEFT JOIN appointments a ON a.id = ci.appointment_id
+      LEFT JOIN lead_sources s ON s.id = a.source_id
+      WHERE ${where.join(' AND ')}
+      GROUP BY a.source_id, s.name, s.is_active
+      ORDER BY revenue DESC, source
+    `, params);
+
+    res.json({ items: r.rows, date_basis: 'customer_invoices.invoice_date' });
+  } catch (err) { next(err); }
+}
+
+// ── Full Funnel By Source ─────────────────────────────────────────────────────
+// GET /api/reports/analytics/source-funnel?from=&to=&hub_id=
+async function getSourceFunnel(req, res, next) {
+  try {
+    const { from, to, hub_id } = req.query;
+    const { userIds } = await resolveScope(req.user);
+
+    /* Three independent aggregates joined on source_id rather than one query with
+       three JOINs. A single query would multiply rows — one lead with two
+       appointments and three invoices produces six — and the counts would be
+       silently wrong in a way that looks plausible. Each CTE counts its own
+       table once.
+
+       lead_sources is the spine so a channel with leads and no jobs still
+       appears, and a UNION adds the NULL bucket so the gaps show too. */
+    const params = [];
+    const leadScope = userIds ? (params.push(userIds), `l.created_by = ANY($${params.length})`) : '';
+    const leadDate  = dateParams(from, to, params, 'l.created_at');
+    const leadHub   = hub_id ? hubClause(hub_id, params, 'l.created_by', 'l.assigned_to') : '';
+    const leadWhere = [leadScope, leadDate, leadHub].filter(Boolean);
+
+    const apptDate = dateParams(from, to, params, 'a.scheduled_date');
+    let apptHub = '';
+    if (hub_id) { params.push(Number(hub_id)); apptHub = `a.hub_id = $${params.length}`; }
+    const apptWhere = [apptDate, apptHub, 'NOT COALESCE(a.is_warranty_redo, FALSE)'].filter(Boolean);
+
+    const ciDate = dateParams(from, to, params, 'ci.invoice_date');
+    const ciWhere = [`ci.status != 'cancelled'`, ciDate].filter(Boolean);
+    if (hub_id) { params.push(Number(hub_id)); ciWhere.push(`ci.hub_id = $${params.length}`); }
+
+    const r = await pool.query(`
+      WITH ld AS (
+        SELECT l.source_id, COUNT(*)::int AS leads
+          FROM leads l
+          ${leadWhere.length ? `WHERE ${leadWhere.join(' AND ')}` : ''}
+         GROUP BY l.source_id
+      ),
+      ap AS (
+        SELECT a.source_id, COUNT(*)::int AS appointments
+          FROM appointments a
+          ${apptWhere.length ? `WHERE ${apptWhere.join(' AND ')}` : ''}
+         GROUP BY a.source_id
+      ),
+      inv AS (
+        SELECT a.source_id,
+               COUNT(DISTINCT ci.appointment_id)::int          AS invoiced,
+               COALESCE(SUM(ci.grand_total), 0)::numeric(14,2) AS revenue
+          FROM customer_invoices ci
+          LEFT JOIN appointments a ON a.id = ci.appointment_id
+         WHERE ${ciWhere.join(' AND ')}
+         GROUP BY a.source_id
+      ),
+      spine AS (
+        SELECT id AS source_id, name, is_active FROM lead_sources
+        UNION ALL
+        SELECT NULL, '(no source)', NULL
+      )
+      SELECT
+        sp.source_id,
+        sp.name       AS source,
+        sp.is_active  AS source_is_active,
+        COALESCE(ld.leads, 0)        AS leads,
+        COALESCE(ap.appointments, 0) AS appointments,
+        COALESCE(inv.invoiced, 0)    AS invoiced,
+        COALESCE(inv.revenue, 0)     AS revenue
+      FROM spine sp
+      LEFT JOIN ld  ON ld.source_id  IS NOT DISTINCT FROM sp.source_id
+      LEFT JOIN ap  ON ap.source_id  IS NOT DISTINCT FROM sp.source_id
+      LEFT JOIN inv ON inv.source_id IS NOT DISTINCT FROM sp.source_id
+      -- A channel with nothing at all in the window is noise, not information.
+      WHERE COALESCE(ld.leads, 0) + COALESCE(ap.appointments, 0) + COALESCE(inv.invoiced, 0) > 0
+      ORDER BY revenue DESC, leads DESC, source
+    `, params);
+
+    res.json({
+      items: r.rows,
+      /* Stated in the response because the UI must show it. Without this line
+         somebody reads 18/40 as "18 of those 40 leads converted", and it is not:
+         it is "40 enquiries arrived and 18 jobs were booked", in the same window,
+         from possibly different customers. */
+      note: 'Each stage is counted on its own date: leads by when they arrived, '
+          + 'jobs by the date they are booked for, revenue by invoice date. The '
+          + 'percentages compare volumes in the same window, not the same customers.',
+      date_basis: { leads: 'leads.created_at', appointments: 'appointments.scheduled_date', revenue: 'customer_invoices.invoice_date' },
+    });
+  } catch (err) { next(err); }
+}
+
 // ── Leads Over Time ───────────────────────────────────────────────────────────
 // GET /api/reports/leads-over-time?from=&to=&group_by=day|week&hub_id=
 async function getLeadsOverTime(req, res, next) {
@@ -1405,4 +1630,8 @@ module.exports = {
   getRevenueTrend, getConversionFunnel, getTopPerformers,
   getTeamPerformance, getLeadsOverTime, getLeadsBySource,
   getHubRevenue,
+  // Migration 204: the real source, read off source_id rather than the old free
+  // text. getLeadsBySource above still reads the text and is kept for the chart
+  // that already uses it.
+  getAppointmentsBySource, getRevenueBySource, getSourceFunnel,
 };

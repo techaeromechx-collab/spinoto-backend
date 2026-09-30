@@ -4,6 +4,7 @@ const { z } = require('zod');
 const { requireAuth, requirePermission } = require('../middleware/auth.middleware');
 const { rateLimit } = require('../middleware/rateLimit.middleware');
 const { pool } = require('../config/db');
+const { emitInvalidateTo } = require('../socket');
 
 // Values must be validated, not just key-whitelisted — otherwise empty names,
 // multi-MB photo strings, or non-string values (→ unhandled 500s) get through.
@@ -135,6 +136,130 @@ router.patch('/profile', requireAuth, async (req, res, next) => {
       [req.user.id]
     );
     res.json({ user: r.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW — GET / PUT /api/me/shortcuts  — this user's keyboard overrides
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Only the OVERRIDES are stored. The defaults live in
+ * frontend/src/lib/shortcuts.js; see migration 202 for why copying them into
+ * every row would mean no default could ever be improved again.
+ */
+
+/* The same shapes lib/shortcuts.js accepts. Kept in step by test22, which
+   asserts the two regexes agree on a list of examples — a validator that is
+   stricter than the client rejects work somebody has already done, and one
+   that is looser is not a validator. */
+const SC_ONE = "[a-z0-9/?,.;'\\[\\]\\\\`=-]";
+const SC_BINDING = new RegExp(
+  '^(?:'
+  + '(?:(?:ctrl|meta|alt|shift)\\+)+(?:' + SC_ONE + '|F\\d{1,2}|Home|End|Enter|Tab|Escape| )'
+  + '|' + SC_ONE
+  + '|[a-z] ' + SC_ONE
+  + '|Escape'
+  + ')$'
+);
+
+/* The browser's, or the operating system's. Mirrors RESERVED in
+   lib/shortcuts.js — refused here as well, because a client deciding what it
+   may save is not a rule. */
+const SC_RESERVED = new Set([
+  'ctrl+t','meta+t','ctrl+n','meta+n','ctrl+w','meta+w','ctrl+q','meta+q',
+  'ctrl+l','meta+l','ctrl+p','meta+p','ctrl+s','meta+s','ctrl+f','meta+f',
+  'alt+d','alt+e','alt+f',
+  'alt+Home','alt+ArrowLeft','alt+ArrowRight','alt+ArrowUp','alt+ArrowDown',
+  'alt+ ','alt+Tab','alt+F4',
+  'ctrl+k','meta+k',
+]);
+
+/* A cap, so the column cannot become a dumping ground for a buggy client.
+   Comfortably more than the sidebar has. */
+const SC_MAX_KEYS = 80;
+
+/* Deliberately NOT a whitelist of ids. The set of bindable things is NAV_ITEMS,
+   a frontend list, and restating it here would be the third copy of the
+   sidebar — the failure utils/leadScope.js documents at length. An id this
+   backend has never heard of is harmless: the resolver only reads ids it
+   knows, so a stale override for a deleted page is ignored and costs nothing
+   but a row of JSON. What IS enforced is the shape, the size, and the keys
+   nobody may take. */
+const SC_ID = /^(?:nav:\/[\w\-/]*|action:[a-z-]+)$/;
+
+/* And a length, because SC_ID's path part is unbounded. Without this an
+   authenticated caller can store 80 ids of any length each — the regex is happy
+   with 'nav:/' followed by ten thousand characters — and the column takes it.
+   Found while writing test22; the longest real id is well under 40. */
+const SC_ID_MAX = 64;
+
+router.get('/shortcuts', requireAuth, async (req, res, next) => {
+  try {
+    const r = await pool.query('SELECT shortcuts FROM users WHERE id = $1', [req.user.id]);
+    if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
+    res.json({ shortcuts: r.rows[0].shortcuts || {} });
+  } catch (err) {
+    /* The column arrives in migration 202. A deploy that runs the frontend
+       before the migration should lose its shortcuts, not its settings page. */
+    if (err.code === '42703') return res.json({ shortcuts: {} });
+    next(err);
+  }
+});
+
+router.put('/shortcuts', requireAuth, async (req, res, next) => {
+  try {
+    const body = req.body?.shortcuts;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'shortcuts must be an object' });
+    }
+    const entries = Object.entries(body);
+    if (entries.length > SC_MAX_KEYS) {
+      return res.status(400).json({ error: `At most ${SC_MAX_KEYS} shortcuts` });
+    }
+
+    const clean = {};
+    const seen = new Map();
+    for (const [id, raw] of entries) {
+      if (id.length > SC_ID_MAX || !SC_ID.test(id)) {
+        return res.status(400).json({ error: `Not a shortcut id: ${id.slice(0, SC_ID_MAX)}` });
+      }
+      if (typeof raw !== 'string') {
+        return res.status(400).json({ error: `${id}: a shortcut must be a string` });
+      }
+      const keys = raw.trim();
+      if (keys === '') { clean[id] = ''; continue; }   // unbound on purpose
+      if (!SC_BINDING.test(keys)) {
+        return res.status(400).json({ error: `${id}: "${keys}" is not a usable key` });
+      }
+      if (SC_RESERVED.has(keys)) {
+        return res.status(400).json({ error: `${id}: "${keys}" belongs to the browser` });
+      }
+      /* Two ids on one key is not a state the UI can get into, so a request
+         carrying it is a bug or a hand-rolled call. Refusing is kinder than
+         storing something whose behaviour depends on object order. */
+      if (seen.has(keys)) {
+        return res.status(400).json({ error: `"${keys}" is used twice, by ${seen.get(keys)} and ${id}` });
+      }
+      seen.set(keys, id);
+      clean[id] = keys;
+    }
+
+    await pool.query(
+      'UPDATE users SET shortcuts = $1::jsonb, updated_at = NOW() WHERE id = $2',
+      [JSON.stringify(clean), req.user.id]
+    );
+
+    /* This person's OTHER tabs and devices, so a key changed on the desktop is
+       live on the workshop PC without a reload.
+       NOT the tab that sent this: emitInvalidateTo skips the originating socket
+       on purpose, which is right for its usual job and would be useless here
+       anyway — the panel and the listener are in the same tab, and
+       lib/shortcutsStore.js is what keeps those two in step. */
+    emitInvalidateTo([req.user.id], 'shortcuts', req);
+
+    res.json({ shortcuts: clean });
   } catch (err) {
     next(err);
   }

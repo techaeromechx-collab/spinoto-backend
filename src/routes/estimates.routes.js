@@ -4,6 +4,7 @@ const express = require('express');
 const { maskCustomerContact } = require('../middleware/maskMobile.middleware');
 const { requireAuth, requirePermission, requirePermissionOrHub } = require('../middleware/auth.middleware');
 const {
+  listDeclinedWork,
   listEstimates,
   getEstimate,
   getEstimatePdf,
@@ -15,6 +16,7 @@ const {
   companyRevise,
   customerApproval,
   updateItemWorkStatus,
+  completeItemsBulk,
   deleteEstimate,
   estimateDatePreflight,
   updateEstimateDate,
@@ -54,6 +56,11 @@ router.use(requireAuth);
 router.use(maskCustomerContact);
 
 
+/* Before '/:id', or "declined-work" is parsed as an estimate id.
+   canView, the same gate the form itself sits behind — a hub raising an
+   estimate needs this as much as staff do, and the service narrows a hub
+   caller to its own hub's refusals. */
+router.get('/declined-work',                       canView,    listDeclinedWork);
 router.get('/',                                    canView,    listEstimates);
 router.post('/',                                   canCreate,  createEstimate);
 // by-token — resolves a shareable-URL token; must be before /:id
@@ -71,6 +78,11 @@ router.post('/:id/submit',                         canSubmit,  submitEstimate);
 router.post('/:id/company-approve',                canApprove, companyApprove);
 router.post('/:id/company-revise',                 canRevise,  companyRevise);
 router.post('/:id/customer-approval',              canRecordCustomerDecision, customerApproval);
+/* BEFORE the '/:id/items/:itemId/work-status' line below, because Express
+   matches in order and ':itemId' would otherwise swallow the literal segment
+   'work-status-bulk' — the request would reach the single-item handler with
+   itemId = 'work-status-bulk' and fail on the id parse instead of routing. */
+router.patch('/:id/items/work-status-bulk',        canExecute, completeItemsBulk);
 router.patch('/:id/items/:itemId/work-status',     canExecute, updateItemWorkStatus);
 router.delete('/:id',                              requireAuth, deleteEstimate);
 

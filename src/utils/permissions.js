@@ -25,6 +25,32 @@ const PERMISSIONS = Object.freeze({
     group: 'Administration',
   },
 
+  // ---- Internal chat ----
+  USE_CHAT: {
+    code: 'USE_CHAT',
+    label: 'Use Internal Chat',
+    description: 'Send and receive internal messages with colleagues.',
+    group: 'Administration',
+  },
+  // Moderating and reading are different powers and this is only the first.
+  //
+  // It permits deleting somebody else's message and removing somebody from a
+  // group. It does NOT permit reading a conversation you are not in, and it
+  // must never quietly grow into that: a CRM where an admin permission means
+  // "read everyone's private messages" is a CRM nobody uses for anything
+  // honest, and they would be right not to. Every chat route scopes on
+  // chat_participants.user_id = req.user.id, including for a holder of this.
+  //
+  // If reading others' threads is ever genuinely needed — a dispute, a legal
+  // hold — that is a separate, named, LOGGED permission and a separate
+  // conversation with whoever's messages they are.
+  MANAGE_CHAT: {
+    code: 'MANAGE_CHAT',
+    label: 'Moderate Internal Chat',
+    description: 'Delete other people\'s chat messages and remove people from group conversations. Does not allow reading conversations you are not part of.',
+    group: 'Administration',
+  },
+
   // ---- Master data ----
   MANAGE_MASTER_DATA: {
     code: 'MANAGE_MASTER_DATA',
@@ -362,6 +388,53 @@ const PERMISSIONS = Object.freeze({
     label: 'Delete Appointment',
     description: 'Permanently delete an appointment and its whole chain (estimate, purchase invoice, customer invoice, claims). Blocked once any payment exists — cancel instead.',
     group: 'Appointments',
+  },
+
+  // ---- Job cards and inspections ----
+  //
+  // ══ WHY THESE EXIST NOW, HAVING DELIBERATELY NOT EXISTED ══════════════════
+  //
+  // job_cards.routes.js used to argue against them, and the argument was sound
+  // at the time: "a job card IS the appointment, worked", so the appointment
+  // permissions were the honest gate, and a new code would have needed granting
+  // to every existing role on day one just to keep things as they were.
+  //
+  // What changed is the requirement, not the reasoning. The workshop floor and
+  // the call centre are different people: an agent who books and reschedules
+  // has no business opening the card, and a QC inspector has no business
+  // editing parts or labour. That separation cannot be expressed while the two
+  // screens share one permission — and the day-one grant is exactly what
+  // migration 203 does, so nobody loses anything on deploy.
+  //
+  // FOUR codes, not two and not six. View/edit on the card, view/edit on the
+  // sheet — so a QC role is VIEW_JOB_CARD + VIEW_INSPECTION + EDIT_INSPECTION
+  // and nothing else. Gates, parts and labour stay on EDIT_JOB_CARD: the
+  // storekeeper and the service advisor are the same login at most of these
+  // hubs, and a permission nobody will ever grant separately is a row in a
+  // checklist that only makes the real ones harder to find.
+  VIEW_JOB_CARD: {
+    code: 'VIEW_JOB_CARD',
+    label: 'View Job Cards',
+    description: 'Open the job card for a visit and read its complaints, technicians, items, parts, labour and compliance gates.',
+    group: 'Job Cards',
+  },
+  EDIT_JOB_CARD: {
+    code: 'EDIT_JOB_CARD',
+    label: 'Work on Job Cards',
+    description: 'Open and close job cards, change status, record complaints and technicians, issue parts, log labour, confirm compliance gates, issue a gate pass, and mark vehicle damage.',
+    group: 'Job Cards',
+  },
+  VIEW_INSPECTION: {
+    code: 'VIEW_INSPECTION',
+    label: 'View Inspections',
+    description: 'Read completed and in-progress checklist sheets, and the inspection queue across every card. Needs View Job Cards as well, since a sheet is opened from its card.',
+    group: 'Job Cards',
+  },
+  EDIT_INSPECTION: {
+    code: 'EDIT_INSPECTION',
+    label: 'Fill In Inspections',
+    description: 'Start, answer, complete and reopen a checklist sheet, and capture signatures on it. Does not allow editing the job card itself, its parts or its labour.',
+    group: 'Job Cards',
   },
 
   // ---- Customers ----

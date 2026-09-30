@@ -33,8 +33,20 @@ const { inlineAsset } = require('./assetInline');
  * every theme printed the signatory label over blank space with no image, on
  * both the PDF and the preview.
  */
-async function loadCompany() {
-  const r = await pool.query(
+/* `db` so a caller inside a transaction can hand its own client over.
+   Every other caller passes nothing and gets the pool, exactly as before.
+
+   Why it matters: the pool is 10 wide with no acquire timeout (config/db.js),
+   and two callers — generateCustomerInvoiceFromEstimate and createCreditNote —
+   await this while holding a client AND an advisory lock. Ten invoices
+   generated at the same moment took all ten connections, each waiting for an
+   eleventh that cannot exist, and froze anybody else touching the same
+   estimate on the way. Same fix as loadDateSettings and
+   loadInvoiceDateSettings; reading the company row on the caller's connection
+   is also the more correct answer, since it is then the configuration as of
+   that transaction. */
+async function loadCompany(db = pool) {
+  const r = await db.query(
     `SELECT company_name, address_line1, address_line2, city, state, pincode,
             phone, email, gstin, invoice_theme, invoice_accent_color, logo_url,
             signature_url,
@@ -238,9 +250,75 @@ async function renderHtml(docType, row, company, cfg, theme, { baseUrl } = {}) {
  * `filename` is optional — omit it and the name is derived from the document
  * itself (number_vehicle_model), which is what every caller wants.
  */
-async function sendPdf(res, { docType, row, company, cfg, theme, filename, baseUrl }) {
+/**
+ * The document, as a PDF — or as the HTML the PDF is made from.
+ *
+ * ── WHY format: 'html' EXISTS ──────────────────────────────────────────────
+ *
+ * Ctrl+P on the invoice screen used to print the SCREEN: different markup,
+ * different CSS, no logo, no accent colour, none of the theme. The obvious fix
+ * is to write print styles for the screen, and it is the wrong one — that is
+ * maintaining a second, permanently-not-quite-right copy of the document.
+ *
+ * The template already produces a complete, self-contained HTML document with
+ * the logo inlined as a data URI, the accent colour applied, the QR drawn and
+ * its own @page rule. A browser renders that string exactly as well as
+ * headless Chromium does. So printing it IS the PDF layout, not an imitation
+ * of it — one template, one design, two renderers.
+ *
+ * It also means the Print button keeps working when PDF generation does not,
+ * which on a server where Chromium cannot launch is not a hypothetical.
+ *
+ * The PDF is still the thing that gets emailed and sent on WhatsApp, where
+ * nobody is standing at a keyboard to press Ctrl+P.
+ */
+async function sendPdf(res, { docType, row, company, cfg, theme, filename, baseUrl, format }) {
   const { html, doc } = await renderHtml(docType, row, company, cfg, theme, { baseUrl });
   const name = filename || documentFilename(doc, row);
+
+  if (String(format || '').toLowerCase() === 'html') {
+    /* ── THE SHEET HAS TO BE DECLARED HERE ────────────────────────────────
+       templates/invoiceThemes/docShared.js emits `@page { margin }` but
+       deliberately NOT `@page { size }`, because Puppeteer's `format` option
+       owns the sheet and two declarations invite them to disagree. That is
+       right for the PDF and wrong the moment a BROWSER prints the same HTML:
+       nothing tells it which sheet, so it uses whatever the print dialog
+       happens to be set to while the body is still zoomed by pageScaleCss for
+       the configured one. The layout is then wider than the page and the right
+       edge is simply cut off — the invoice number, the Amount column, the
+       signatory line.
+
+       So the sheet is stated here, for this response only, from the same
+       pageSizeFor() the PDF is given. Separate @page rules cascade and merge,
+       so this adds `size` to the margin rule already in the document rather
+       than replacing it.
+
+       A5 matters more than A4 here: on A5 the body carries a zoom, and a
+       browser printing that onto A4 would render a small invoice in the corner
+       of a big sheet. */
+    const sheet = pageSizeFor(theme, cfg);
+    const withSheet = html.replace(
+      /<\/head>/i,
+      `<style>@page { size: ${sheet}; }</style></head>`
+    );
+
+    res.set({
+      'Content-Type': 'text/html; charset=utf-8',
+      /* Explicitly NOT an attachment: this is loaded into a hidden iframe and
+         printed. A download would defeat the whole point. */
+      'Content-Disposition': 'inline',
+      /* It is one customer's invoice. Nothing may keep a copy. */
+      'Cache-Control': 'no-store, private',
+      /* The template is self-contained — everything is inlined — so it needs
+         no network at all, and a document carrying a customer's name and
+         address should not be able to reach out for anything. */
+      'Content-Security-Policy':
+        "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:",
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.send(withSheet);
+  }
+
   const buf = await renderHtmlToPdf(html, { pageSize: pageSizeFor(theme, cfg) });
   res.set({
     'Content-Type': 'application/pdf',

@@ -32,6 +32,7 @@ const { recalcInvoiceState } = require('../services/invoiceBalance.service');
 const { generatePublicToken } = require('../utils/publicToken');
 const { logActivity } = require('../services/activityLog.service');
 const { isHubUser } = require('../utils/hubScope');
+const { calendarDate } = require('../utils/appTime');
 const { resolvePlaceOfSupply } = require('../utils/gstStates');
 const { loadCompany } = require('../utils/renderDocument');
 
@@ -243,7 +244,7 @@ async function createCreditNote(req, res, next) {
        it reverses. Anything else splits one transaction across two states. */
     let posCode = null, posName = null;
     if (isCustomer) {
-      const company = await loadCompany();
+      const company = await loadCompany(client);
       const pos = resolvePlaceOfSupply(invoice, company);
       posCode = pos.code || null;
       posName = pos.code ? pos.name : null;
@@ -409,7 +410,14 @@ async function listCreditNotes(req, res, next) {
         LIMIT 500`,
       params
     );
-    res.json({ items: rows.rows });
+    /* note_date is a DATE column, so `pg` hands it back as a Date built at
+       LOCAL midnight — and this process runs in IST (utils/appTime). Sent as
+       a Date, res.json() serialises it through toISOString() and it leaves as
+       the PREVIOUS day at 18:30Z. Every credit note would show a day early on
+       the invoice screen. Same fix as the GSTR-1 and ledger endpoints. */
+    res.json({
+      items: rows.rows.map(r => ({ ...r, note_date: calendarDate(r.note_date) })),
+    });
   } catch (err) { next(err); }
 }
 
@@ -437,7 +445,7 @@ async function getCreditNote(req, res, next) {
     const items = await pool.query(
       `SELECT * FROM credit_note_items WHERE credit_note_id = $1 ORDER BY id`, [id]
     );
-    res.json({ item: { ...r.rows[0], items: items.rows } });
+    res.json({ item: { ...r.rows[0], note_date: calendarDate(r.rows[0].note_date), items: items.rows } });
   } catch (err) { next(err); }
 }
 

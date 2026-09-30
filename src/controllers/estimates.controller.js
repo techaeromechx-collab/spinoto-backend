@@ -17,6 +17,7 @@
 const { z }    = require('zod');
 const { pool } = require('../config/db');
 const advanceAppointmentStatus = require('../helpers/advanceAppointmentStatus');
+const { checkEstimateParentage } = require('../helpers/supplementaryEstimate');
 // Keeps the PI and CI in step after a decision or a work-status change.
 const { resyncInvoicesForEstimate, describeResync } = require('../services/invoiceResync.service');
 const { fireWhatsAppEventDetached } = require('../services/whatsappAutomations.service');
@@ -24,6 +25,7 @@ const { applyItemApprovals } = require('../services/estimateApproval.service');
 const { getRoundingFunction } = require('../utils/math');
 const { generatePublicToken, ensureCustomerIdentity, resolveTokenToId } = require('../utils/publicToken');
 const { hubScopeSql, assertHubOwns, isHubUser } = require('../utils/hubScope');
+const { readDeclinedWork } = require('../services/declinedWork.service');
 const { applyTransactionDiscount } = require('../utils/transactionDiscount');
 const { getDiscountBasis } = require('../utils/discountBasis');
 const { logActivity } = require('../services/activityLog.service');
@@ -74,6 +76,12 @@ const itemSchema = z.object({
   customer_rate: z.coerce.number().nonnegative(),
   gst_percent:  z.coerce.number().min(0).max(100).default(0),
   is_from_appointment: z.boolean().optional().default(false),
+  /* What the customer was quoted when they booked, inc-GST (migration 195).
+     Carried lines are re-priced at today's rate, which is the right answer and
+     is how the estimate form has always worked — but the advisor has to be able
+     to see that the customer heard a different number. Sent only for lines that
+     came from a booking; NULL everywhere else. */
+  booked_price: z.coerce.number().nonnegative().optional().nullable(),
   discount_type:   z.enum(['percent', 'flat']).optional().nullable(),
   discount_value:  z.coerce.number().nonnegative().optional().default(0),
   discount_amount: z.coerce.number().nonnegative().optional().default(0),
@@ -119,6 +127,10 @@ const createSchema = z.object({
   // Optional now — an estimate can either link to an existing appointment
   // OR carry its own standalone customer/vehicle context (see below).
   appointment_id:            z.coerce.number().int().positive().optional().nullable(),
+  // The estimate this one EXTENDS. Supplying it steps the
+  // one-estimate-per-appointment rule aside, because a second document is then
+  // deliberate rather than a double-submitted form. See migration 193.
+  parent_estimate_id:        z.coerce.number().int().positive().optional().nullable(),
   hub_id:                    z.coerce.number().int().positive().optional().nullable(),
   notes:                     z.string().trim().max(3000).optional().nullable(),
   items:                     z.array(itemSchema).optional().default([]),
@@ -215,8 +227,15 @@ const companyReviseSchema = z.object({
 // single date entry rather than three.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function loadDateSettings() {
-  const r = await pool.query(
+/* `db` so a caller inside a transaction can hand its own client over. Without
+   it this read always went to the pool for a connection of its own, and
+   updateEstimateDate called it while holding one AND holding an advisory lock:
+   the pool is 10 wide with no acquire timeout (config/db.js), so ten date
+   changes at once held all ten connections while each waited for an eleventh.
+   Reading the settings on the caller's connection is also the more correct
+   answer — the rule being applied is then the rule as of the transaction. */
+async function loadDateSettings(db = pool) {
+  const r = await db.query(
     `SELECT books_locked_through::text AS books_locked_through, backdate_max_days
        FROM company_settings ORDER BY id LIMIT 1`
   );
@@ -421,7 +440,7 @@ function updateEstimateDate(req, res, next) {
       }
 
       const today = istToday();
-      ctx._settings = await loadDateSettings();
+      ctx._settings = await loadDateSettings(client);
 
       // When cascading, the downstream documents are moving too, so they must
       // not also be treated as a ceiling — that would make every cascade
@@ -673,6 +692,7 @@ async function _getItems(estimateId) {
        ei.gst_amount,
        ei.total_inc_gst,
        ei.is_from_appointment,
+       ei.booked_price,
        ei.customer_approved,
        ei.work_status,
        ei.discount_type,
@@ -714,6 +734,19 @@ const EST_SELECT = `
     e.hub_id,
     e.status,
     e.notes,
+    /* Supplementary estimates (migration 193). parent_estimate_id is NULL on
+       an original, which is every estimate raised before this existed. */
+    e.parent_estimate_id,
+    e.job_card_id,
+    (SELECT COUNT(*)::int FROM estimates s WHERE s.parent_estimate_id = e.id) AS supplementary_count,
+    /* What this VISIT costs, not what this document costs — the original plus
+       every supplementary that has not been cancelled. Identical to
+       e.grand_total for any estimate with no supplementaries, which is all of
+       them today. */
+    (SELECT COALESCE(SUM(s.grand_total), 0) FROM estimates s
+      WHERE s.status <> 'cancelled'
+        AND (s.id = COALESCE(e.parent_estimate_id, e.id)
+             OR s.parent_estimate_id = COALESCE(e.parent_estimate_id, e.id))) AS visit_total,
     /* The appointment is where the reading is actually taken — a service
        advisor notes it when the vehicle arrives, often AFTER the estimate was
        drafted. e.odometer_km is only set when somebody typed one onto the
@@ -979,6 +1012,10 @@ function getEstimatePdf(req, res, next) {
     await sendPdf(res, {
       docType: 'estimate', row: estimate, company, cfg, theme,
       baseUrl: req.get('origin') || req.get('referer'),
+      /* ?format=html returns the very same document as HTML, for the
+         browser's own print dialog. Same permission checks, same data, same
+         template — see sendPdf. */
+      format: req.query.format,
     });
   });
 }
@@ -1033,17 +1070,23 @@ function createEstimate(req, res, next) {
       profileMobile = apptCheck.rows[0].mobile;
       apptScheduledDate = apptCheck.rows[0].scheduled_date || null;
 
-      // Guard: only one estimate per appointment
-      const dupCheck = await pool.query(
-        `SELECT id, status FROM estimates WHERE appointment_id = $1 LIMIT 1`,
-        [data.appointment_id]
-      );
-      if (dupCheck.rows[0]) {
-        return res.status(409).json({
-          error: `An estimate already exists for appointment #${data.appointment_id} (estimate #${dupCheck.rows[0].id}, status: ${dupCheck.rows[0].status}).`,
-          existing_estimate_id: dupCheck.rows[0].id,
-        });
-      }
+      // ── One ORIGINAL estimate per appointment; supplementaries allowed ────
+      // The rule and its reasoning live in helpers/supplementaryEstimate.js,
+      // where they can be driven directly in a test. Unchanged for every
+      // ordinary create.
+      const parentage = await checkEstimateParentage(pool, {
+        appointmentId: data.appointment_id, parentEstimateId: data.parent_estimate_id,
+      });
+      if (parentage) return res.status(parentage.status).json(parentage.body);
+    }
+
+    // Also checked for a standalone estimate, which has no appointment block
+    // above to fall into.
+    if (data.parent_estimate_id && !data.appointment_id) {
+      const p = await checkEstimateParentage(pool, {
+        appointmentId: null, parentEstimateId: data.parent_estimate_id,
+      });
+      if (p) return res.status(p.status).json(p.body);
     }
 
     // ── Estimate date ───────────────────────────────────────────────────────
@@ -1091,17 +1134,31 @@ function createEstimate(req, res, next) {
       dateWarnings = check.warnings;
     }
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js).
+       advanceAppointmentStatus opens its own connection and fires the WhatsApp
+       automations; the read-back and _getItems() each want one too. All of them
+       therefore run after the release. Ten estimates saved at the same moment
+       would otherwise take all ten connections, with every one of them waiting
+       for an eleventh that cannot exist, and the backend would stop answering
+       until somebody restarted it. */
+    let estimateId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      if (!isStandalone) {
+      // The advisory lock still serialises EVERY create for this appointment,
+      // supplementary or not — two supplementaries raised at the same instant
+      // should still queue rather than interleave. Only the re-check narrows,
+      // and only for a deliberate supplementary.
+      if (!isStandalone && !data.parent_estimate_id) {
         // Serialize concurrent creates for the same appointment, then re-check
         // the one-estimate-per-appointment guard INSIDE the transaction —
         // the pre-check above is not atomic on its own.
         await client.query(`SELECT pg_advisory_xact_lock(1, $1)`, [data.appointment_id]);
         const dupInTx = await client.query(
-          `SELECT id FROM estimates WHERE appointment_id = $1 LIMIT 1`,
+          `SELECT id FROM estimates
+            WHERE appointment_id = $1 AND parent_estimate_id IS NULL LIMIT 1`,
           [data.appointment_id]
         );
         if (dupInTx.rows[0]) {
@@ -1111,6 +1168,20 @@ function createEstimate(req, res, next) {
             existing_estimate_id: dupInTx.rows[0].id,
           });
         }
+      } else if (!isStandalone) {
+        await client.query(`SELECT pg_advisory_xact_lock(1, $1)`, [data.appointment_id]);
+      }
+
+      /* The visit's job card, if it has one. Denormalised onto the estimate so
+         the card can list its own financial documents without a join through
+         the appointment, and so a supplementary carries the same link as the
+         original it extends. Looked up rather than taken from the request: the
+         caller has no business naming which card this belongs to. */
+      let jobCardId = null;
+      if (data.appointment_id) {
+        jobCardId = (await client.query(
+          `SELECT id FROM job_cards WHERE appointment_id = $1`, [data.appointment_id]
+        )).rows[0]?.id ?? null;
       }
 
       const ins = await client.query(
@@ -1122,10 +1193,10 @@ function createEstimate(req, res, next) {
             vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id,
             public_token, odometer_km,
             estimate_date, original_estimate_date, backdate_reason, backdated_by, backdated_at,
-            updated_by)
+            updated_by, parent_estimate_id, job_card_id)
          VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11,
                  $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
-                 $24::date, $25::date, $26, $27, $28, $29)
+                 $24::date, $25::date, $26, $27, $28, $29, $30, $31)
          RETURNING id`,
         [
           data.appointment_id || null, data.hub_id, data.notes || null, req.user.id,
@@ -1166,10 +1237,12 @@ function createEstimate(req, res, next) {
           userChoseDate ? (req.user?.id || null) : null,
           userChoseDate ? new Date() : null,
           req.user?.id || null,
+          data.parent_estimate_id || null,
+          jobCardId,
         ]
       );
 
-      const estimateId = ins.rows[0].id;
+      estimateId = ins.rows[0].id;
 
       // Make sure this mobile number has a customer routing identity
       // (public_token) even if no customer_profiles row is ever created.
@@ -1236,16 +1309,16 @@ function createEstimate(req, res, next) {
           `INSERT INTO estimate_items
              (estimate_id, item_type, service_id, part_id, description,
               quantity, customer_rate, gst_percent, gst_amount, total_inc_gst,
-              is_from_appointment, hsn_sac,
+              is_from_appointment, booked_price, hsn_sac,
               discount_type, discount_value, discount_amount, discount_source,
               warranty_months, warranty_days, warranty_km, warranty_text, warranty_source,
               guarantee_months, guarantee_days, guarantee_km, guarantee_text, guarantee_source)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              COALESCE(
                (SELECT sac_code FROM services WHERE id = $3),
                (SELECT hsn_code FROM parts    WHERE id = $4)
              ),
-             $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+             $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
           [
             estimateId,
             item.item_type,
@@ -1258,6 +1331,10 @@ function createEstimate(req, res, next) {
             gstAmount,
             totalIncGst,
             item.is_from_appointment ?? false,
+            /* Written once, on the way in, and never recalculated. The rate
+               above may move when the estimate is edited; what the customer was
+               told on the phone cannot. */
+            item.booked_price ?? null,
             forceZeroDiscount ? null        : (item.discount_type   || null),
             forceZeroDiscount ? 0           : (item.discount_value  || 0),
             forceZeroDiscount ? 0           : discountAmt,
@@ -1278,21 +1355,21 @@ function createEstimate(req, res, next) {
 
       await recalcTotals(client, estimateId);
       await client.query('COMMIT');
-
-      // Auto-advance appointment status to "Estimate Created"
-      await advanceAppointmentStatus(data.appointment_id, 'estimate-created');
-
-      const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [estimateId]);
-      const estimate = row.rows[0];
-      estimate.items = await _getItems(estimateId);
-
-      return res.status(201).json({ item: estimate });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    // Auto-advance appointment status to "Estimate Created"
+    await advanceAppointmentStatus(data.appointment_id, 'estimate-created');
+
+    const row = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [estimateId]);
+    const estimate = row.rows[0];
+    estimate.items = await _getItems(estimateId);
+
+    return res.status(201).json({ item: estimate });
   });
 }
 
@@ -1550,6 +1627,13 @@ function updateEstimate(req, res, next) {
                    (SELECT sac_code FROM services WHERE id = $3),
                    (SELECT hsn_code FROM parts    WHERE id = $4)
                  ),
+                 /* COALESCE, not assignment. booked_price is what the customer
+                    was told on the phone — a fact about a past moment. An edit
+                    may legitimately change the rate, the quantity or the
+                    description of this line; it can never change what was
+                    quoted. So this can only ever be FILLED IN, never rewritten
+                    and never cleared, no matter what the client posts. */
+                 booked_price = COALESCE(booked_price, $26),
                  discount_type = $12, discount_value = $13, discount_amount = $14,
                  discount_source = $15,
                  warranty_months = $16, warranty_days = $17, warranty_km = $18,
@@ -1576,6 +1660,7 @@ function updateEstimate(req, res, next) {
                 item.guarantee_km     ?? null,
                 item.guarantee_text   || null,
                 item.guarantee_source || null,
+                item.booked_price ?? null,        // $26 — see the COALESCE above
               ]
             );
             keptIds.add(Number(existingRow.id));
@@ -1600,16 +1685,16 @@ function updateEstimate(req, res, next) {
             `INSERT INTO estimate_items
                (estimate_id, item_type, service_id, part_id, description,
                 quantity, customer_rate, gst_percent, gst_amount, total_inc_gst,
-                is_from_appointment, hsn_sac,
+                is_from_appointment, booked_price, hsn_sac,
                 discount_type, discount_value, discount_amount, discount_source,
                 warranty_months, warranty_days, warranty_km, warranty_text, warranty_source,
                 guarantee_months, guarantee_days, guarantee_km, guarantee_text, guarantee_source)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                COALESCE(
                  (SELECT sac_code FROM services WHERE id = $3),
                  (SELECT hsn_code FROM parts    WHERE id = $4)
                ),
-               $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+               $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
              RETURNING id`,
             [
               id,
@@ -1623,6 +1708,7 @@ function updateEstimate(req, res, next) {
               gstAmount,
               totalIncGst,
               item.is_from_appointment ?? false,
+              item.booked_price ?? null,
               forceZeroDiscount ? null : (item.discount_type   || null),
               forceZeroDiscount ? 0    : (item.discount_value  || 0),
               forceZeroDiscount ? 0    : discountAmt,
@@ -2270,6 +2356,148 @@ function updateItemWorkStatus(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/estimates/:id/items/work-status-bulk — finish several lines at once
+//
+// WHY THIS EXISTS AND IS NOT A LOOP OVER THE ENDPOINT ABOVE
+// ────────────────────────────────────────────────────────
+// The per-item route does far more than write one column: it re-derives the
+// estimate status, advances the appointment, and re-syncs BOTH invoices. Called
+// four times for a four-line job that is four transactions, four status
+// derivations and four invoice resyncs — and four toasts, each contradicting
+// the last, because the estimate is only "work_completed" after the final one.
+//
+// Worse, it is not atomic across the set. If line three fails, lines one and
+// two are already committed and the operator is left with a half-finished job
+// and no way to tell which half. On a screen whose whole point is "the work is
+// done", that is the wrong failure.
+//
+// So: one statement, one derivation, one resync, one answer.
+//
+// Every guard the single-item route applies is applied here too, deliberately
+// duplicated rather than shared — the two differ in what they are allowed to
+// SET (this one only ever writes 'completed'), and a shared helper that took a
+// status would let a bulk call reopen a whole estimate, which no screen asks
+// for and nobody would expect from a button labelled "done".
+// ─────────────────────────────────────────────────────────────────────────────
+function completeItemsBulk(req, res, next) {
+  handle(req, res, next, async () => {
+    const estimateId = idParam.parse(req.params.id);
+
+    /* A LIST, not "all". The screen ticks every open line by default, but the
+       operator can untick the one that is not finished, and the server must be
+       able to say that too — "complete everything" is a client decision, not a
+       rule of the system. Capped because this is an id list from a browser and
+       an estimate has tens of lines, not thousands. */
+    const { item_ids } = z.object({
+      item_ids: z.array(z.coerce.number().int().positive()).min(1).max(200),
+    }).parse(req.body);
+    const ids = [...new Set(item_ids)];
+
+    await _assertEstimateHub(req, estimateId);
+
+    const estRow = await pool.query(`SELECT status FROM estimates WHERE id = $1`, [estimateId]);
+    if (!estRow.rows[0]) return res.status(404).json({ error: 'Estimate not found' });
+    const allowedStatuses = ['fully_approved', 'partially_approved', 'work_in_progress', 'work_completed'];
+    if (!allowedStatuses.includes(estRow.rows[0].status)) {
+      return res.status(400).json({ error: `Work cannot be updated when estimate is in status: ${estRow.rows[0].status}` });
+    }
+
+    /* Checked BEFORE the write and reported by name. Silently skipping an id
+       that belongs to another estimate, or to a line the customer rejected,
+       would let the screen report work finished that was never touched. */
+    const valid = await pool.query(
+      `SELECT id, customer_approved FROM estimate_items
+        WHERE estimate_id = $1 AND id = ANY($2::int[])`,
+      [estimateId, ids]
+    );
+    if (valid.rowCount !== ids.length) {
+      return res.status(404).json({ error: 'One or more items do not belong to this estimate.' });
+    }
+    if (valid.rows.some(r => r.customer_approved !== true)) {
+      return res.status(400).json({
+        error: 'Cannot complete a rejected or pending-approval item.',
+      });
+    }
+
+    let newEstStatus;
+    let updated = 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      /* `work_status <> 'completed'` so the count answers "how many lines did
+         this actually finish", not "how many were ticked". A re-submitted form
+         or a double-click then reports 0 changed rather than claiming to have
+         completed work that was already done. */
+      const upd = await client.query(
+        `UPDATE estimate_items
+            SET work_status = 'completed', updated_at = NOW()
+          WHERE estimate_id = $1
+            AND id = ANY($2::int[])
+            AND customer_approved = true
+            AND work_status <> 'completed'`,
+        [estimateId, ids]
+      );
+      updated = upd.rowCount;
+
+      // Identical derivation to updateItemWorkStatus — same query, same order.
+      const allItems = await client.query(
+        `SELECT work_status FROM estimate_items WHERE estimate_id = $1 AND customer_approved = true`,
+        [estimateId]
+      );
+      const statuses = allItems.rows.map(r => r.work_status);
+      if (statuses.every(s => s === 'completed')) {
+        newEstStatus = 'work_completed';
+      } else if (statuses.some(s => s === 'in_progress' || s === 'completed')) {
+        newEstStatus = 'work_in_progress';
+      } else {
+        const approvalCheck = await client.query(
+          `SELECT COUNT(*) FILTER (WHERE customer_approved = true)  AS approved_count,
+                  COUNT(*) FILTER (WHERE customer_approved = false) AS rejected_count
+             FROM estimate_items WHERE estimate_id = $1`,
+          [estimateId]
+        );
+        const { rejected_count } = approvalCheck.rows[0];
+        newEstStatus = parseInt(rejected_count) > 0 ? 'partially_approved' : 'fully_approved';
+      }
+
+      await client.query(
+        `UPDATE estimates SET status = $1, updated_at = NOW() WHERE id = $2`,
+        [newEstStatus, estimateId]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const est   = await pool.query(`${EST_SELECT} WHERE e.id = $1`, [estimateId]);
+    const items = await _getItems(estimateId);
+
+    const apptId = est.rows[0]?.appointment_id;
+    if (newEstStatus === 'work_in_progress') {
+      await advanceAppointmentStatus(apptId, 'work-in-progress');
+    } else if (newEstStatus === 'work_completed') {
+      await advanceAppointmentStatus(apptId, 'work-completed');
+    }
+
+    // Once for the whole set, which is the point of the endpoint.
+    const wsResync = await resyncInvoicesForEstimate(estimateId, req.user);
+
+    announceEstimateChange(req, true);
+    return res.json({
+      item: { ...est.rows[0], items },
+      updated,
+      resync: wsResync,
+      resync_message: describeResync(wsResync),
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DELETE /api/estimates/:id — Super admin only
 // Cascade: CI payments → CI items → CI → PI schedule → PI payments → PI items
 //          → estimate items → estimate
@@ -2357,8 +2585,73 @@ function deleteEstimate(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/estimates/declined-work?mobile=…&number=…&exclude_appointment_id=…
+// ─────────────────────────────────────────────────────────────────────────────
+/* What this car was quoted before and the customer refused, for the advisor
+   raising the NEXT estimate.
+
+   That is the one thing this form could never see. It knows what the customer
+   booked (appointment_services, carried by onAppointmentChange), it knows the
+   service master, and it knows the pricing rules. It has never known that the
+   same pads were offered in March at ₹2,000 and turned down — so the advisor
+   either re-discovers it by opening old estimates, or does not offer it at all.
+
+   No pricing is done here, deliberately. The rows carry what each line was
+   QUOTED AT on the day, which is a historical fact; the form re-prices through
+   /api/pricing/lookup exactly as it does for any other service, because a
+   months-old rate is not a rate to bill today. See readDeclinedWork for why
+   this is a service rather than a third copy of the rule. */
+function listDeclinedWork(req, res, next) {
+  handle(req, res, next, async () => {
+    let mobile = String(req.query.mobile || '').trim();
+    let number = String(req.query.number || '').trim();
+    const apptId = Number(req.query.appointment_id);
+    let exclude  = Number(req.query.exclude_appointment_id);
+
+    /* ── appointment_id is the preferred way in, and not for convenience ─────
+       Hub logins see customer mobiles masked to 98382xxxxx — maskCustomerContact
+       is mounted on this whole router. A hub screen therefore does not hold the
+       number it would have to send here, and asking it to would either fail
+       silently or mean taking the mask off a route that has it for a reason.
+
+       Given an appointment, the pair is read from the row instead, where
+       nothing is masked. That visit also excludes ITSELF by default: an advisor
+       writing this estimate wants what was refused BEFORE today, and today's
+       own lines are already on the form in front of them. */
+    if (Number.isFinite(apptId) && apptId > 0) {
+      const a = await pool.query(
+        `SELECT mobile, vehicle_number FROM appointments WHERE id = $1`, [apptId]);
+      if (!a.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+      mobile = a.rows[0].mobile || '';
+      number = a.rows[0].vehicle_number || '';
+      if (!Number.isFinite(exclude)) exclude = apptId;
+    }
+
+    if (!mobile || !number) {
+      return res.status(400).json({
+        error: 'appointment_id, or mobile and number together, are required',
+      });
+    }
+
+    const items = await readDeclinedWork(pool, {
+      mobile,
+      vehicleNumber: number,
+      excludeAppointmentId: Number.isFinite(exclude) && exclude > 0 ? exclude : null,
+      // Same rule the job card applies: a hub reads its own refusals only.
+      hubId: isHubUser(req) ? (req.user?.hub_id ?? null) : null,
+    });
+
+    res.json({
+      items,
+      total: Number(items.reduce((s, i) => s + Number(i.quoted_at || 0), 0).toFixed(2)),
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
+  listDeclinedWork,
   listEstimates,
   getEstimate,
   getEstimatePdf,
@@ -2370,6 +2663,7 @@ module.exports = {
   companyRevise,
   customerApproval,
   updateItemWorkStatus,
+  completeItemsBulk,
   deleteEstimate,
   estimateDatePreflight,
   updateEstimateDate,

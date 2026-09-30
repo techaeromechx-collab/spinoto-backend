@@ -1,17 +1,14 @@
-/* FIRST. Before dotenv, before any require that might format a Date.
-   Node caches the zone the first time one is used, so setting process.env.TZ
-   after that point changes the variable and not the behaviour — which looks
-   exactly like the fix working until somebody checks a timestamp. */
+
 require('./utils/appTime').applyProcessTimezone();
 
 require('dotenv').config();
 
-const http    = require('http');
+const http = require('http');
 const express = require('express');
-const cors    = require('cors');
-const morgan  = require('morgan');
-const path    = require('path');
-const zlib    = require('zlib');
+const cors = require('cors');
+const morgan = require('morgan');
+const path = require('path');
+const zlib = require('zlib');
 const compression = require('compression');
 const { initIO } = require('./socket');
 
@@ -22,60 +19,68 @@ const { startReminderPoller } = require('./services/appointmentReminders.service
 const { startWhatsappOutbox } = require('./services/whatsappOutbox.service');
 const { startIntegrationSettings } = require('./services/integrationSettings.service');
 
-const authRoutes      = require('./routes/auth.routes');
-const meRoutes        = require('./routes/me.routes');
-const usersRoutes     = require('./routes/users.routes');
+const authRoutes = require('./routes/auth.routes');
+const meRoutes = require('./routes/me.routes');
+const usersRoutes = require('./routes/users.routes');
 const locationsRoutes = require('./routes/locations.routes');
-const vehiclesRoutes  = require('./routes/vehicles.routes');
-const servicesRoutes  = require('./routes/services.routes');
-const pricingRoutes   = require('./routes/pricing.routes');
-const leadsRoutes          = require('./routes/leads.routes');
-const leadStatusesRoutes   = require('./routes/lead_statuses.routes');
-const leadSourcesRoutes    = require('./routes/lead_sources.routes');
-const importRoutes         = require('./routes/import.routes');
-const reportsRoutes      = require('./routes/reports.routes');
-const creditNotesRoutes  = require('./routes/credit_notes.routes');
-const openingBalRoutes   = require('./routes/opening_balances.routes');
-const ledgerRoutes       = require('./routes/ledger.routes');
+const vehiclesRoutes = require('./routes/vehicles.routes');
+const servicesRoutes = require('./routes/services.routes');
+const pricingRoutes = require('./routes/pricing.routes');
+const leadsRoutes = require('./routes/leads.routes');
+const leadStatusesRoutes = require('./routes/lead_statuses.routes');
+const leadSourcesRoutes = require('./routes/lead_sources.routes');
+const importRoutes = require('./routes/import.routes');
+const reportsRoutes = require('./routes/reports.routes');
+const creditNotesRoutes = require('./routes/credit_notes.routes');
+const openingBalRoutes = require('./routes/opening_balances.routes');
+const ledgerRoutes = require('./routes/ledger.routes');
+const checklistsRoutes = require('./routes/checklists.routes');
+const techniciansRoutes = require('./routes/technicians.routes');
+const jobCardsRoutes = require('./routes/job_cards.routes');
+/* The cross-card inspection queue. Card-less on purpose — see the file. */
+const inspectionsRoutes = require('./routes/inspections.routes');
 const ccCategoriesRoutes = require('./routes/cc_categories.routes');
-const leadEventsRoutes       = require('./routes/lead_events.routes');
-const notificationsRoutes    = require('./routes/notifications.routes');
-const leadNotesRoutes        = require('./routes/lead_notes.routes');
-const leadActivitiesRoutes   = require('./routes/lead_activities.routes');
-const departmentsRoutes          = require('./routes/departments.routes');
-const hubsRoutes                 = require('./routes/hubs.routes');
-const workshopsRoutes            = require('./routes/workshops.routes');
-const appointmentStatusesRoutes  = require('./routes/appointment_statuses.routes');
-const invoiceStatusesRoutes      = require('./routes/invoice_statuses.routes');
-const appointmentsRoutes         = require('./routes/appointments.routes');
-const customersRoutes            = require('./routes/customers.routes');
-const invoicesRoutes             = require('./routes/invoices.routes');
+const leadEventsRoutes = require('./routes/lead_events.routes');
+const notificationsRoutes = require('./routes/notifications.routes');
+const leadNotesRoutes = require('./routes/lead_notes.routes');
+const leadActivitiesRoutes = require('./routes/lead_activities.routes');
+const departmentsRoutes = require('./routes/departments.routes');
+const hubsRoutes = require('./routes/hubs.routes');
+const workshopsRoutes = require('./routes/workshops.routes');
+const appointmentStatusesRoutes = require('./routes/appointment_statuses.routes');
+const invoiceStatusesRoutes = require('./routes/invoice_statuses.routes');
+const appointmentsRoutes = require('./routes/appointments.routes');
+const customersRoutes = require('./routes/customers.routes');
+const invoicesRoutes = require('./routes/invoices.routes');
 // invoice_payments.routes is deliberately not required — see the note at its
 // former mount below. Requiring it here would leave a router built and ready
 // for one line to re-enable by accident.
-const partsRoutes                = require('./routes/parts.routes');
-const estimatesRoutes            = require('./routes/estimates.routes');
+const partsRoutes = require('./routes/parts.routes');
+const estimatesRoutes = require('./routes/estimates.routes');
 const estimateChangeRequestsRoutes = require('./routes/estimate_change_requests.routes');
-const settingsRoutes             = require('./routes/settings.routes');
-const rolesRoutes                = require('./routes/roles.routes');
-const logsRoutes                 = require('./routes/logs.routes');
-const discountMasterRoutes       = require('./routes/discount_master.routes');
-const warrantyMasterRoutes       = require('./routes/warranty_master.routes');
-const warrantyClaimsRoutes       = require('./routes/warranty_claims.routes');
-const integrationsRoutes         = require('./routes/integrations.routes');
-const publicBookingRoutes        = require('./routes/public.booking.routes');
-const publicDocumentsRoutes      = require('./routes/public.documents.routes');
-const whatsappRoutes             = require('./routes/whatsapp.routes');
+const settingsRoutes = require('./routes/settings.routes');
+const rolesRoutes = require('./routes/roles.routes');
+const logsRoutes = require('./routes/logs.routes');
+const discountMasterRoutes = require('./routes/discount_master.routes');
+const warrantyMasterRoutes = require('./routes/warranty_master.routes');
+const warrantyClaimsRoutes = require('./routes/warranty_claims.routes');
+const integrationsRoutes = require('./routes/integrations.routes');
+const publicBookingRoutes = require('./routes/public.booking.routes');
+const publicDocumentsRoutes = require('./routes/public.documents.routes');
+const whatsappRoutes = require('./routes/whatsapp.routes');
+// Internal staff messaging. Nothing to do with whatsappRoutes above, which is
+// the customer channel — different audience, different tables, different rules.
+const chatRoutes = require('./routes/chat.routes');
 // Read-only master data for outside systems. Key-authenticated, versioned
 // separately from the internal /api/* routes so its shape can stay stable
 // while those keep changing with the frontend.
-const v1MasterRoutes             = require('./routes/v1_master.routes');
+const v1MasterRoutes = require('./routes/v1_master.routes');
 // Admin side of the same feature: issuing and revoking those keys.
-const apiKeysRoutes              = require('./routes/api_keys.routes');
-const callOutcomesRoutes         = require('./routes/call_outcomes.routes');
-const lostReasonsRoutes          = require('./routes/lost_reasons.routes');
-const competitorsRoutes          = require('./routes/competitors.routes');
-const pushRoutes                 = require('./routes/push.routes');
+const apiKeysRoutes = require('./routes/api_keys.routes');
+const callOutcomesRoutes = require('./routes/call_outcomes.routes');
+const lostReasonsRoutes = require('./routes/lost_reasons.routes');
+const competitorsRoutes = require('./routes/competitors.routes');
+const pushRoutes = require('./routes/push.routes');
 
 const app = express();
 
@@ -132,7 +137,7 @@ app.use(compression({
   brotli: { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } },
 }));
 
-// Support multiple allowed origins (comma-separated in CORS_ORIGIN env var)
+
 const allowedOrigins = (process.env.CORS_ORIGIN || '*')
   .split(',')
   .map(o => o.trim())
@@ -178,17 +183,7 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 // ---- Static: uploaded hub documents -------------------------------------
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-// ---- Health --------------------------------------------------------------
-// Render polls this on a 5-SECOND timeout and kills the instance when it
-// misses. It used to run `SELECT NOW()`, which made "is this process alive?"
-// depend on a round trip to a pooled, sometimes-cold managed Postgres. One
-// slow connect and a perfectly healthy instance was restarted -- which is
-// exactly the "HTTP health check failed (timed out after 5 seconds)" /
-// "Service recovered" pair in the Render log.
-//
-// So liveness now answers from memory. The database check is unchanged, it
-// just moved to /api/health/db: nothing polls that one, and it stays the
-// thing to curl when the question really is "can the app reach the database".
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, uptime: Math.round(process.uptime()) });
 });
@@ -204,34 +199,38 @@ app.get('/api/health/db', async (_req, res) => {
 });
 
 // ---- Routes --------------------------------------------------------------
-app.use('/api/auth',      authRoutes);
-app.use('/api/me',        meRoutes);
-app.use('/api/users',     usersRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/me', meRoutes);
+app.use('/api/users', usersRoutes);
 app.use('/api/locations', locationsRoutes);
-app.use('/api/vehicles',  vehiclesRoutes);
-app.use('/api/services',  servicesRoutes);
-app.use('/api/pricing',   pricingRoutes);
-app.use('/api/leads',         leadsRoutes);
+app.use('/api/vehicles', vehiclesRoutes);
+app.use('/api/services', servicesRoutes);
+app.use('/api/pricing', pricingRoutes);
+app.use('/api/leads', leadsRoutes);
 app.use('/api/lead-statuses', leadStatusesRoutes);
-app.use('/api/lead-sources',  leadSourcesRoutes);
-app.use('/api/import',         importRoutes);
-app.use('/api/reports',        reportsRoutes);
-app.use('/api/credit-notes',   creditNotesRoutes);
+app.use('/api/lead-sources', leadSourcesRoutes);
+app.use('/api/import', importRoutes);
+app.use('/api/reports', reportsRoutes);
+app.use('/api/credit-notes', creditNotesRoutes);
 app.use('/api/opening-balances', openingBalRoutes);
-app.use('/api/ledger',         ledgerRoutes);
-app.use('/api/cc-categories',  ccCategoriesRoutes);
-app.use('/api/lead-events',      leadEventsRoutes);
-app.use('/api/notifications',    notificationsRoutes);
-app.use('/api/lead-notes',       leadNotesRoutes);
-app.use('/api/lead-activities',  leadActivitiesRoutes);
-app.use('/api/departments',          departmentsRoutes);
-app.use('/api/hubs',                 hubsRoutes);
-app.use('/api/workshops',            workshopsRoutes);
+app.use('/api/ledger', ledgerRoutes);
+app.use('/api/checklists', checklistsRoutes);
+app.use('/api/technicians', techniciansRoutes);
+app.use('/api/job-cards', jobCardsRoutes);
+app.use('/api/inspections', inspectionsRoutes);
+app.use('/api/cc-categories', ccCategoriesRoutes);
+app.use('/api/lead-events', leadEventsRoutes);
+app.use('/api/notifications', notificationsRoutes);
+app.use('/api/lead-notes', leadNotesRoutes);
+app.use('/api/lead-activities', leadActivitiesRoutes);
+app.use('/api/departments', departmentsRoutes);
+app.use('/api/hubs', hubsRoutes);
+app.use('/api/workshops', workshopsRoutes);
 app.use('/api/appointment-statuses', appointmentStatusesRoutes);
-app.use('/api/invoice-statuses',     invoiceStatusesRoutes);
-app.use('/api/appointments',         appointmentsRoutes);
-app.use('/api/customers',            customersRoutes);
-app.use('/api/invoices',                    invoicesRoutes);
+app.use('/api/invoice-statuses', invoiceStatusesRoutes);
+app.use('/api/appointments', appointmentsRoutes);
+app.use('/api/customers', customersRoutes);
+app.use('/api/invoices', invoicesRoutes);
 
 // NOT MOUNTED: /api/invoices/:id/payments (routes/invoice_payments.routes.js).
 //
@@ -257,30 +256,31 @@ app.use('/api/invoices',                    invoicesRoutes);
 // that can read them is a separate decision from closing the door.
 // app.use('/api/invoices/:id/payments', require('./routes/invoice_payments.routes'));
 
-app.use('/api/parts',             partsRoutes);
-app.use('/api/estimates',         estimatesRoutes);
+app.use('/api/parts', partsRoutes);
+app.use('/api/estimates', estimatesRoutes);
 // A hub's proposed edit to an estimate, held until Spinoto approves it —
 // see migration 180 for why an unreviewed hub edit could not stay a write.
 app.use('/api/estimate-change-requests', estimateChangeRequestsRoutes);
-app.use('/api/discount-master',   discountMasterRoutes);
-app.use('/api/warranty-master',   warrantyMasterRoutes);
-app.use('/api/warranty-claims',   warrantyClaimsRoutes);
-app.use('/api/integrations',      integrationsRoutes);
-app.use('/api/v1/master',         v1MasterRoutes);
-app.use('/api/api-keys',          apiKeysRoutes);
+app.use('/api/discount-master', discountMasterRoutes);
+app.use('/api/warranty-master', warrantyMasterRoutes);
+app.use('/api/warranty-claims', warrantyClaimsRoutes);
+app.use('/api/integrations', integrationsRoutes);
+app.use('/api/v1/master', v1MasterRoutes);
+app.use('/api/api-keys', apiKeysRoutes);
 // UNAUTHENTICATED — booking.spinoto.com. Rate-limited inside the router;
 // requires https://booking.spinoto.com in CORS_ORIGIN.
-app.use('/api/public/booking',    publicBookingRoutes);
+app.use('/api/public/booking', publicBookingRoutes);
 // UNAUTHENTICATED — customer invoice links (WhatsApp message + the QR already
 // printed on every invoice, which until now led to a login screen). Serves a
 // PDF built from a deliberately narrow SELECT; see the header of
 // public.documents.controller.js before touching it.
-app.use('/api/public/documents',  publicDocumentsRoutes);
-app.use('/api/call-outcomes',     callOutcomesRoutes);
-app.use('/api/lost-reasons',      lostReasonsRoutes);
-app.use('/api/competitors',       competitorsRoutes);
-app.use('/api/whatsapp',          whatsappRoutes);
-app.use('/api/settings',   settingsRoutes);
+app.use('/api/public/documents', publicDocumentsRoutes);
+app.use('/api/call-outcomes', callOutcomesRoutes);
+app.use('/api/lost-reasons', lostReasonsRoutes);
+app.use('/api/competitors', competitorsRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/settings', settingsRoutes);
 
 const purchaseInvoicesRouter = require('./routes/purchase_invoices.routes');
 const customerInvoicesRouter = require('./routes/customer_invoices.routes');
@@ -320,8 +320,8 @@ const publicPaymentsRoutes = require('./routes/public.payments.routes');
 app.use('/api/public/pay', publicPaymentsRoutes);
 
 app.use('/api/roles', rolesRoutes);
-app.use('/api/push',  pushRoutes);
-app.use('/api/logs',  logsRoutes);
+app.use('/api/push', pushRoutes);
+app.use('/api/logs', logsRoutes);
 
 // Stubs for upcoming modules — every module will plug in here.
 
@@ -353,7 +353,7 @@ const PORT = process.env.PORT || 4000;
     `UPDATE notifications
      SET body = 'No lead activity logged in 2+ hours. Please update your leads.'
      WHERE type = 'no_activity' AND (body IS NULL OR body = '')`
-  ).catch(() => {});
+  ).catch(() => { });
 
   // Ensure all users have new notification types enabled by default
   pool.query(
@@ -365,7 +365,7 @@ const PORT = process.env.PORT || 4000;
         OR NOT (notification_settings ? 'note_added')
         OR NOT (notification_settings ? 'pricing_changed')
         OR NOT (notification_settings ? 'reference_data_changed')`
-  ).catch(() => {});
+  ).catch(() => { });
 
   const httpServer = http.createServer(app);
   initIO(httpServer);

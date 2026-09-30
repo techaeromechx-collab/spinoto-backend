@@ -142,6 +142,13 @@ function createInvoice(req, res, next) {
     const gstAmount     = roundFn(afterDiscount * gstRate / 100);
     const total         = afterDiscount + gstAmount;
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js), so awaiting
+       anything that needs a SECOND connection while holding this client is a
+       deadlock, not a slow path: ten simultaneous invoices take all ten
+       connections and each then waits for an eleventh. The read-back and the
+       line fetch below therefore happen after the release. */
+    let invoiceId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -171,7 +178,7 @@ function createInvoice(req, res, next) {
         ]
       );
 
-      const invoiceId = ins.rows[0].id;
+      invoiceId = ins.rows[0].id;
 
       for (const svc of data.services) {
         const lineTotal = Number(svc.unit_price) * Number(svc.qty ?? 1);
@@ -192,19 +199,19 @@ function createInvoice(req, res, next) {
       }
 
       await client.query('COMMIT');
-
-      const row = await pool.query(`${INV_SELECT} WHERE i.id = $1`, [invoiceId]);
-      const inv = row.rows[0];
-      inv.services = await _getLines(invoiceId);
-
-      logActivity({ userId: req.user?.id, userName: req.user?.name, action: 'CREATE', entity: 'invoice', entityId: invoiceId, description: `Created invoice #${invoiceId}` });
-      return res.status(201).json({ item: inv });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    const row = await pool.query(`${INV_SELECT} WHERE i.id = $1`, [invoiceId]);
+    const inv = row.rows[0];
+    inv.services = await _getLines(invoiceId);
+
+    logActivity({ userId: req.user?.id, userName: req.user?.name, action: 'CREATE', entity: 'invoice', entityId: invoiceId, description: `Created invoice #${invoiceId}` });
+    return res.status(201).json({ item: inv });
   });
 }
 

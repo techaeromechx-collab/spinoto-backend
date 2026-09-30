@@ -1494,6 +1494,178 @@ async function cascadeVehicleEdit(client, {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customers/:mobile/job-cards — the Job Cards tab
+// ─────────────────────────────────────────────────────────────────────────────
+/* The profile already had Appointments, Vehicles, Payments, Estimates, Invoices
+   and Account. Job cards — the record of what was actually DONE to the car —
+   was the one thing missing, so "what happened last time" meant opening the
+   appointment, finding the estimate, and reading the lines.
+
+   Keyed through the customer's appointments, because that is what a job card
+   belongs to; there is no customer_id on job_cards and adding one would be a
+   second source of truth for the same fact. */
+function listCustomerJobCards(req, res, next) {
+  handle(req, res, next, async () => {
+    const mobile = req.params.mobile;
+
+    const r = await pool.query(`
+      SELECT
+        jc.id, jc.job_card_no, jc.status, jc.created_at,
+        jc.odometer_in, jc.odometer_out,
+        jc.appointment_id,
+        a.appointment_code, a.vehicle_number,
+        TO_CHAR(a.scheduled_date, 'YYYY-MM-DD') AS scheduled_date,
+        h.hub_name,
+        (SELECT COUNT(*) FROM job_card_technicians t WHERE t.job_card_id = jc.id)::int
+          AS technician_count,
+        /* What the visit came to, and what was agreed — the same two figures
+           the card itself shows, so the tab and the card cannot disagree.
+           Cancelled documents authorise nothing and are excluded from both. */
+        (SELECT COALESCE(SUM(e.grand_total), 0)
+           FROM estimates e
+          WHERE e.appointment_id = jc.appointment_id
+            AND e.status <> 'cancelled') AS quoted,
+        (SELECT COALESCE(SUM(ei.total_inc_gst), 0)
+           FROM estimate_items ei
+           JOIN estimates e ON e.id = ei.estimate_id
+          WHERE e.appointment_id = jc.appointment_id
+            AND e.status <> 'cancelled'
+            AND ei.customer_approved IS TRUE) AS approved,
+        (SELECT COALESCE(SUM(ci.grand_total), 0)
+           FROM customer_invoices ci
+          WHERE ci.appointment_id = jc.appointment_id
+            AND ci.status <> 'cancelled') AS billed
+      FROM job_cards jc
+      JOIN appointments a ON a.id = jc.appointment_id
+      LEFT JOIN hubs h ON h.id = jc.hub_id
+      WHERE a.mobile = $1
+      ORDER BY a.scheduled_date DESC NULLS LAST, jc.id DESC
+      LIMIT 100
+    `, [mobile]);
+
+    res.json({ items: r.rows });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/customers/:mobile/vehicle-history?number=GJ01AB1234
+// ─────────────────────────────────────────────────────────────────────────────
+/* One row per VISIT for one car, which is the question a service advisor
+   actually asks: what has this vehicle had done, when, at what reading, and
+   what did it come to.
+
+   Nothing like this existed. getVehicleUsage above returns three counts, which
+   answers "is this vehicle safe to delete" and nothing else.
+
+   Built on APPOINTMENTS rather than job cards, deliberately: a visit that was
+   quoted and invoiced without a card ever being opened is still a visit, and
+   omitting it would make the history quietly incomplete for every job that
+   predates the job card module. The card joins in when there is one. */
+function getVehicleHistory(req, res, next) {
+  handle(req, res, next, async () => {
+    const mobile = req.params.mobile;
+    const plate  = (req.query.number || '').trim().toUpperCase();
+    if (!plate) return res.status(400).json({ error: 'number query param is required' });
+
+    const r = await pool.query(`
+      SELECT
+        a.id AS appointment_id, a.appointment_code, a.vehicle_number,
+        TO_CHAR(a.scheduled_date, 'YYYY-MM-DD') AS scheduled_date,
+        a.odometer_km AS appointment_odometer,
+        ast.name AS appointment_status,
+        h.hub_name,
+        jc.id AS job_card_id, jc.job_card_no, jc.status AS job_card_status,
+        jc.odometer_in, jc.odometer_out,
+        (SELECT COALESCE(SUM(e.grand_total), 0) FROM estimates e
+          WHERE e.appointment_id = a.id AND e.status <> 'cancelled') AS quoted,
+        (SELECT COALESCE(SUM(ei.total_inc_gst), 0)
+           FROM estimate_items ei JOIN estimates e ON e.id = ei.estimate_id
+          WHERE e.appointment_id = a.id AND e.status <> 'cancelled'
+            AND ei.customer_approved IS TRUE) AS approved,
+        /* Refused, explicitly. IS FALSE, not "not approved" — a line nobody has
+           answered yet is NULL and is neither. */
+        (SELECT COALESCE(SUM(ei.total_inc_gst), 0)
+           FROM estimate_items ei JOIN estimates e ON e.id = ei.estimate_id
+          WHERE e.appointment_id = a.id AND e.status <> 'cancelled'
+            AND ei.customer_approved IS FALSE) AS declined,
+        (SELECT COALESCE(SUM(ci.grand_total), 0) FROM customer_invoices ci
+          WHERE ci.appointment_id = a.id AND ci.status <> 'cancelled') AS billed,
+        /* What was actually DONE, not what was offered: approved AND finished.
+           A line the customer refused, or one nobody got to, has no business in
+           a service history — that is the difference between this and a list of
+           past estimates. */
+        COALESCE((
+          SELECT json_agg(json_build_object(
+                   'description', ei.description,
+                   'item_type',   ei.item_type,
+                   'quantity',    ei.quantity,
+                   'total',       ei.total_inc_gst
+                 ) ORDER BY ei.id)
+            FROM estimate_items ei
+            JOIN estimates e ON e.id = ei.estimate_id
+           WHERE e.appointment_id = a.id
+             AND e.status <> 'cancelled'
+             AND ei.customer_approved IS TRUE
+             AND ei.work_status = 'completed'
+        ), '[]') AS work_done,
+        /* What was offered on this visit and turned down.
+           Kept per visit and separate from work_done, because the two are
+           different facts about the same day — and because "we offered it and
+           they said no" is the half of a service history that tells an advisor
+           what to raise next time.
+           Unlike the job card's list this is NOT filtered by whether the work
+           was done later: this is the record of that visit, not a to-do. */
+        COALESCE((
+          SELECT json_agg(json_build_object(
+                   'description', ei.description,
+                   'item_type',   ei.item_type,
+                   'quantity',    ei.quantity,
+                   'total',       ei.total_inc_gst
+                 ) ORDER BY ei.id)
+            FROM estimate_items ei
+            JOIN estimates e ON e.id = ei.estimate_id
+           WHERE e.appointment_id = a.id
+             AND e.status <> 'cancelled'
+             AND ei.customer_approved IS FALSE
+        ), '[]') AS work_declined
+      FROM appointments a
+      LEFT JOIN job_cards jc            ON jc.appointment_id = a.id
+      LEFT JOIN appointment_statuses ast ON ast.id = a.status_id
+      LEFT JOIN hubs h                   ON h.id  = a.hub_id
+      WHERE a.mobile = $1
+        AND UPPER(REPLACE(a.vehicle_number, ' ', '')) = UPPER(REPLACE($2, ' ', ''))
+      ORDER BY a.scheduled_date DESC NULLS LAST, a.id DESC
+      LIMIT 100
+    `, [mobile, plate]);
+
+    /* A running total across the visits, so the tab header can say what this
+       car has been worth without the screen adding up rows it may have paged. */
+    const rows = r.rows;
+    const n = v => Number(v || 0);
+    res.json({
+      items: rows,
+      summary: {
+        visits:   rows.length,
+        quoted:   Number(rows.reduce((s, x) => s + n(x.quoted), 0).toFixed(2)),
+        approved: Number(rows.reduce((s, x) => s + n(x.approved), 0).toFixed(2)),
+        billed:   Number(rows.reduce((s, x) => s + n(x.billed), 0).toFixed(2)),
+        /* What this car has been offered and refused, across every visit. The
+           one figure on this screen about money NOT taken.
+
+           Summed from the visits' own `declined`, NOT as quoted − approved:
+           customer_approved is a tristate, and that subtraction would count
+           every line nobody has answered yet as a refusal. */
+        declined: Number(rows.reduce((s, x) => s + n(x.declined), 0).toFixed(2)),
+        /* The highest reading seen anywhere for this car, whichever field it
+           came from. Readings are entered by people and are not monotonic. */
+        last_odometer: rows.reduce((m, x) => Math.max(
+          m, n(x.odometer_out), n(x.odometer_in), n(x.appointment_odometer)), 0) || null,
+      },
+    });
+  });
+}
+
 module.exports = {
   // Exported for the suite, which drives the real branching rather than a copy.
   cascadeVehicleEdit,
@@ -1501,4 +1673,5 @@ module.exports = {
   lookupCustomers, getCustomer, updateCustomer, deleteCustomer,
   listCustomerVehicles, addCustomerVehicle, updateCustomerVehicle, deleteCustomerVehicle,
   getCustomerTimeline, getVehicleUsage, getCustomerByToken,
+  listCustomerJobCards, getVehicleHistory,
 };

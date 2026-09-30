@@ -317,6 +317,12 @@ function createClaim(req, res, next) {
       current_km:      data.current_km ?? null,
     });
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js), so the
+       read-back below waits until the client is back in the pool. Ten claims
+       at once, each holding a connection and asking for a second, is a
+       deadlock rather than a slow patch. */
+    let claimId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -344,23 +350,23 @@ function createClaim(req, res, next) {
           req.user.id,
         ]
       );
-      const claimId = ins.rows[0].id;
+      claimId = ins.rows[0].id;
       // WC- for warranty claims, GC- for guarantee claims
       await client.query(
         `UPDATE warranty_claims SET claim_code = $2 || LPAD($1::text, 5, '0') WHERE id = $1`,
         [claimId, isGuarantee ? 'GC-' : 'WC-']
       );
       await client.query('COMMIT');
-
-      const full = await pool.query(`${WC_SELECT} WHERE wc.id = $1`, [claimId]);
-      getIO().emit('invalidate', { topic: 'warranty_claims' });
-      res.status(201).json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before the read-back asks for a client
     }
+
+    const full = await pool.query(`${WC_SELECT} WHERE wc.id = $1`, [claimId]);
+    getIO().emit('invalidate', { topic: 'warranty_claims' });
+    res.status(201).json({ item: full.rows[0] });
   });
 }
 
@@ -504,10 +510,19 @@ function createRedo(req, res, next) {
 
     // Original vehicle context: from the original appointment when there is
     // one, otherwise from the original estimate's standalone columns.
+    //
+    /* source_id comes along with it (migration 204). A redo is the SAME customer
+       coming back on the same job, so its source is whatever brought them the
+       first time — nobody should be asked to pick a channel for a warranty
+       return, and leaving it blank would drop that vehicle out of every
+       source report the moment it comes back under warranty.
+       A redo raised from a standalone estimate has no appointment to inherit
+       from and stays null, which is the truthful answer there. */
     let veh = {};
     if (ctx.appointment_id) {
       const a = await pool.query(
-        `SELECT vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id, whatsapp
+        `SELECT vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id, whatsapp,
+                source_id
          FROM appointments WHERE id = $1`, [ctx.appointment_id]);
       veh = a.rows[0] || {};
     } else if (ctx.estimate_id) {
@@ -540,6 +555,13 @@ function createRedo(req, res, next) {
     const gstAmount = Math.round(exRate * qty * gstPct) / 100;
     const totalIncGst = Math.round((exRate * qty + gstAmount) * 100) / 100;
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       advanceAppointmentStatus opens its OWN connection (two queries, plus the
+       WhatsApp automation lookup), and the read-back needs one too. The pool is
+       10 wide with no acquire timeout (config/db.js), so both of those have to
+       wait until this client is back — otherwise ten redos at once take all ten
+       connections and every one of them waits for an eleventh. */
+    let redoApptId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -551,8 +573,8 @@ function createRedo(req, res, next) {
             vehicle_type_id, make_id, model_id, body_type_id, segment_ids, cc_category_id,
             hub_id, scheduled_date, status_id, total_price, notes,
             is_warranty_redo, warranty_claim_id, odometer_km,
-            created_by, public_token)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,$14,TRUE,$15,$16,$17,$18)
+            created_by, public_token, source_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,$14,TRUE,$15,$16,$17,$18,$19)
          RETURNING id`,
         [
           ctx.customer_name || null, ctx.mobile, veh.whatsapp || null, ctx.vehicle_number || null,
@@ -562,9 +584,10 @@ function createRedo(req, res, next) {
           `Warranty redo for claim ${claim.claim_code} — ${ctx.description}`,
           id, claim.current_km ?? null,
           req.user.id, generatePublicToken(),
+          veh.source_id ?? null,
         ]
       );
-      const redoApptId = apptIns.rows[0].id;
+      redoApptId = apptIns.rows[0].id;
 
       if (ctx.mobile) await ensureCustomerIdentity(client, ctx.mobile);
 
@@ -635,21 +658,21 @@ function createRedo(req, res, next) {
       );
 
       await client.query('COMMIT');
-
-      // Mirror the normal estimate-creation status advance (fire-and-forget)
-      await advanceAppointmentStatus(redoApptId, 'estimate-created');
-
-      const full = await pool.query(`${WC_SELECT} WHERE wc.id = $1`, [id]);
-      getIO().emit('invalidate', { topic: 'warranty_claims' });
-      getIO().emit('invalidate', { topic: 'appointments' });
-      getIO().emit('invalidate', { topic: 'estimates' });
-      res.status(201).json({ item: full.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    // Mirror the normal estimate-creation status advance (fire-and-forget)
+    await advanceAppointmentStatus(redoApptId, 'estimate-created');
+
+    const full = await pool.query(`${WC_SELECT} WHERE wc.id = $1`, [id]);
+    getIO().emit('invalidate', { topic: 'warranty_claims' });
+    getIO().emit('invalidate', { topic: 'appointments' });
+    getIO().emit('invalidate', { topic: 'estimates' });
+    res.status(201).json({ item: full.rows[0] });
   });
 }
 

@@ -68,6 +68,15 @@ function addPayment(req, res, next) {
       });
     }
 
+    /* ── The transaction, and nothing else ──────────────────────────────────
+       The pool is 10 wide with no acquire timeout (config/db.js). A handler
+       that holds a client and then awaits anything needing a SECOND
+       connection is not slow — it is a deadlock: ten simultaneous payments
+       take all ten clients, each then waits for an eleventh that cannot
+       exist, and the backend stops answering until it is restarted.
+
+       So the read-back below sits outside this block, after the release. */
+    let payment;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -87,22 +96,23 @@ function addPayment(req, res, next) {
           req.user.id,
         ]
       );
+      payment = ins.rows[0];
 
       await syncAmountPaid(client, invoiceId);
       await client.query('COMMIT');
-
-      // Return updated invoice summary + new payment
-      const invRow = await pool.query(
-        'SELECT id, total, amount_paid, (total - amount_paid) AS outstanding FROM invoices WHERE id = $1',
-        [invoiceId]
-      );
-      return res.status(201).json({ payment: ins.rows[0], invoice: invRow.rows[0] });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
-      client.release();
+      client.release();          // ← before anything below asks for a client
     }
+
+    // Return updated invoice summary + new payment
+    const invRow = await pool.query(
+      'SELECT id, total, amount_paid, (total - amount_paid) AS outstanding FROM invoices WHERE id = $1',
+      [invoiceId]
+    );
+    return res.status(201).json({ payment, invoice: invRow.rows[0] });
   });
 }
 
@@ -136,6 +146,9 @@ function deletePayment(req, res, next) {
     const invoiceId = idParam.parse(req.params.id);
     const payId     = idParam.parse(req.params.payId);
 
+    /* Transaction only — see the note in addPayment. The read-back needs its
+       own connection and therefore happens after the release. */
+    let found;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -144,22 +157,32 @@ function deletePayment(req, res, next) {
         'DELETE FROM invoice_payments WHERE id = $1 AND invoice_id = $2 RETURNING id',
         [payId, invoiceId]
       );
-      if (!del.rows[0]) return res.status(404).json({ error: 'Payment not found' });
+      found = Boolean(del.rows[0]);
 
-      await syncAmountPaid(client, invoiceId);
-      await client.query('COMMIT');
-
-      const invRow = await pool.query(
-        'SELECT id, total, amount_paid, (total - amount_paid) AS outstanding FROM invoices WHERE id = $1',
-        [invoiceId]
-      );
-      return res.json({ deleted: true, invoice: invRow.rows[0] });
+      /* The "not found" exit used to `return` from inside the transaction.
+         release() does not roll anything back, so the connection went back to
+         the pool still inside an open transaction, holding its locks, for the
+         next request to inherit. Roll back first, answer afterwards. */
+      if (!found) {
+        await client.query('ROLLBACK');
+      } else {
+        await syncAmountPaid(client, invoiceId);
+        await client.query('COMMIT');
+      }
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
     } finally {
       client.release();
     }
+
+    if (!found) return res.status(404).json({ error: 'Payment not found' });
+
+    const invRow = await pool.query(
+      'SELECT id, total, amount_paid, (total - amount_paid) AS outstanding FROM invoices WHERE id = $1',
+      [invoiceId]
+    );
+    return res.json({ deleted: true, invoice: invRow.rows[0] });
   });
 }
 

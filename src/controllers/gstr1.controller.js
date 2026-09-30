@@ -45,6 +45,8 @@
 
 const { pool } = require('../config/db');
 const { loadCompany } = require('../utils/renderDocument');
+const { buildGstr1Workbook } = require('../utils/gstr1Workbook');
+const { calendarDate } = require('../utils/appTime');
 const { isHubUser } = require('../utils/hubScope');
 const {
   STATE_CODES,
@@ -57,6 +59,9 @@ const {
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const r2  = (v) => Math.round(num(v) * 100) / 100;
 const ciNo = (id) => `CI-${String(id).padStart(6, '0')}`;
+/* "1 invoice" / "2 invoices" rather than "1 invoice(s)". A return that talks
+   like a form field is one more reason not to read it. */
+const plural = (n, word) => (n === 1 ? word : `${word}s`);
 
 /* ── Period ────────────────────────────────────────────────────────────────
    A GST return covers a statutory period, never an arbitrary range, so the
@@ -212,19 +217,40 @@ function rateRows(items, interState) {
 // =====================================================================
 // GET /api/reports/gstr1
 // =====================================================================
-async function getGstr1(req, res, next) {
-  try {
+/**
+ * The return itself, as data.
+ *
+ * ── EVERY DATE LEAVES HERE AS 'YYYY-MM-DD' ────────────────────────────────
+ *
+ * Not as a Date. res.json() serialises a Date through toISOString(), and the
+ * process runs in IST, so a DATE column built at local midnight goes out as
+ * the previous day at 18:30Z — and the page, the filing CSVs and the workbook
+ * all read the first ten characters of that. Every date was a day early, on
+ * files that get uploaded to the portal. calendarDate() reads the calendar
+ * parts instead, which is what was stored.
+ *
+ * Split out from the HTTP handler so the JSON endpoint and the workbook are
+ * built from ONE pass over the invoices. Two builders would eventually
+ * disagree, and a spreadsheet that does not match the screen it was
+ * downloaded from is worse than no spreadsheet.
+ *
+ * Refuses by throwing with `.status` set rather than writing a response, so
+ * the caller decides what the failure looks like.
+ */
+async function buildGstr1(req) {
+  {
     /* A hub never sees this. Every other report on this page is hub-scoped —
        a hub partner sees their own jobs. A GST return cannot be scoped that
        way: it is the whole company's outward supply, with every customer's
        name and GSTIN in it, and a partial one would be a wrong return rather
        than a filtered view. So the answer is no, not a narrower yes. */
     if (isHubUser(req)) {
-      return res.status(403).json({ error: 'The GST return is not available to hub logins.' });
+      const e = new Error('The GST return is not available to hub logins.');
+      e.status = 403; throw e;
     }
 
     const period = resolvePeriod(req.query);
-    if (period.error) return res.status(400).json({ error: period.error });
+    if (period.error) { const e = new Error(period.error); e.status = 400; throw e; }
 
     const company = await loadCompany();
     const ownState = supplierStateCode(company);
@@ -256,14 +282,24 @@ async function getGstr1(req, res, next) {
 
     for (const inv of invoices) {
       const items = itemsByInvoice.get(inv.id) || [];
-      if (!items.length) { noLines.push(ciNo(inv.id)); continue; }
+      /* Every collector below records a ROW, not a label. The page renders
+         these as real tables with a column each — an invoice number, a date
+         and an amount joined by the same dot separator cannot be read. */
+      const stub = () => ({
+        id: inv.id,
+        invoice: ciNo(inv.id),
+        date: calendarDate(inv.invoice_date),
+        customer: inv.b2b_company_name || inv.customer_name || '',
+        value: r2(inv.grand_total),
+      });
+      if (!items.length) { noLines.push(stub()); continue; }
 
       /* The SAME resolution the PDF uses. After migration 184 the column is
          populated and rule 1 fires; the fallback stays because an invoice
          created before the fix — or by a path that misses it — must still land
          in the right table rather than vanish from the return. */
       const pos = resolvePlaceOfSupply(inv, company);
-      if (!pos.code) { noPos.push(ciNo(inv.id)); continue; }
+      if (!pos.code) { noPos.push(stub()); continue; }
       if (pos.source !== 'explicit') {
         // Worth surfacing: the return is correct, but the invoice row is not
         // carrying the value, so a later edit could change what was filed.
@@ -275,7 +311,9 @@ async function getGstr1(req, res, next) {
 
       const gstin = String(inv.b2b_gst_number || '').trim().toUpperCase();
       const isB2B = !!(inv.is_b2b && gstin);
-      if (inv.is_b2b && gstin && gstin.length !== 15) badGstin.push(ciNo(inv.id));
+      if (inv.is_b2b && gstin && gstin.length !== 15) {
+        badGstin.push({ ...stub(), gstin, gstin_length: gstin.length });
+      }
 
       const invoiceValue = r2(inv.grand_total);
       totInvoiceValue += invoiceValue;
@@ -322,7 +360,7 @@ async function getGstr1(req, res, next) {
             gstin,
             receiver_name: inv.b2b_company_name || inv.customer_name || '',
             invoice_no: ciNo(inv.id),
-            invoice_date: inv.invoice_date,
+            invoice_date: calendarDate(inv.invoice_date),
             invoice_value: invoiceValue,
             pos_code: pos.code,
             pos_name: pos.name,
@@ -338,7 +376,7 @@ async function getGstr1(req, res, next) {
              B2CS, which would be the wrong table. */
           b2clRows.push({
             invoice_no: ciNo(inv.id),
-            invoice_date: inv.invoice_date,
+            invoice_date: calendarDate(inv.invoice_date),
             invoice_value: invoiceValue,
             pos_code: pos.code, pos_name: pos.name,
             rate: row.rate, taxable: row.taxable,
@@ -362,19 +400,35 @@ async function getGstr1(req, res, next) {
         }
       }
 
-      // ── Table 12: HSN summary, per line ────────────────────────────────
+      /* ── Table 12: HSN summary, per line ───────────────────────────────
+         Split B2B from B2C. The portal takes Table 12 as two separate lists —
+         the offline-utility workbook has an hsn(b2b) sheet and an hsn(b2c)
+         sheet — so `scope` is part of the key, not a label added afterwards.
+         The same code at the same rate sold to a GSTIN customer and to a
+         walk-in is two rows, and merging them cannot be undone later. */
+      const scope = isB2B ? 'b2b' : 'b2c';
       for (const it of items) {
         const code = String(it.hsn_sac || '').trim();
         if (!code) {
-          noHsn.push({ invoice: ciNo(inv.id), item_type: it.item_type, description: it.description });
+          noHsn.push({
+            id: inv.id,
+            invoice: ciNo(inv.id),
+            date: calendarDate(inv.invoice_date),
+            line: it.description || '(no description)',
+            kind: it.item_type === 'service' ? 'Service' : 'Part',
+            /* The amount is the point: it is exactly what Table 12 is short
+               by, and it is what decides whether this is worth stopping for. */
+            taxable: r2(it.taxable),
+          });
           continue;
         }
         const rate = num(it.gst_percent);
-        const key = `${code}|${rate}`;
+        const key = `${code}|${rate}|${scope}`;
         if (!hsnMap.has(key)) {
           hsnMap.set(key, {
             code, description: it.description || '',
             uqc: it.item_type === 'service' ? 'NA' : 'NOS',
+            scope,
             rate, quantity: 0, taxable: 0, cgst: 0, sgst: 0, igst: 0, cess: 0,
           });
         }
@@ -405,7 +459,15 @@ async function getGstr1(req, res, next) {
        listed in 9B reduces the liability twice. */
     for (const n of notes) {
       const nItems = itemsByNote.get(n.id) || [];
-      if (!nItems.length) { notesSkipped.push(n.note_no); continue; }
+      if (!nItems.length) {
+        notesSkipped.push({
+          note_no: n.note_no,
+          date: calendarDate(n.note_date),
+          customer: n.b2b_company_name || n.customer_name || '',
+          value: r2(n.grand_total),
+        });
+        continue;
+      }
       notesApplied += 1;
       cnTaxable += num(n.subtotal_ex_gst);
       cnGst     += num(n.total_gst);
@@ -430,9 +492,9 @@ async function getGstr1(req, res, next) {
             gstin,
             receiver_name: n.b2b_company_name || n.customer_name || '',
             note_no: n.note_no,
-            note_date: n.note_date,
+            note_date: calendarDate(n.note_date),
             original_invoice_no: ciNo(n.customer_invoice_id),
-            original_invoice_date: n.orig_invoice_date,
+            original_invoice_date: calendarDate(n.orig_invoice_date),
             note_type: 'C',              // C = credit note, D = debit note
             reason: n.reason,
             pos_code: posCode,
@@ -466,7 +528,9 @@ async function getGstr1(req, res, next) {
         const code = String(it.hsn_sac || '').trim();
         if (!code) continue;
         const rate = num(it.gst_percent);
-        const key = `${code}|${rate}`;
+        /* Netted off inside the note's OWN side of the split. A credit note to
+           a registered buyer must not reduce the B2C list. */
+        const key = `${code}|${rate}|${isB2B ? 'b2b' : 'b2c'}`;
         if (!hsnMap.has(key)) continue;   // nothing supplied at this code this period
         const h = hsnMap.get(key);
         h.quantity = r2(h.quantity - num(it.quantity));
@@ -497,58 +561,205 @@ async function getGstr1(req, res, next) {
     }] : [];
 
     // ── Warnings — things that would file wrong ───────────────────────────
+    /* ── THE SHAPE, AND WHY ────────────────────────────────────────────────
+       Each entry carries three things a person needs in this order:
+
+         title  what happened, with the count AND the money, because the
+                amount is what decides whether it is worth stopping for
+         why    one line on what goes wrong if it is filed as it stands
+         rows   the actual documents, as table rows with a column each
+
+       `group` is the split the page renders as three sections:
+
+         fix    blocks a correct filing
+         check  a judgement call, not an error
+         info   not a problem at all — the maths working as intended
+
+       Without that split a note confirming the credit notes were handled
+       correctly sits in a red list headed "things that would file wrong", and
+       the headline count never matches the number of boxes on screen.
+
+       `rows` is NEVER truncated. It used to be sliced to 50 here and to 12
+       again on the page, so on a busy month the broken documents could not be
+       read at all — which is the only reason the warning exists. The page
+       paginates and offers a CSV instead.
+
+       `message` stays because the workbook and the summary CSV print it. */
     const unstoredPos = noPos.filter(v => v === null).length;
     const missingPos  = noPos.filter(Boolean);
 
-    if (missingPos.length) warnings.push({
-      code: 'no_place_of_supply', severity: 'blocker',
-      message: `${missingPos.length} invoice(s) have no place of supply and could not be classified. They are NOT in the figures below.`,
-      items: missingPos.slice(0, 50), count: missingPos.length,
-    });
+    const COL = {
+      invoice:  { key: 'invoice',  label: 'Invoice',   type: 'ref' },
+      note:     { key: 'note_no',  label: 'Note',      type: 'ref' },
+      date:     { key: 'date',     label: 'Date',      type: 'date' },
+      customer: { key: 'customer', label: 'Customer' },
+      value:    { key: 'value',    label: 'Invoice value', type: 'money' },
+      taxable:  { key: 'taxable',  label: 'Taxable',   type: 'money' },
+      line:     { key: 'line',     label: 'Line item' },
+      kind:     { key: 'kind',     label: 'Type' },
+      gstin:    { key: 'gstin',    label: 'GSTIN entered', type: 'ref' },
+    };
+    const sumBy = (rows, k) => r2(rows.reduce((t, x) => t + num(x[k]), 0));
+
+    if (missingPos.length) {
+      const amount = sumBy(missingPos, 'value');
+      warnings.push({
+        code: 'no_place_of_supply', group: 'fix', severity: 'blocker',
+        title: `${missingPos.length} ${plural(missingPos.length, 'invoice')} have no place of supply`,
+        amount,
+        why: 'They could not be put in any table, so they are missing from every figure on this page.',
+        count: missingPos.length,
+        columns: [COL.invoice, COL.date, COL.customer, COL.value],
+        rows: missingPos,
+        message: `${missingPos.length} invoice(s) have no place of supply and could not be classified. They are NOT in the figures below.`,
+      });
+    }
     if (unstoredPos) warnings.push({
-      code: 'place_of_supply_not_stored', severity: 'warn',
-      message: `${unstoredPos} invoice(s) had their place of supply derived rather than read from the invoice. Run migration 184 so the value is stored on the document.`,
+      code: 'place_of_supply_not_stored', group: 'check', severity: 'warn',
+      title: `${unstoredPos} ${plural(unstoredPos, 'invoice')} had the place of supply worked out, not read`,
+      amount: null,
+      why: 'The return is right today, but editing one of those invoices later could change what was filed.',
       count: unstoredPos,
+      action: { label: 'Run migration 184' },
+      message: `${unstoredPos} invoice(s) had their place of supply derived rather than read from the invoice. Run migration 184 so the value is stored on the document.`,
     });
-    if (noHsn.length) warnings.push({
-      code: 'no_hsn', severity: 'blocker',
-      message: `${noHsn.length} line(s) have no HSN/SAC code, so Table 12 under-reports by their value.`,
-      items: noHsn.slice(0, 50), count: noHsn.length,
-    });
+    if (noHsn.length) {
+      const amount = sumBy(noHsn, 'taxable');
+      warnings.push({
+        code: 'no_hsn', group: 'fix', severity: 'blocker',
+        title: `${noHsn.length} ${plural(noHsn.length, 'line')} have no HSN/SAC code`,
+        amount,
+        why: 'Table 12 is short by exactly this much, and the portal checks Table 12 against your taxable value.',
+        count: noHsn.length,
+        columns: [COL.invoice, COL.date, COL.line, COL.kind, COL.taxable],
+        rows: noHsn,
+        message: `${noHsn.length} line(s) have no HSN/SAC code, so Table 12 under-reports by their value.`,
+      });
+    }
     if (badGstin.length) warnings.push({
-      code: 'bad_gstin', severity: 'blocker',
+      code: 'bad_gstin', group: 'fix', severity: 'blocker',
+      title: `${badGstin.length} B2B ${plural(badGstin.length, 'invoice')} have a GSTIN that is not 15 characters`,
+      amount: sumBy(badGstin, 'value'),
+      why: 'The portal rejects these rows outright — the upload fails rather than filing something wrong.',
+      count: badGstin.length,
+      columns: [COL.invoice, COL.date, COL.customer, COL.gstin, COL.value],
+      rows: badGstin,
       message: `${badGstin.length} B2B invoice(s) have a GSTIN that is not 15 characters. The portal will reject these rows.`,
-      items: badGstin, count: badGstin.length,
     });
     if (noLines.length) warnings.push({
-      code: 'no_lines', severity: 'warn',
+      code: 'no_lines', group: 'check', severity: 'warn',
+      title: `${noLines.length} ${plural(noLines.length, 'invoice')} have no line items and were skipped`,
+      amount: sumBy(noLines, 'value'),
+      why: 'An invoice with a value but no lines is usually a half-finished document rather than a real supply.',
+      count: noLines.length,
+      columns: [COL.invoice, COL.date, COL.customer, COL.value],
+      rows: noLines,
       message: `${noLines.length} invoice(s) in this period have no line items and were skipped.`,
-      items: noLines, count: noLines.length,
     });
     if (nilMap.size) {
-      const nilTotal = r2([...nilMap.values()].reduce((t, r) => t + r.amount, 0));
+      const nilTotal = r2([...nilMap.values()].reduce((t, x) => t + x.amount, 0));
       warnings.push({
-        code: 'nil_rated_unclassified', severity: 'blocker',
-        message: `Rs ${nilTotal.toFixed(2)} of zero-rated supply is reported in Table 8 but not yet split into nil rated / exempted / non-GST. In this data it is fuel (petrol, CNG), which is a NON-GST supply - confirm before filing.`,
+        code: 'nil_rated_unclassified', group: 'fix', severity: 'blocker',
+        title: 'Zero-rated supply is not split into nil rated / exempted / non-GST',
+        amount: nilTotal,
+        why: 'Table 8 needs one of those three columns chosen. In this data it is fuel (petrol, CNG), which is a NON-GST supply.',
         count: nilMap.size,
+        columns: [
+          { key: 'bucket', label: 'Table 8 row', type: 'ref' },
+          { key: 'label',  label: 'Description' },
+          { key: 'line_count', label: 'Lines', type: 'count' },
+          { key: 'amount', label: 'Value', type: 'money' },
+        ],
+        rows: [...nilMap.values()],
+        message: `Rs ${nilTotal.toFixed(2)} of zero-rated supply is reported in Table 8 but not yet split into nil rated / exempted / non-GST. In this data it is fuel (petrol, CNG), which is a NON-GST supply - confirm before filing.`,
       });
     }
     if (docs.length && docs[0].outside_period > 0) {
+      /* The actual documents, not a paragraph about creation order — and the
+         two cases are NOT the same thing, which the old wording missed by
+         calling all of them "real invoices dated in another month":
+
+           dated elsewhere  the invoice exists, its date puts it in another
+                            period. Consecutive returns overlap, which is
+                            expected and needs nothing done.
+           never issued     no invoice carries that number at all — deleted,
+                            or a rolled-back insert that burned a sequence
+                            value. Table 13 declares a RANGE and a count, so
+                            the portal expects these declared as CANCELLED.
+                            Reported as zero today, which is the part that
+                            would actually file wrong.
+
+         In this period all seven are the second kind, which is exactly why
+         the distinction is worth drawing. */
+      const inPeriod = new Set(usedIds);
+      const gapIds = [];
+      for (let id = minId; id <= maxId; id++) if (!inPeriod.has(id)) gapIds.push(id);
+      const found = gapIds.length
+        ? (await pool.query(
+            `SELECT id, invoice_date, customer_name, b2b_company_name, grand_total
+               FROM customer_invoices WHERE id = ANY($1::int[]) ORDER BY id`, [gapIds])).rows
+        : [];
+      const foundIds = new Set(found.map(g => g.id));
+      const missing = gapIds.filter(id => !foundIds.has(id));
+
+      const rows = [
+        ...found.map(g => ({
+          invoice: ciNo(g.id),
+          status: 'Dated in another period',
+          date: calendarDate(g.invoice_date),
+          customer: g.b2b_company_name || g.customer_name || '',
+          value: r2(g.grand_total),
+        })),
+        ...missing.map(id => ({
+          invoice: ciNo(id),
+          status: 'No such invoice — declare as cancelled',
+          date: null, customer: '', value: null,
+        })),
+      ].sort((a, b) => a.invoice.localeCompare(b.invoice));
+
+      const bits = [];
+      if (missing.length) bits.push(`${missing.length} never issued`);
+      if (found.length) bits.push(`${found.length} dated in another period`);
       warnings.push({
-        code: 'document_range_gaps', severity: 'warn',
-        message: `Table 13 reports ${docs[0].from_no} to ${docs[0].to_no}, a range of ${span} numbers, but only ${usedIds.length} are dated in this period. The other ${docs[0].outside_period} are real invoices dated in another month - invoice numbers follow creation order while the return follows invoice_date. Consecutive periods will overlap.`,
-        count: docs[0].outside_period,
+        code: 'document_range_gaps',
+        /* Never-issued numbers are a blocker: Table 13 reports them as zero
+           cancelled, which is a wrong declaration. An overlap alone is not. */
+        group: missing.length ? 'fix' : 'check',
+        severity: missing.length ? 'blocker' : 'warn',
+        title: `${gapIds.length} ${plural(gapIds.length, 'number')} in the Table 13 range are not in this return — ${bits.join(', ')}`,
+        amount: found.length ? r2(found.reduce((t, g) => t + num(g.grand_total), 0)) : null,
+        why: missing.length
+          ? `Table 13 declares ${docs[0].from_no} to ${docs[0].to_no} with 0 cancelled. ${missing.length} of those numbers do not exist, so they should be declared cancelled rather than left unexplained.`
+          : 'Invoice numbers follow the order they were created; the return follows the invoice date, so consecutive periods overlap. Nothing to do.',
+        count: gapIds.length,
+        columns: [
+          COL.invoice,
+          { key: 'status', label: 'What it is' },
+          { key: 'date', label: 'Actually dated', type: 'date' },
+          COL.customer,
+          COL.value,
+        ],
+        rows,
+        message: `Table 13 reports ${docs[0].from_no} to ${docs[0].to_no}, a range of ${span} numbers, but only ${usedIds.length} are in this return - ${bits.join(', ')}. Numbers that were never issued should be declared as cancelled in Table 13, which currently reports 0.`,
       });
     }
     if (notesSkipped.length) warnings.push({
-      code: 'credit_note_no_lines', severity: 'blocker',
+      code: 'credit_note_no_lines', group: 'fix', severity: 'blocker',
+      title: `${notesSkipped.length} credit ${plural(notesSkipped.length, 'note')} have no line items`,
+      amount: sumBy(notesSkipped, 'value'),
+      why: 'They were left out of the return entirely, so the liability is overstated by their value.',
+      count: notesSkipped.length,
+      columns: [COL.note, COL.date, COL.customer, { key: 'value', label: 'Note value', type: 'money' }],
+      rows: notesSkipped,
       message: `${notesSkipped.length} credit note(s) have no line items and were left out of the return entirely.`,
-      items: notesSkipped, count: notesSkipped.length,
     });
     if (notesApplied) warnings.push({
-      code: 'credit_notes_applied', severity: 'info',
-      message: `${notesApplied} credit note(s) worth Rs ${r2(cnTaxable + cnGst).toFixed(2)} are netted off this return. Notes to registered buyers are listed in Table 9B; notes to unregistered customers are netted into Table 7, which is where they belong - listing those separately would reduce the liability twice.`,
+      code: 'credit_notes_applied', group: 'info', severity: 'info',
+      title: `${notesApplied} credit ${plural(notesApplied, 'note')} netted off this return`,
+      amount: r2(cnTaxable + cnGst),
+      why: 'Notes to registered buyers are listed in Table 9B; notes to unregistered customers are netted into Table 7, which is where they belong — listing those separately would reduce the liability twice.',
       count: notesApplied,
+      message: `${notesApplied} credit note(s) worth Rs ${r2(cnTaxable + cnGst).toFixed(2)} are netted off this return. Notes to registered buyers are listed in Table 9B; notes to unregistered customers are netted into Table 7, which is where they belong - listing those separately would reduce the liability twice.`,
     });
 
     // ── Reconciliation — the return against the ledger it came from ───────
@@ -560,7 +771,7 @@ async function getGstr1(req, res, next) {
     const ledgerGst     = r2(invoices.reduce((s, i) => s + num(i.total_gst), 0) - cnGst);
     const returnTax     = r2(totCgst + totSgst + totIgst);
 
-    res.json({
+    return {
       period: { type: period.type, label: period.label, from: period.from, to: period.to, fp: period.fp },
       company: {
         name: company?.company_name || '',
@@ -573,7 +784,11 @@ async function getGstr1(req, res, next) {
       nil_rated: [...nilMap.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)),
       cdnr,
       b2cs: [...b2csMap.values()].sort((a, b) => a.pos_code.localeCompare(b.pos_code) || b.rate - a.rate),
-      hsn:  [...hsnMap.values()].sort((a, b) => a.code.localeCompare(b.code) || b.rate - a.rate),
+      /* One array carrying `scope`, not two: the screen shows a single table
+         and the export splits it. Sorted b2b first so the order matches the
+         two sheets in the portal workbook. */
+      hsn:  [...hsnMap.values()].sort((a, b) =>
+        a.scope.localeCompare(b.scope) || a.code.localeCompare(b.code) || b.rate - a.rate),
       docs,
       totals: {
         invoices: usedIds.length,
@@ -604,8 +819,35 @@ async function getGstr1(req, res, next) {
         material: Math.abs(ledgerTaxable - (totTaxable + totNil)) > 1 || Math.abs(ledgerGst - returnTax) > Math.max(1, usedIds.length * 0.02),
       },
       warnings,
-    });
-  } catch (err) { next(err); }
+    };
+  }
 }
 
-module.exports = { getGstr1, resolvePeriod };
+// ── HTTP: the JSON the page reads ───────────────────────────────────────────
+async function getGstr1(req, res, next) {
+  try { res.json(await buildGstr1(req)); }
+  catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+}
+
+// ── HTTP: the same return as one workbook ───────────────────────────────────
+async function getGstr1Xlsx(req, res, next) {
+  try {
+    const data = await buildGstr1(req);
+    const buf = await buildGstr1Workbook(data);
+    const name = `GSTR1-${(data.company.gstin || 'return')}-${data.period.fp}.xlsx`;
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    /* attachment, unlike the statement PDF: nothing in a browser renders a
+       workbook, so "open in a tab" would just be a download with extra steps. */
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    res.send(buf);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+}
+
+module.exports = { getGstr1, getGstr1Xlsx, buildGstr1, resolvePeriod };

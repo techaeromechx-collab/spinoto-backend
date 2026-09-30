@@ -54,7 +54,14 @@ const TYPE_LABEL = {
  * @param {object} opts    { accent }
  */
 function statementHtml(ledger, company, opts = {}) {
-  const { party, rows, totals, ageing } = ledger;
+  const { party, rows, totals, ageing, range } = ledger;
+  /* A statement for August that does not say "August" is indistinguishable
+     from a full statement the moment it is printed and handed to somebody. */
+  const filtered = Boolean(range?.from || range?.to);
+  const periodLine = filtered
+    ? `<p class="period">${range.from ? esc(dmy(range.from)) : 'Start'} &ndash; ${
+        range.to ? esc(dmy(range.to)) : esc(dmy(new Date().toISOString().slice(0, 10)))}</p>`
+    : '';
   const accent = opts.accent || company?.invoice_accent_color || '#16b994';
   const isCustomer = party.type === 'customer';
 
@@ -85,7 +92,10 @@ function statementHtml(ledger, company, opts = {}) {
       <td class="n b">${money(r.balance)} <span class="dc">${esc(r.balance_direction.toUpperCase())}</span></td>
     </tr>`).join('');
 
-  const ageingHtml = (ageing && owing && totals.closing > 0.011) ? `
+  /* Ageing is an as-of-today figure about everything still open, which is not
+     what a windowed statement is about. Under a period it would be computed
+     from the filtered invoices alone and quietly mean something else. */
+  const ageingHtml = (!filtered && ageing && owing && totals.closing > 0.011) ? `
     <div class="ageing">
       <span class="ageing-label">Age of the amount due</span>
       ${[['Current', ageing.current], ['31&ndash;60 days', ageing.d30],
@@ -118,6 +128,7 @@ function statementHtml(ledger, company, opts = {}) {
   .co .gst { margin-top: 1.5mm; font-weight: 700; color: #1a2433; }
   .title { text-align: right; }
   .title h2 { margin: 0; font-size: 13pt; font-weight: 800; color: ${esc(accent)}; letter-spacing: -0.2pt; }
+  .title .period { margin: 1.5mm 0 0; font-size: 9pt; font-weight: 700; color: #1a2433; }
   .title p  { margin: 1.5mm 0 0; font-size: 8pt; color: #5b6878; }
 
   .party { background: #f5f7fa; border-radius: 2mm; padding: 4mm 5mm; margin-bottom: 5mm;
@@ -169,6 +180,7 @@ function statementHtml(ledger, company, opts = {}) {
     </div>
     <div class="title">
       <h2>Statement of Account</h2>
+      ${periodLine}
       <p>Generated ${esc(dmy(new Date().toISOString().slice(0, 10)))}</p>
       <p>${rows.length} entr${rows.length === 1 ? 'y' : 'ies'}</p>
     </div>
