@@ -452,6 +452,27 @@ const SORTABLE = {
      a lead nobody has come back on is exactly as recent as the day it was
      made. */
   activity:   'GREATEST(l.created_at, COALESCE(l.last_enquiry_at, l.created_at))',
+
+  /* ── Next Follow-up ───────────────────────────────────────────────────────
+     The soonest OPEN follow-up on the lead — the same value the list's
+     Next Follow-up column prints, because it is literally that column.
+
+     This is the one entry in here that is not a table column. It is the output
+     alias of the LATERAL-style subselect in LIST_SELECT, and Postgres allows a
+     bare output alias in ORDER BY. Naming the alias rather than repeating the
+     subquery matters: repeated, it would run once per row for the sort and
+     again per row for the SELECT, on a table with no index for it.
+
+     Because it is an alias and not an expression, it works ONLY in the items
+     query. The count queries do not select it and must never be given this
+     sort — they are not, they have no ORDER BY at all, but that is the reason
+     why if somebody ever adds one.
+
+     ORDER BY appends NULLS LAST in both directions (see the note at the query),
+     which is what you want here and is not merely incidental: a lead with no
+     follow-up booked has no place in a list ordered by when the follow-up is,
+     and it sinks whichever way the arrow points. */
+  next_follow_up: 'next_follow_up_date',
 };
 
 /* The sort applied when the caller names none. Changed from 'created_at' to
