@@ -309,15 +309,26 @@ function listInbox(req, res, next) {
         AND last.created_at IS NOT NULL
         AND NOT ${HIDDEN_SQL}
         ${extra}
-      -- Unread first, then most recent. Sorting purely by time would bury a
-      -- customer who wrote this morning under conversations you have already
-      -- dealt with since.
+      -- ── Newest first. Nothing else. ──────────────────────────────────────
       --
-      -- Ordering on the OUTPUT column, which Postgres allows and which matters
-      -- here: repeating the EXISTS would have the planner evaluate it a second
-      -- time per row, and the two copies could drift the day one of them is
-      -- edited.
-      ORDER BY is_unread DESC, last.created_at DESC
+      -- This used to be 'is_unread DESC, last.created_at DESC', and the note
+      -- defending it said that sorting purely by time would bury a customer who
+      -- wrote this morning under conversations already dealt with since.
+      --
+      -- That was true when unread was a dot. It stopped being true when the row
+      -- gained a COUNT and the rail gained an Unread tab: position is no longer
+      -- the only way to find an unanswered customer, so it no longer has to
+      -- carry that job.
+      --
+      -- And it was carrying a real cost. is_unread flips the moment somebody
+      -- opens a conversation, so reading one made its row LEAVE the unread block
+      -- and drop down the list — the row moved out from under the cursor that
+      -- had just clicked it. WhatsApp does not do that, and the reason it does
+      -- not is that a list which reorders itself as you use it cannot be learned.
+      --
+      -- One rule now: the most recent message is at the top. Reading something
+      -- changes its badge and never its position.
+      ORDER BY last.created_at DESC
       LIMIT $2 OFFSET $3`,
       params
     );
