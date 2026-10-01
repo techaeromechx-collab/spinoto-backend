@@ -2372,6 +2372,246 @@ async function checkMobile(req, res, next) {
   } catch (err) { next(err); }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/leads/dashboard-metrics?period=today|week|month|all
+//
+// ══ THE BUG THIS EXISTS TO FIX ══════════════════════════════════════════════
+//
+// The dashboard called GET /api/leads with no page_size, got the default first
+// page of TEN rows, and then computed every lead number on the screen from
+// those ten in the browser. Not just the Pipeline Overview donut — the Total
+// Leads card, the status breakdown, the pipeline value, the conversion rate,
+// the Created/Assigned chips and all three sparklines. Every one of them was
+// capped at 10. The donut was the one somebody noticed, because 10 is a
+// suspiciously round number to see every single day.
+//
+// Raising page_size would have been the small fix and the wrong one: it means
+// shipping the whole leads table to the browser on every dashboard load to add
+// a column of numbers up, and it goes wrong again — silently — the day the
+// workshop passes whatever limit got picked.
+//
+// So the counting happens where the rows already are.
+//
+// ══ WHY IT IS HERE AND NOT IN reports.controller.js ═════════════════════════
+//
+// reports.controller.js has its own resolveScope(). This endpoint uses
+// scopeConditions() from utils/leadScope.js — the SAME function GET /api/leads
+// uses. That is the whole point: a dashboard that says 1,240 leads and a leads
+// page that lists 1,180 of them is worse than no number at all, and two
+// separate implementations of "which leads may this person see" is exactly how
+// that happens. There is one rule, in one file, and both callers import it.
+//
+// ══ WHY THE WINDOW PREDICATES LOOK ODD ══════════════════════════════════════
+//
+// They reproduce, deliberately and exactly, what the browser was doing:
+//
+//   today  the same CALENDAR day
+//   week   a rolling 7×24 hours back from this instant — NOT the last 7
+//          calendar days, and not the week-to-date
+//   month  the same calendar month AND year
+//
+// Only the base changed, not the arithmetic. A number that moves because the
+// count was fixed is a fix; a number that moves because the definition quietly
+// changed with it is a second bug wearing the first one's clothes.
+//
+// The session's timezone is pinned to Asia/Kolkata in config/db.js, so
+// CURRENT_DATE and ::date are the workshop's day, not UTC's. See
+// utils/appTime.js for why that is set on the connection and not per query.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/* The window the period dropdown selects, as a predicate on l.created_at.
+   `all` is null rather than 'TRUE' so the caller can tell "no window" from "a
+   window that happens to match everything" and leave the clause out entirely. */
+const DASH_WINDOW = {
+  today: `l.created_at::date = CURRENT_DATE`,
+  week:  `l.created_at >= NOW() - INTERVAL '7 days'`,
+  month: `DATE_TRUNC('month', l.created_at) = DATE_TRUNC('month', CURRENT_DATE)`,
+  all:   null,
+};
+
+/* A lead is converted when an appointment was made from it. Derived, not
+   stored — same EXISTS the list and the detail SELECT use, so the dashboard's
+   conversion rate and the row's Converted badge cannot disagree. */
+const IS_CONVERTED = `EXISTS (SELECT 1 FROM appointments a WHERE a.lead_id = l.id)`;
+
+/* Blank and NULL statuses collapse to one bucket, matching the expression
+   listLeads' own status counts use. Neither value matches a row in
+   lead_statuses, so the dashboard drops the bucket when it joins the two —
+   which is what the browser did with them too. It is returned rather than
+   filtered out here so the total and the breakdown still reconcile. */
+const STATUS_KEY = `COALESCE(NULLIF(TRIM(l.status), ''), '__new__')`;
+
+async function getDashboardMetrics(req, res, next) {
+  handle(req, res, next, async () => {
+    const user    = req.user;
+    const teamIds = await teamIdsIfNeeded(user);
+
+    const period = Object.prototype.hasOwnProperty.call(DASH_WINDOW, String(req.query.period || ''))
+      ? String(req.query.period)
+      : 'all';
+    const windowSql = DASH_WINDOW[period];
+
+    /* Each query builds its own params array. Sharing one would make five
+       queries agree on $n ordering — the coupling that breaks the moment
+       somebody adds a condition to one of them. The same note is on listLeads'
+       count block, for the same reason. */
+    const whereFor = (params, extra = null) => {
+      const c = scopeConditions(user, teamIds, params);
+      if (extra) c.push(extra);
+      return c.length ? `WHERE ${c.join(' AND ')}` : '';
+    };
+
+    const oParams = [];
+    const oMe     = ph(oParams, user.id);
+    const oWhere  = whereFor(oParams);
+
+    const osParams = [];
+    const osWhere  = whereFor(osParams);
+
+    const wParams = [];
+    const wWhere  = whereFor(wParams, windowSql);
+
+    const wsParams = [];
+    const wsWhere  = whereFor(wsParams, windowSql);
+
+    /* The sparkline query references leads twice, so scopeConditions is called
+       twice on the same array. That pushes the scope value twice and yields two
+       placeholders — redundant, and correct, which is the trade this makes
+       rather than hand-threading one placeholder into two CTEs. */
+    const kParams   = [];
+    const kCreated  = whereFor(kParams, `l.created_at >= CURRENT_DATE - 6`);
+    const kConv     = whereFor(kParams, `l.updated_at >= CURRENT_DATE - 6`);
+
+    const [overall, overallStatus, win, winStatus, spark] = await Promise.all([
+      /* Everything the stat cards and the personal KPIs need, in one pass over
+         the scoped rows. No joins: every condition references l.* only.
+
+         mine_assigned_not_created is the awkward one and it is awkward on
+         purpose. The browser computed it as
+         `assigned_to === me && created_by !== me`, and in JavaScript a NULL
+         created_by becomes 0, which is not me, so an unclaimed WhatsApp lead
+         handed to somebody COUNTED. In SQL `l.created_by <> $me` is NULL for
+         that row and a NULL does not pass a filter, so it would silently stop
+         counting. The IS NULL arm keeps the number the same as it was. */
+      pool.query(
+        `SELECT COUNT(*)::int                                            AS total,
+                COALESCE(SUM(l.total_price), 0)::float                   AS value,
+                COUNT(*) FILTER (WHERE ${IS_CONVERTED})::int             AS converted,
+                COUNT(*) FILTER (WHERE l.created_at::date = CURRENT_DATE)::int AS created_today,
+                COUNT(*) FILTER (WHERE l.created_by  = ${oMe})::int      AS mine_created,
+                COUNT(*) FILTER (WHERE l.assigned_to = ${oMe})::int      AS mine_assigned,
+                COUNT(*) FILTER (WHERE l.assigned_to = ${oMe}
+                                   AND (l.created_by IS NULL OR l.created_by <> ${oMe}))::int
+                                                                         AS mine_assigned_not_created
+           FROM leads l ${oWhere}`, oParams),
+
+      // The donut, and the value beside each status row.
+      pool.query(
+        `SELECT ${STATUS_KEY} AS name,
+                COUNT(*)::int AS count,
+                COALESCE(SUM(l.total_price), 0)::float AS value
+           FROM leads l ${osWhere}
+          GROUP BY 1`, osParams),
+
+      // The Pipeline Overview card's four numbers, for the chosen window.
+      pool.query(
+        `SELECT COUNT(*)::int                                AS total,
+                COALESCE(SUM(l.total_price), 0)::float       AS value,
+                COUNT(*) FILTER (WHERE ${IS_CONVERTED})::int AS converted
+           FROM leads l ${wWhere}`, wParams),
+
+      /* The card's status rows, counted AND valued inside the window.
+         The browser took the count from the window and the revenue from every
+         lead ever, so picking "Today" changed the counts and left the money
+         beside them untouched. That was not a decision anybody made; it was two
+         useMemos reading different arrays. */
+      pool.query(
+        `SELECT ${STATUS_KEY} AS name,
+                COUNT(*)::int AS count,
+                COALESCE(SUM(l.total_price), 0)::float AS value
+           FROM leads l ${wsWhere}
+          GROUP BY 1`, wsParams),
+
+      /* Seven days of history for the three sparklines, always seven points.
+         generate_series supplies the days and the LEFT JOINs fill them, so a
+         day nobody made a lead on is a 0 and not a gap — a sparkline that
+         silently drops its empty days draws a different shape from the truth.
+
+         `converted` is dated by updated_at, which is a proxy and a weak one:
+         it is the day the lead last changed, not the day it became an
+         appointment. It is what the browser used, and appointments.created_at
+         is where this should read from instead — left alone here so this
+         change fixes the COUNT without also redefining the series. */
+      pool.query(
+        `WITH days AS (
+           SELECT (CURRENT_DATE - g)::date AS d FROM generate_series(0, 6) g
+         ),
+         made AS (
+           SELECT l.created_at::date AS d,
+                  COUNT(*)::int AS created,
+                  COUNT(*) FILTER (WHERE l.total_price > 0)::int AS priced
+             FROM leads l ${kCreated}
+            GROUP BY 1
+         ),
+         conv AS (
+           SELECT l.updated_at::date AS d, COUNT(*)::int AS converted
+             FROM leads l ${kConv} AND ${IS_CONVERTED}
+            GROUP BY 1
+         )
+         SELECT days.d::text                     AS day,
+                COALESCE(made.created, 0)        AS created,
+                COALESCE(made.priced, 0)         AS priced,
+                COALESCE(conv.converted, 0)      AS converted
+           FROM days
+           LEFT JOIN made ON made.d = days.d
+           LEFT JOIN conv ON conv.d = days.d
+          ORDER BY days.d`, kParams),
+    ]);
+
+    const o = overall.rows[0] || {};
+    const w = win.rows[0]     || {};
+    const rate = (part, whole) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
+    const byStatus = (rows) => rows
+      .map(r => ({ name: r.name, count: r.count, value: r.value }))
+      .sort((a, b) => b.count - a.count);
+
+    res.json({
+      period,
+      /* Scope-wide, ignoring the period dropdown — the stat cards and the
+         status donut have always been all-time and stay that way. */
+      overall: {
+        total:           o.total || 0,
+        value:           o.value || 0,
+        converted:       o.converted || 0,
+        conversion_rate: rate(o.converted || 0, o.total || 0),
+        created_today:   o.created_today || 0,
+        mine: {
+          created:             o.mine_created || 0,
+          assigned:            o.mine_assigned || 0,
+          assigned_not_created: o.mine_assigned_not_created || 0,
+        },
+        by_status: byStatus(overallStatus.rows),
+      },
+      /* The Pipeline Overview card only. Every status in the window, sorted by
+         count — the card takes its own top 5, because how many rows fit is a
+         layout decision and does not belong in an API. */
+      window: {
+        total:           w.total || 0,
+        value:           w.value || 0,
+        converted:       w.converted || 0,
+        conversion_rate: rate(w.converted || 0, w.total || 0),
+        by_status:       byStatus(winStatus.rows),
+      },
+      /* Oldest day first, seven entries, IST calendar days as 'YYYY-MM-DD'. */
+      spark: spark.rows.map(r => ({
+        day: r.day, created: r.created, converted: r.converted, priced: r.priced,
+      })),
+    });
+  });
+}
+
 module.exports = {
   listLeads, getLead, getLeadByToken, createLead, updateLead, deleteLead, lookupPrice, exportLeads, getStageStats, bulkAssign, bulkStatus, bulkDelete, checkMobile,
+  getDashboardMetrics,
 };

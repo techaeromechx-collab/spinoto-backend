@@ -20,6 +20,13 @@ router.get('/check-mobile', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TE
 // Call log summary — must be before /:id
 router.get('/calls/summary', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), cl.getCallSummary);
 
+/* Dashboard lead numbers — before /:id, and on the same three view permissions
+   as the list, because it answers a question about exactly the leads the list
+   would show you. Scoping happens in the controller via utils/leadScope.js, the
+   same helper the list uses, so the dashboard's totals and the leads page can
+   never disagree about who may see what. */
+router.get('/dashboard-metrics', requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.getDashboardMetrics);
+
 // LIST: any of the three view-level permissions grants access; filtering happens inside the controller
 router.get ('/',     requireAuth, requirePermission('VIEW_LEAD', 'VIEW_TEAM_LEADS', 'VIEW_OWN_LEADS'), c.listLeads);
 router.post('/',    requireAuth, requirePermission('CREATE_LEAD'), c.createLead);
