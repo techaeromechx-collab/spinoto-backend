@@ -61,6 +61,7 @@ const estimateChangeRequestsRoutes = require('./routes/estimate_change_requests.
 const settingsRoutes = require('./routes/settings.routes');
 const rolesRoutes = require('./routes/roles.routes');
 const logsRoutes = require('./routes/logs.routes');
+const systemRoutes = require('./routes/system.routes');
 const discountMasterRoutes = require('./routes/discount_master.routes');
 const warrantyMasterRoutes = require('./routes/warranty_master.routes');
 const warrantyClaimsRoutes = require('./routes/warranty_claims.routes');
@@ -322,6 +323,12 @@ app.use('/api/public/pay', publicPaymentsRoutes);
 app.use('/api/roles', rolesRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/logs', logsRoutes);
+/* Settings → System Health. Super admin only, read only — it reports whether
+   this deploy's migrations have actually been applied, and reconciles today's
+   inbound WhatsApp against the leads it produced. Both answers already lived in
+   the database (schema_migrations and wa_events) with no screen to show them,
+   which is a problem when nobody here has console access to the database. */
+app.use('/api/system', systemRoutes);
 
 // Stubs for upcoming modules — every module will plug in here.
 
