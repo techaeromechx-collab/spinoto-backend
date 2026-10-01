@@ -107,6 +107,32 @@ function scopeSql(user) {
 }
 
 /**
+ * Whose unread is this?
+ *
+ * ── The problem this solves ─────────────────────────────────────────────────
+ *
+ * A super admin SEES every conversation (scopeSql returns TRUE for them), and
+ * the read cursor is per user. Put those two facts together and their badge
+ * counts every conversation they have not personally opened — which, in a
+ * workshop taking fifty customers an hour, is all of them, permanently. A badge
+ * pinned at 99+ that can never come down is not a badge; it is wallpaper, and
+ * people stop looking at it, including on the day it matters.
+ *
+ * So SEEING and OWING are separated. The list still shows everything the scope
+ * allows. The unread marker — the number, the Unread tab, the badge on the
+ * switch — counts only what is this person's to answer:
+ *
+ *   assigned to me   my customer, my problem
+ *   assigned to NOBODY  nobody's problem yet, which makes it everybody's — a
+ *                    customer in the shared queue has to be counted by someone
+ *                    or they are counted by no one and quietly go unanswered
+ *
+ * A conversation that belongs to a colleague is still listed, still readable,
+ * still searchable. It simply is not held against you.
+ */
+const MINE_SQL = `(${OWNER_SQL} IS NULL OR ${OWNER_SQL} = $1)`;
+
+/**
  * The lead join, needed by both queries now that ownership can come from it.
  * One definition, because a count and a list built from two different FROM
  * clauses is how a badge saying 3 ends up over a dropdown with 2 rows in it.
@@ -139,11 +165,15 @@ const UNREAD_WHERE = `
                WHERE r.user_id = $1 AND r.mobile = c.mobile),
              TIMESTAMPTZ 'epoch')`;
 
-const UNREAD_SQL = `
-  EXISTS (
+/* MINE_SQL first and not merely alongside: it is the cheap half, it is false
+   for most rows on a busy day, and && short-circuits — so the message scan below
+   is skipped entirely for every conversation that belongs to somebody else. */
+const UNREAD_SQL = `(
+  ${MINE_SQL}
+  AND EXISTS (
     SELECT 1 FROM wa_messages m
      WHERE ${UNREAD_WHERE}
-  )`;
+  ))`;
 
 /* How many, for the number on the row.
    Kept beside the EXISTS rather than replacing it: the count endpoint below
@@ -151,8 +181,9 @@ const UNREAD_SQL = `
    the EXISTS as an output alias. Turning that one into a count would quietly
    change both. This is a second column on the list only. */
 const UNREAD_N_SQL = `
-  (SELECT COUNT(*)::int FROM wa_messages m
-    WHERE ${UNREAD_WHERE})`;
+  (CASE WHEN ${MINE_SQL}
+        THEN (SELECT COUNT(*)::int FROM wa_messages m WHERE ${UNREAD_WHERE})
+        ELSE 0 END)`;
 
 /**
  * Has this user cleared this conversation? (migration 164)
@@ -200,9 +231,48 @@ function unreadCount(req, res, next) {
  * a list that empties itself the moment you look at it is a list you cannot use
  * to find the message you just read.
  */
+/* The tab filters, as SQL. A whitelist and not a string from the query: this
+   goes into a WHERE clause, and `filter` is whatever the browser sent. */
+const FILTERS = Object.freeze({
+  all:        null,
+  unread:     UNREAD_SQL,
+  unassigned: `${OWNER_SQL} IS NULL`,
+  mine:       `${OWNER_SQL} = $1`,
+});
+
 function listInbox(req, res, next) {
   handle(req, res, next, async () => {
-    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+    /* 200, not 50.
+       50 was a hard ceiling rather than a page, and on a day taking fifty
+       customers an hour it meant the list showed the last forty-five minutes and
+       silently dropped everything before it — a customer who wrote at two
+       o'clock was not merely further down, they were GONE, and the search box
+       could not find them either because it filtered what had loaded.
+       It is a page now; `offset` below is what fetches the rest. */
+    const limit  = Math.min(Math.max(Number(req.query.limit) || 30, 1), 200);
+    const offset = Math.min(Math.max(Number(req.query.offset) || 0, 0), 100000);
+
+    /* Search runs on the SERVER so it reaches the whole history rather than the
+       rows already downloaded. Digits match the number, anything else matches
+       the name — somebody typing 9824 means a phone number, and matching that
+       against names finds nothing and looks broken. */
+    const qRaw   = String(req.query.q || '').trim().slice(0, 80);
+    const qDigits = qRaw.replace(/\D/g, '');
+    const search = qRaw
+      ? (qDigits.length >= 3
+          ? `regexp_replace(c.mobile, '\\D', '', 'g') LIKE '%' || $4 || '%'`
+          : `COALESCE(NULLIF(TRIM(l.name), ''), NULLIF(TRIM(c.customer_name), ''), c.mobile) ILIKE '%' || $4 || '%'`)
+      : null;
+    const searchParam = qRaw ? (qDigits.length >= 3 ? qDigits : qRaw) : null;
+
+    const filterSql = Object.prototype.hasOwnProperty.call(FILTERS, req.query.filter)
+      ? FILTERS[req.query.filter]
+      : null;
+
+    const extra = [filterSql, search].filter(Boolean).map(x => `AND ${x}`).join('\n        ');
+    const params = searchParam
+      ? [req.user.id, limit, offset, searchParam]
+      : [req.user.id, limit, offset];
 
     const r = await pool.query(
       `SELECT
@@ -238,6 +308,7 @@ function listInbox(req, res, next) {
       WHERE ${scopeSql(req.user)}
         AND last.created_at IS NOT NULL
         AND NOT ${HIDDEN_SQL}
+        ${extra}
       -- Unread first, then most recent. Sorting purely by time would bury a
       -- customer who wrote this morning under conversations you have already
       -- dealt with since.
@@ -247,8 +318,32 @@ function listInbox(req, res, next) {
       -- time per row, and the two copies could drift the day one of them is
       -- edited.
       ORDER BY is_unread DESC, last.created_at DESC
-      LIMIT $2`,
-      [req.user.id, limit]
+      LIMIT $2 OFFSET $3`,
+      params
+    );
+
+    /* The tab numbers, counted over the WHOLE inbox rather than the page.
+       Counting the loaded rows would have "Unread 3" mean "3 of the 30 you
+       happen to have downloaded", which is a different and useless statement —
+       and it is exactly the bug the leads list had before its counts moved to
+       the server. Skipped while searching: the tabs describe the inbox, not the
+       search, and a count that changed as you typed would read as the search
+       having lost something. */
+    const counts = qRaw ? null : await pool.query(
+      `SELECT COUNT(*)::int                                              AS all_n,
+              COUNT(*) FILTER (WHERE ${UNREAD_SQL})::int                 AS unread_n,
+              COUNT(*) FILTER (WHERE ${OWNER_SQL} IS NULL)::int          AS unassigned_n,
+              COUNT(*) FILTER (WHERE ${OWNER_SQL} = $1)::int             AS mine_n
+         ${FROM_SQL}
+         LEFT JOIN LATERAL (
+           SELECT m.created_at FROM wa_messages m
+            WHERE m.to_number = c.mobile
+            ORDER BY m.created_at DESC, m.id DESC LIMIT 1
+         ) last ON TRUE
+        WHERE ${scopeSql(req.user)}
+          AND last.created_at IS NOT NULL
+          AND NOT ${HIDDEN_SQL}`,
+      [req.user.id]
     );
 
     res.json({
@@ -259,6 +354,16 @@ function listInbox(req, res, next) {
         // nobody sees — times twenty rows, on every open.
         last_message: row.last_message ? String(row.last_message).slice(0, 120) : null,
       })),
+      // A full page probably means there is another. One row of slack rather
+      // than a second COUNT on every scroll.
+      has_more: r.rowCount === limit,
+      offset,
+      counts: counts ? {
+        all:        counts.rows[0].all_n,
+        unread:     counts.rows[0].unread_n,
+        unassigned: counts.rows[0].unassigned_n,
+        mine:       counts.rows[0].mine_n,
+      } : null,
     });
   });
 }
