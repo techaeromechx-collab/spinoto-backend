@@ -126,16 +126,33 @@ const FROM_SQL = `
  * direction = 'in' only. An outbound message is one we sent; counting it would
  * have the badge light up because an advisor replied.
  */
-const UNREAD_SQL = `
-  EXISTS (
-    SELECT 1 FROM wa_messages m
-     WHERE m.to_number = c.mobile
+/* The predicate itself, written ONCE.
+   Two shapes are needed — EXISTS for "is there anything", COUNT for "how many" —
+   and two hand-written copies of this condition is how a badge saying 3 ends up
+   over a row that shows nothing. They are built from this string so they cannot
+   disagree. */
+const UNREAD_WHERE = `
+       m.to_number = c.mobile
        AND m.direction = 'in'
        AND m.created_at > COALESCE(
              (SELECT r.read_at FROM wa_conversation_reads r
                WHERE r.user_id = $1 AND r.mobile = c.mobile),
-             TIMESTAMPTZ 'epoch')
+             TIMESTAMPTZ 'epoch')`;
+
+const UNREAD_SQL = `
+  EXISTS (
+    SELECT 1 FROM wa_messages m
+     WHERE ${UNREAD_WHERE}
   )`;
+
+/* How many, for the number on the row.
+   Kept beside the EXISTS rather than replacing it: the count endpoint below
+   counts CONVERSATIONS that have anything unread, and the list's ORDER BY reads
+   the EXISTS as an output alias. Turning that one into a count would quietly
+   change both. This is a second column on the list only. */
+const UNREAD_N_SQL = `
+  (SELECT COUNT(*)::int FROM wa_messages m
+    WHERE ${UNREAD_WHERE})`;
 
 /**
  * Has this user cleared this conversation? (migration 164)
@@ -199,6 +216,10 @@ function listInbox(req, res, next) {
          u.name   AS assigned_to_name,
          ${OWNER_SQL} AS assigned_user_id,
          ${UNREAD_SQL} AS is_unread,
+         -- How many messages are waiting, for the number on the row. A dot says
+         -- "something"; a dot cannot tell one new message from eleven, and those
+         -- are different amounts of trouble.
+         ${UNREAD_N_SQL} AS unread_n,
          last.body_rendered AS last_message,
          last.created_at    AS last_message_at,
          last.direction     AS last_direction
