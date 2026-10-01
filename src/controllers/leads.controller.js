@@ -165,6 +165,10 @@ const LEAD_SELECT = `
     l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
     l.priority, l.tags,
     l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
+    /* When the customer last came back to us on an inbound channel, and NULL
+       for the many who never have. The list draws its rail and its caption
+       from this, and sorts on it — see SORTABLE.activity. */
+    l.last_enquiry_at,
     l.lost_competitor_id, l.competitor_service_date, l.retarget_due_date,
     cmp.name AS lost_competitor_name,
     /* Derived, never stored. The retarget treatment on the leads list has to
@@ -423,7 +427,37 @@ const SORTABLE = {
   name:       'l.name',
   status:     'l.status',
   value:      'l.total_price',
+  /* ── The default since migration 205 ──────────────────────────────────────
+     "Latest activity" — the later of when the lead was made and when the
+     customer last reached out. A lead is as recent as the last thing that
+     happened on it.
+
+     ── Why this replaced created_at as the default ────────────────────────
+     Sorted by creation date the list is a history book: it answers "which lead
+     did we make most recently", which nobody opens the page to ask. A customer
+     who enquired in July and messages again today stayed under July, on page 5,
+     and the business never saw it. Sorted by activity it is a work queue, which
+     is what it is for.
+
+     ── Why not updated_at, which already existed ──────────────────────────
+     updated_at moves when anybody edits anything — a note, a status, a
+     corrected spelling. It answers "was this row touched", a question about US.
+     Sorting by it floats whatever the team last typed in, which is noise. This
+     answers "did something happen with the CUSTOMER".
+
+     COALESCE, and the expression written exactly as migration 205's
+     idx_leads_last_activity has it: the planner matches an expression index by
+     its text, so the two must stay character-for-character identical. Most rows
+     have a NULL last_enquiry_at and fall back to created_at, which is right —
+     a lead nobody has come back on is exactly as recent as the day it was
+     made. */
+  activity:   'GREATEST(l.created_at, COALESCE(l.last_enquiry_at, l.created_at))',
 };
+
+/* The sort applied when the caller names none. Changed from 'created_at' to
+   'activity' by migration 205 — see the entry above. Anything that genuinely
+   wants creation order still asks for it by name and gets it. */
+const DEFAULT_SORT = 'activity';
 
 function listLeads(req, res, next) {
   handle(req, res, next, async () => {
@@ -437,7 +471,7 @@ function listLeads(req, res, next) {
     const page     = Math.max(parseInt(q.page, 10) || 1, 1);
     const offset   = (page - 1) * pageSize;
 
-    const sortCol = SORTABLE[String(q.sort || 'created_at')] || SORTABLE.created_at;
+    const sortCol = SORTABLE[String(q.sort || DEFAULT_SORT)] || SORTABLE[DEFAULT_SORT];
     const sortDir = String(q.dir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
     const teamIds = await teamIdsIfNeeded(user);
@@ -461,6 +495,10 @@ function listLeads(req, res, next) {
         l.id, l.public_token, l.name, l.mobile, l.whatsapp, l.status, l.total_price,
         l.priority, l.tags,
         l.lead_source, l.lost_reason, l.notes, l.created_at, l.updated_at,
+        /* When the customer last came back to us on an inbound channel, and
+           NULL for the many who never have. The list draws its rail and its
+           caption from this, and sorts on it — see SORTABLE.activity. */
+        l.last_enquiry_at,
         l.lost_competitor_id, l.competitor_service_date, l.retarget_due_date,
         cmp.name AS lost_competitor_name,
         /* Derived, never stored. The retarget treatment on the leads list has to

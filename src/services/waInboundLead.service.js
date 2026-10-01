@@ -418,6 +418,29 @@ async function resolveOrCreateLead(client, { e164, name, firstMessage }) {
   if (lead.rowCount > 0) {
     const leadId = lead.rows[0].id;
     await client.query(`UPDATE wa_conversations SET lead_id = $2 WHERE mobile = $1`, [e164, leadId]);
+
+    /* ── The lead has to know they came back ──────────────────────────────
+       Until migration 205 this branch touched wa_conversations and nothing
+       else, so the lead itself recorded nothing. The message arrived, the
+       conversation showed it, and the lead sat under its original created_at
+       on whatever page that date put it — page 5, usually, for exactly the
+       leads worth answering: somebody with a quotation already out who is
+       asking again.
+
+       created_at is deliberately untouched. It answers "when did this lead come
+       into the business", which the funnel reports and every month-on-month
+       count depend on; moving it would make a July lead look like an October
+       one. last_enquiry_at is the other fact, kept separately, and the list
+       sorts on whichever of the two is later.
+
+       updated_at moves too, because the row genuinely changed — but it is NOT
+       what the sort reads. See SORTABLE in leads.controller.js for why a column
+       that any edit touches cannot order a work queue. */
+    await client.query(
+      `UPDATE leads SET last_enquiry_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [leadId]
+    );
+
     return { entityType: 'lead', entityId: leadId, leadId, createdLead: false, matchedCustomer: false };
   }
 
